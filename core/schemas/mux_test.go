@@ -1,0 +1,2377 @@
+package schemas
+
+import (
+	"encoding/json"
+	"reflect"
+	"strings"
+	"testing"
+)
+
+func TestToChatMessages_PreservesDeveloperRole(t *testing.T) {
+	messages := []ResponsesMessage{
+		{
+			Role: Ptr(ResponsesInputMessageRoleDeveloper),
+			Content: &ResponsesMessageContent{
+				ContentBlocks: []ResponsesMessageContentBlock{
+					{
+						Type: ResponsesInputMessageContentBlockTypeText,
+						Text: Ptr("You are helpful"),
+					},
+				},
+			},
+		},
+	}
+
+	chatMessages := ToChatMessages(messages)
+	if len(chatMessages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(chatMessages))
+	}
+	if chatMessages[0].Role != ChatMessageRoleDeveloper {
+		t.Fatalf("expected role %q, got %q", ChatMessageRoleDeveloper, chatMessages[0].Role)
+	}
+}
+
+func TestToChatRequest_NormalizesDeveloperRoleToSystemForFallback(t *testing.T) {
+	req := &BifrostResponsesRequest{
+		Input: []ResponsesMessage{
+			{
+				Role: Ptr(ResponsesInputMessageRoleDeveloper),
+				Content: &ResponsesMessageContent{
+					ContentBlocks: []ResponsesMessageContentBlock{
+						{
+							Type: ResponsesInputMessageContentBlockTypeText,
+							Text: Ptr("You are helpful"),
+						},
+					},
+				},
+			},
+		},
+		Params: &ResponsesParameters{},
+	}
+
+	chatReq := req.ToChatRequest()
+	if chatReq == nil {
+		t.Fatal("expected non-nil chat request")
+	}
+	if len(chatReq.Input) != 1 {
+		t.Fatalf("expected 1 chat message, got %d", len(chatReq.Input))
+	}
+	if chatReq.Input[0].Role != ChatMessageRoleSystem {
+		t.Fatalf("expected role %q in fallback conversion, got %q", ChatMessageRoleSystem, chatReq.Input[0].Role)
+	}
+}
+
+func TestToChatMessages_LeavesExistingSupportedRolesUnchanged(t *testing.T) {
+	messages := []ResponsesMessage{
+		{Role: Ptr(ResponsesInputMessageRoleSystem)},
+		{Role: Ptr(ResponsesInputMessageRoleUser)},
+		{Role: Ptr(ResponsesInputMessageRoleAssistant)},
+	}
+
+	chatMessages := ToChatMessages(messages)
+	if len(chatMessages) != len(messages) {
+		t.Fatalf("expected %d messages, got %d", len(messages), len(chatMessages))
+	}
+
+	if chatMessages[0].Role != ChatMessageRoleSystem {
+		t.Fatalf("expected system role, got %q", chatMessages[0].Role)
+	}
+	if chatMessages[1].Role != ChatMessageRoleUser {
+		t.Fatalf("expected user role, got %q", chatMessages[1].Role)
+	}
+	if chatMessages[2].Role != ChatMessageRoleAssistant {
+		t.Fatalf("expected assistant role, got %q", chatMessages[2].Role)
+	}
+}
+
+func TestToChatMessages_AttachesReasoningToNextAssistantMessage(t *testing.T) {
+	reasoningText := "Let me think about this step by step."
+	signature := "sig_abc"
+
+	messages := []ResponsesMessage{
+		{Role: Ptr(ResponsesInputMessageRoleUser), Content: &ResponsesMessageContent{ContentStr: Ptr("hi")}},
+		{
+			Type: Ptr(ResponsesMessageTypeReasoning),
+			Role: Ptr(ResponsesInputMessageRoleAssistant),
+			Content: &ResponsesMessageContent{
+				ContentBlocks: []ResponsesMessageContentBlock{
+					{
+						Type:      ResponsesOutputMessageContentTypeReasoning,
+						Text:      &reasoningText,
+						Signature: &signature,
+					},
+				},
+			},
+		},
+		{
+			Role:    Ptr(ResponsesInputMessageRoleAssistant),
+			Content: &ResponsesMessageContent{ContentStr: Ptr("Hello!")},
+		},
+	}
+
+	chatMessages := ToChatMessages(messages)
+	if len(chatMessages) != 2 {
+		t.Fatalf("expected 2 chat messages (reasoning absorbed into assistant), got %d", len(chatMessages))
+	}
+	assistant := chatMessages[1]
+	if assistant.Role != ChatMessageRoleAssistant {
+		t.Fatalf("expected assistant role, got %q", assistant.Role)
+	}
+	if assistant.ChatAssistantMessage == nil {
+		t.Fatal("expected ChatAssistantMessage attached to carry reasoning")
+	}
+	if assistant.ChatAssistantMessage.Reasoning == nil || *assistant.ChatAssistantMessage.Reasoning != reasoningText {
+		t.Fatalf("expected reasoning %q, got %#v", reasoningText, assistant.ChatAssistantMessage.Reasoning)
+	}
+	if len(assistant.ChatAssistantMessage.ReasoningDetails) != 1 {
+		t.Fatalf("expected 1 reasoning detail, got %d", len(assistant.ChatAssistantMessage.ReasoningDetails))
+	}
+	if assistant.ChatAssistantMessage.ReasoningDetails[0].Signature == nil || *assistant.ChatAssistantMessage.ReasoningDetails[0].Signature != signature {
+		t.Fatalf("expected signature %q preserved, got %#v", signature, assistant.ChatAssistantMessage.ReasoningDetails[0].Signature)
+	}
+}
+
+func TestToChatMessages_AttachesReasoningToToolCallAssistantMessage(t *testing.T) {
+	reasoningText := "I need to call the search tool."
+
+	messages := []ResponsesMessage{
+		{
+			Type: Ptr(ResponsesMessageTypeReasoning),
+			Role: Ptr(ResponsesInputMessageRoleAssistant),
+			Content: &ResponsesMessageContent{
+				ContentBlocks: []ResponsesMessageContentBlock{
+					{Type: ResponsesOutputMessageContentTypeReasoning, Text: &reasoningText},
+				},
+			},
+		},
+		{
+			Type: Ptr(ResponsesMessageTypeFunctionCall),
+			Role: Ptr(ResponsesInputMessageRoleAssistant),
+			ResponsesToolMessage: &ResponsesToolMessage{
+				CallID:    Ptr("call_1"),
+				Name:      Ptr("search"),
+				Arguments: Ptr(`{"q":"x"}`),
+			},
+		},
+		{
+			Type: Ptr(ResponsesMessageTypeFunctionCallOutput),
+			ResponsesToolMessage: &ResponsesToolMessage{
+				CallID: Ptr("call_1"),
+				Output: &ResponsesToolMessageOutputStruct{ResponsesToolCallOutputStr: Ptr("done")},
+			},
+		},
+	}
+
+	chatMessages := ToChatMessages(messages)
+	if len(chatMessages) != 2 {
+		t.Fatalf("expected 2 chat messages (tool-call assistant + tool result), got %d", len(chatMessages))
+	}
+	assistant := chatMessages[0]
+	if assistant.ChatAssistantMessage == nil {
+		t.Fatal("expected tool-call assistant message")
+	}
+	if len(assistant.ChatAssistantMessage.ToolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(assistant.ChatAssistantMessage.ToolCalls))
+	}
+	if assistant.ChatAssistantMessage.Reasoning == nil || *assistant.ChatAssistantMessage.Reasoning != reasoningText {
+		t.Fatalf("expected reasoning %q on tool-call assistant, got %#v", reasoningText, assistant.ChatAssistantMessage.Reasoning)
+	}
+}
+
+func TestToChatMessages_MapsOutputTextInMultiPartAssistantMessage(t *testing.T) {
+	messages := []ResponsesMessage{
+		{
+			Role: Ptr(ResponsesInputMessageRoleUser),
+			Content: &ResponsesMessageContent{
+				ContentBlocks: []ResponsesMessageContentBlock{
+					{Type: ResponsesInputMessageContentBlockTypeText, Text: Ptr("hi")},
+				},
+			},
+		},
+		{
+			Role: Ptr(ResponsesInputMessageRoleAssistant),
+			Content: &ResponsesMessageContent{
+				ContentBlocks: []ResponsesMessageContentBlock{
+					{Type: ResponsesOutputMessageContentTypeText, Text: Ptr("a")},
+					{Type: ResponsesOutputMessageContentTypeText, Text: Ptr("b")},
+				},
+			},
+		},
+	}
+
+	chatMessages := ToChatMessages(messages)
+	if len(chatMessages) != 2 {
+		t.Fatalf("expected 2 chat messages, got %d", len(chatMessages))
+	}
+
+	assistant := chatMessages[1]
+	if assistant.Content == nil || len(assistant.Content.ContentBlocks) != 2 {
+		t.Fatalf("expected 2 content blocks on the assistant turn, got %#v", assistant.Content)
+	}
+	for i, block := range assistant.Content.ContentBlocks {
+		// "output_text" is not a chat-completions content part: a block left with
+		// the Responses spelling is rejected downstream as an unknown variant.
+		if block.Type != ChatContentBlockTypeText {
+			t.Fatalf("block %d: expected type %q, got %q", i, ChatContentBlockTypeText, block.Type)
+		}
+	}
+	if assistant.Content.ContentBlocks[0].Text == nil || *assistant.Content.ContentBlocks[0].Text != "a" {
+		t.Fatalf("expected first block text %q, got %#v", "a", assistant.Content.ContentBlocks[0].Text)
+	}
+	if assistant.Content.ContentBlocks[1].Text == nil || *assistant.Content.ContentBlocks[1].Text != "b" {
+		t.Fatalf("expected second block text %q, got %#v", "b", assistant.Content.ContentBlocks[1].Text)
+	}
+}
+
+func TestToResponsesMessages_EmitsReasoningMessageBeforeToolCalls(t *testing.T) {
+	reasoning := "I should call Bash to list the directory."
+	cm := &ChatMessage{
+		Role: ChatMessageRoleAssistant,
+		ChatAssistantMessage: &ChatAssistantMessage{
+			Reasoning: &reasoning,
+			ToolCalls: []ChatAssistantMessageToolCall{
+				{
+					ID:   Ptr("call_1"),
+					Type: Ptr("function"),
+					Function: ChatAssistantMessageToolCallFunction{
+						Name: Ptr("Bash"),
+					},
+				},
+			},
+		},
+	}
+
+	out := cm.ToResponsesMessages()
+	if len(out) != 2 {
+		t.Fatalf("expected 2 messages (reasoning + function_call), got %d", len(out))
+	}
+	if out[0].Type == nil || *out[0].Type != ResponsesMessageTypeReasoning {
+		t.Fatalf("expected first message to be reasoning, got %#v", out[0].Type)
+	}
+	if out[0].Content == nil || len(out[0].Content.ContentBlocks) != 1 {
+		t.Fatal("expected reasoning message to carry a single content block")
+	}
+	if out[0].Content.ContentBlocks[0].Text == nil || *out[0].Content.ContentBlocks[0].Text != reasoning {
+		t.Fatalf("expected reasoning text %q, got %#v", reasoning, out[0].Content.ContentBlocks[0].Text)
+	}
+	if out[1].Type == nil || *out[1].Type != ResponsesMessageTypeFunctionCall {
+		t.Fatalf("expected second message to be function_call, got %#v", out[1].Type)
+	}
+}
+
+func TestToResponsesMessages_ToolResultBlocksUseResponsesInputTypes(t *testing.T) {
+	// A chat tool message with array content must become a function_call_output whose
+	// output blocks use the Responses spellings; OpenAI rejects "text" there with
+	// "Invalid value: 'text'. Supported values are: 'input_text', ...".
+	cm := ChatMessage{
+		Role:            ChatMessageRoleTool,
+		ChatToolMessage: &ChatToolMessage{ToolCallID: Ptr("call_1")},
+		Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{
+			{Type: ChatContentBlockTypeText, Text: Ptr("18C, light rain"), CacheControl: &CacheControl{Type: CacheControlTypeEphemeral}},
+			{Type: ChatContentBlockTypeImage, ImageURLStruct: &ChatInputImage{URL: "https://example.com/radar.png"}},
+		}},
+	}
+	want := []ResponsesMessageContentBlockType{ResponsesInputMessageContentBlockTypeText, ResponsesInputMessageContentBlockTypeImage}
+
+	check := func(t *testing.T, name string, msg *ResponsesMessage) {
+		if msg == nil || msg.Type == nil || *msg.Type != ResponsesMessageTypeFunctionCallOutput {
+			t.Fatalf("%s: expected a function_call_output message, got %#v", name, msg)
+		}
+		out := msg.ResponsesToolMessage.Output
+		if out == nil || out.ResponsesFunctionToolCallOutputBlocks == nil || len(out.ResponsesFunctionToolCallOutputBlocks) != 2 {
+			t.Fatalf("%s: expected 2 output blocks, got %#v", name, out)
+		}
+		for i, b := range out.ResponsesFunctionToolCallOutputBlocks {
+			if b.Type != want[i] {
+				t.Errorf("%s: output[%d].type = %q, want %q", name, i, b.Type, want[i])
+			}
+		}
+		if out.ResponsesFunctionToolCallOutputBlocks[0].CacheControl == nil {
+			t.Errorf("%s: cache_control on the tool result block must survive the conversion", name)
+		}
+	}
+
+	check(t, "ToResponsesToolMessage", cm.ToResponsesToolMessage())
+	msgs := cm.ToResponsesMessages()
+	if len(msgs) != 1 {
+		t.Fatalf("ToResponsesMessages: expected 1 message, got %d", len(msgs))
+	}
+	check(t, "ToResponsesMessages", &msgs[0])
+}
+
+func TestToResponsesRequest_EmptyToolContentKeepsOutput(t *testing.T) {
+	// A tool that ran but printed nothing sends content "". OpenAI and Azure reject a
+	// function_call_output without output: "Missing required parameter: 'input[N].output'".
+	req := &BifrostChatRequest{
+		Provider: OpenAI,
+		Model:    "gpt-6-luna",
+		Input: []ChatMessage{
+			{Role: ChatMessageRoleUser, Content: &ChatMessageContent{ContentStr: Ptr("What is the weather in Berlin?")}},
+			{Role: ChatMessageRoleAssistant, ChatAssistantMessage: &ChatAssistantMessage{ToolCalls: []ChatAssistantMessageToolCall{{
+				ID: Ptr("call_1"), Type: Ptr("function"),
+				Function: ChatAssistantMessageToolCallFunction{Name: Ptr("get_weather"), Arguments: `{"location":"Berlin"}`},
+			}}}},
+			{Role: ChatMessageRoleTool, ChatToolMessage: &ChatToolMessage{ToolCallID: Ptr("call_1")}, Content: &ChatMessageContent{ContentStr: Ptr("")}},
+		},
+	}
+
+	input := req.ToResponsesRequest().Input
+	if len(input) != 3 {
+		t.Fatalf("expected 3 input items, got %d", len(input))
+	}
+	data, err := MarshalSorted(input[2])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"output":""`) {
+		t.Fatalf(`function_call_output must carry "output":"", got %s`, data)
+	}
+}
+
+func TestToResponsesMessages_EmitsReasoningMessageBeforeTextContent(t *testing.T) {
+	reasoning := "Thinking about how to summarize."
+	cm := &ChatMessage{
+		Role: ChatMessageRoleAssistant,
+		Content: &ChatMessageContent{
+			ContentStr: Ptr("Here's the summary."),
+		},
+		ChatAssistantMessage: &ChatAssistantMessage{
+			Reasoning: &reasoning,
+		},
+	}
+
+	out := cm.ToResponsesMessages()
+	if len(out) != 2 {
+		t.Fatalf("expected 2 messages (reasoning + assistant text), got %d", len(out))
+	}
+	if out[0].Type == nil || *out[0].Type != ResponsesMessageTypeReasoning {
+		t.Fatalf("expected first message to be reasoning, got %#v", out[0].Type)
+	}
+	if out[1].Type == nil || *out[1].Type != ResponsesMessageTypeMessage {
+		t.Fatalf("expected second message to be a regular assistant message, got %#v", out[1].Type)
+	}
+}
+
+func TestToChatRequest_FiltersUnsupportedResponsesToolsForFallback(t *testing.T) {
+	validName := "valid_tool"
+	invalidName := "  "
+	req := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{
+			Tools: []ResponsesTool{
+				{
+					Type: ResponsesToolTypeFunction,
+					Name: &validName,
+					ResponsesToolFunction: &ResponsesToolFunction{
+						Parameters: &ToolFunctionParameters{
+							Type:       "object",
+							Properties: &OrderedMap{},
+						},
+					},
+				},
+				{
+					Type: ResponsesToolTypeFunction,
+					Name: &invalidName,
+				},
+				{
+					Type: ResponsesToolTypeMCP,
+					Name: Ptr("mcp_tool"),
+				},
+				{
+					Type: ResponsesToolTypeWebSearch,
+					Name: Ptr("web_search"),
+				},
+			},
+		},
+	}
+
+	chatReq := req.ToChatRequest()
+	if chatReq == nil || chatReq.Params == nil {
+		t.Fatal("expected non-nil chat request params")
+	}
+	if len(chatReq.Params.Tools) != 1 {
+		t.Fatalf("expected 1 valid fallback tool, got %d", len(chatReq.Params.Tools))
+	}
+	if chatReq.Params.Tools[0].Type != ChatToolTypeFunction {
+		t.Fatalf("expected tool type %q, got %q", ChatToolTypeFunction, chatReq.Params.Tools[0].Type)
+	}
+	if chatReq.Params.Tools[0].Function == nil || chatReq.Params.Tools[0].Function.Name != validName {
+		t.Fatalf("expected function tool %q to be preserved", validName)
+	}
+}
+
+func TestToChatRequest_DropsInvalidToolChoiceForFallback(t *testing.T) {
+	validName := "valid_tool"
+	invalidChoiceName := "missing_tool"
+	req := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{
+			Tools: []ResponsesTool{
+				{
+					Type: ResponsesToolTypeFunction,
+					Name: &validName,
+				},
+			},
+			ToolChoice: &ResponsesToolChoice{
+				ResponsesToolChoiceStruct: &ResponsesToolChoiceStruct{
+					Type: ResponsesToolChoiceTypeFunction,
+					Name: &invalidChoiceName,
+				},
+			},
+		},
+	}
+
+	chatReq := req.ToChatRequest()
+	if chatReq == nil || chatReq.Params == nil {
+		t.Fatal("expected non-nil chat request params")
+	}
+	if chatReq.Params.ToolChoice != nil {
+		t.Fatal("expected incompatible tool choice to be removed for fallback")
+	}
+}
+
+func TestToChatRequest_AllNonFunctionToolsDropsToolsAndToolChoice(t *testing.T) {
+	auto := string(ChatToolChoiceTypeAuto)
+	req := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{
+			Tools: []ResponsesTool{
+				{Type: ResponsesToolTypeMCP, Name: Ptr("mcp")},
+				{Type: ResponsesToolTypeWebSearch, Name: Ptr("search")},
+			},
+			ToolChoice: &ResponsesToolChoice{
+				ResponsesToolChoiceStr: &auto,
+			},
+		},
+	}
+
+	chatReq := req.ToChatRequest()
+	if chatReq == nil || chatReq.Params == nil {
+		t.Fatal("expected non-nil chat request params")
+	}
+	if chatReq.Params.Tools != nil {
+		t.Fatalf("expected nil tools when all tools are unsupported, got %d", len(chatReq.Params.Tools))
+	}
+	if chatReq.Params.ToolChoice != nil {
+		t.Fatal("expected tool choice to be dropped when no valid tools remain")
+	}
+}
+
+func TestToChatRequest_DropsAllowedToolsAndCustomToolChoiceForFallback(t *testing.T) {
+	validName := "valid_tool"
+	tests := []ResponsesToolChoiceType{
+		ResponsesToolChoiceTypeAllowedTools,
+		ResponsesToolChoiceTypeCustom,
+	}
+
+	for _, choiceType := range tests {
+		t.Run(string(choiceType), func(t *testing.T) {
+			req := &BifrostResponsesRequest{
+				Params: &ResponsesParameters{
+					Tools: []ResponsesTool{
+						{
+							Type: ResponsesToolTypeFunction,
+							Name: &validName,
+						},
+					},
+					ToolChoice: &ResponsesToolChoice{
+						ResponsesToolChoiceStruct: &ResponsesToolChoiceStruct{
+							Type: choiceType,
+						},
+					},
+				},
+			}
+
+			chatReq := req.ToChatRequest()
+			if chatReq == nil || chatReq.Params == nil {
+				t.Fatal("expected non-nil chat request params")
+			}
+			if chatReq.Params.ToolChoice != nil {
+				t.Fatalf("expected %q tool choice to be dropped for fallback", choiceType)
+			}
+		})
+	}
+}
+
+func TestToChatRequest_PreservesStringToolChoiceAutoAndNone(t *testing.T) {
+	validName := "valid_tool"
+	tests := []string{
+		string(ChatToolChoiceTypeAuto),
+		string(ChatToolChoiceTypeNone),
+	}
+
+	for _, choice := range tests {
+		t.Run(choice, func(t *testing.T) {
+			req := &BifrostResponsesRequest{
+				Params: &ResponsesParameters{
+					Tools: []ResponsesTool{
+						{
+							Type: ResponsesToolTypeFunction,
+							Name: &validName,
+						},
+					},
+					ToolChoice: &ResponsesToolChoice{
+						ResponsesToolChoiceStr: &choice,
+					},
+				},
+			}
+
+			chatReq := req.ToChatRequest()
+			if chatReq == nil || chatReq.Params == nil {
+				t.Fatal("expected non-nil chat request params")
+			}
+			if chatReq.Params.ToolChoice == nil || chatReq.Params.ToolChoice.ChatToolChoiceStr == nil {
+				t.Fatal("expected string tool choice to be preserved")
+			}
+			if *chatReq.Params.ToolChoice.ChatToolChoiceStr != choice {
+				t.Fatalf("expected tool choice %q, got %q", choice, *chatReq.Params.ToolChoice.ChatToolChoiceStr)
+			}
+		})
+	}
+}
+
+func TestToBifrostResponsesStreamResponse_PopulatesFinalDoneTextAndCompletedOutput(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	makeChunk := func(role *string, content *string, finishReason *string) *BifrostChatResponse {
+		return &BifrostChatResponse{
+			ID:    "chatcmpl-test",
+			Model: "test-model",
+			Choices: []BifrostResponseChoice{
+				{
+					FinishReason: finishReason,
+					ChatStreamResponseChoice: &ChatStreamResponseChoice{
+						Delta: &ChatStreamResponseChoiceDelta{
+							Role:    role,
+							Content: content,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	role := string(ChatMessageRoleAssistant)
+	part1 := "Hello"
+	part2 := " world"
+	stop := string(BifrostFinishReasonStop)
+
+	var all []*BifrostResponsesStreamResponse
+	all = append(all, makeChunk(&role, nil, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, makeChunk(nil, &part1, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, makeChunk(nil, &part2, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, makeChunk(nil, nil, &stop).ToBifrostResponsesStreamResponse(state)...)
+
+	var outputTextDone *BifrostResponsesStreamResponse
+	var completed *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		if evt == nil {
+			continue
+		}
+		if evt.Type == ResponsesStreamResponseTypeOutputTextDone {
+			outputTextDone = evt
+		}
+		if evt.Type == ResponsesStreamResponseTypeCompleted {
+			completed = evt
+		}
+	}
+
+	if outputTextDone == nil || outputTextDone.Text == nil {
+		t.Fatal("expected response.output_text.done with text")
+	}
+	if *outputTextDone.Text != "Hello world" {
+		t.Fatalf("expected output_text.done text %q, got %q", "Hello world", *outputTextDone.Text)
+	}
+
+	if completed == nil || completed.Response == nil || len(completed.Response.Output) != 1 {
+		t.Fatal("expected response.completed with one output message")
+	}
+	msg := completed.Response.Output[0]
+	if msg.Content == nil || len(msg.Content.ContentBlocks) == 0 || msg.Content.ContentBlocks[0].Text == nil {
+		t.Fatal("expected completed output message to include text content block")
+	}
+	if *msg.Content.ContentBlocks[0].Text != "Hello world" {
+		t.Fatalf("expected completed output text %q, got %q", "Hello world", *msg.Content.ContentBlocks[0].Text)
+	}
+}
+
+func TestToBifrostResponsesStreamResponse_NilDeltaWithFinishReasonStillCompletes(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	role := string(ChatMessageRoleAssistant)
+	part := "Hello"
+	roleChunk := &BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: &ChatStreamResponseChoiceDelta{Role: &role}}},
+		},
+	}
+	contentChunk := &BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: &ChatStreamResponseChoiceDelta{Content: &part}}},
+		},
+	}
+
+	// Reproduces the real wire shape many OpenAI-compatible upstreams send on their
+	// terminal chunk: {"choices":[{"delta":null,"finish_reason":"stop"}],"usage":{...}}
+	var terminalChunk BifrostChatResponse
+	terminalJSON := `{"id":"chatcmpl-test","model":"test-model","choices":[{"index":0,"delta":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}`
+	if err := json.Unmarshal([]byte(terminalJSON), &terminalChunk); err != nil {
+		t.Fatalf("failed to unmarshal terminal chunk fixture: %v", err)
+	}
+
+	var all []*BifrostResponsesStreamResponse
+	all = append(all, roleChunk.ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, contentChunk.ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, terminalChunk.ToBifrostResponsesStreamResponse(state)...)
+
+	var completed *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		if evt != nil && evt.Type == ResponsesStreamResponseTypeCompleted {
+			completed = evt
+		}
+	}
+
+	if completed == nil {
+		t.Fatal("expected a Completed event even though the terminal chunk had delta:null")
+	}
+	if completed.Response == nil || completed.Response.Usage == nil {
+		t.Fatal("expected Completed event to carry usage")
+	}
+	if completed.Response.Usage.InputTokens != 5 || completed.Response.Usage.OutputTokens != 2 {
+		t.Fatalf("unexpected usage: %+v", completed.Response.Usage)
+	}
+	if completed.Response.StopReason == nil || *completed.Response.StopReason != "stop" {
+		t.Fatalf("expected stop_reason stop, got %+v", completed.Response.StopReason)
+	}
+}
+
+func TestToBifrostResponsesStreamResponse_MissingDeltaKeyWithFinishReasonStillCompletes(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	role := string(ChatMessageRoleAssistant)
+	part := "Hi"
+	roleChunk := &BifrostChatResponse{
+		ID:    "chatcmpl-test2",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: &ChatStreamResponseChoiceDelta{Role: &role}}},
+		},
+	}
+	contentChunk := &BifrostChatResponse{
+		ID:    "chatcmpl-test2",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: &ChatStreamResponseChoiceDelta{Content: &part}}},
+		},
+	}
+
+	// Some upstreams omit the "delta" key entirely on the terminal chunk rather than
+	// sending it as null, leaving ChatStreamResponseChoice itself nil after unmarshal.
+	var terminalChunk BifrostChatResponse
+	terminalJSON := `{"id":"chatcmpl-test2","model":"test-model","choices":[{"index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":1,"total_tokens":4}}`
+	if err := json.Unmarshal([]byte(terminalJSON), &terminalChunk); err != nil {
+		t.Fatalf("failed to unmarshal terminal chunk fixture: %v", err)
+	}
+
+	var all []*BifrostResponsesStreamResponse
+	all = append(all, roleChunk.ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, contentChunk.ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, terminalChunk.ToBifrostResponsesStreamResponse(state)...)
+
+	var completed *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		if evt != nil && evt.Type == ResponsesStreamResponseTypeCompleted {
+			completed = evt
+		}
+	}
+
+	if completed == nil {
+		t.Fatal("expected a Completed event even though the terminal chunk omitted the delta key")
+	}
+	if completed.Response == nil || completed.Response.Usage == nil {
+		t.Fatal("expected Completed event to carry usage")
+	}
+}
+
+func TestToBifrostResponsesResponse_MapsLengthToIncomplete(t *testing.T) {
+	length := string(BifrostFinishReasonLength)
+	resp := (&BifrostChatResponse{
+		Choices: []BifrostResponseChoice{
+			{FinishReason: &length},
+		},
+	}).ToBifrostResponsesResponse()
+
+	if resp == nil || resp.Status == nil {
+		t.Fatal("expected status to be set")
+	}
+	if *resp.Status != "incomplete" {
+		t.Fatalf("expected status %q, got %q", "incomplete", *resp.Status)
+	}
+	if resp.IncompleteDetails == nil {
+		t.Fatal("expected incomplete_details to be set")
+	}
+	if resp.IncompleteDetails.Reason != "max_output_tokens" {
+		t.Fatalf("expected incomplete_details.reason %q, got %q", "max_output_tokens", resp.IncompleteDetails.Reason)
+	}
+	if resp.StopReason == nil || *resp.StopReason != length {
+		t.Fatalf("expected stop_reason %q, got %v", length, resp.StopReason)
+	}
+}
+
+func TestToBifrostResponsesResponse_MapsToolCallsToCompleted(t *testing.T) {
+	toolCalls := string(BifrostFinishReasonToolCalls)
+	resp := (&BifrostChatResponse{
+		Choices: []BifrostResponseChoice{
+			{FinishReason: &toolCalls},
+		},
+	}).ToBifrostResponsesResponse()
+
+	if resp == nil || resp.Status == nil {
+		t.Fatal("expected status to be set")
+	}
+	if *resp.Status != "completed" {
+		t.Fatalf("expected status %q, got %q", "completed", *resp.Status)
+	}
+	if resp.IncompleteDetails != nil {
+		t.Fatal("expected incomplete_details to be nil")
+	}
+	if resp.StopReason == nil || *resp.StopReason != toolCalls {
+		t.Fatalf("expected stop_reason %q, got %v", toolCalls, resp.StopReason)
+	}
+}
+
+func TestToBifrostResponsesResponse_PrioritizesLengthAcrossChoices(t *testing.T) {
+	stop := string(BifrostFinishReasonStop)
+	length := string(BifrostFinishReasonLength)
+	resp := (&BifrostChatResponse{
+		Choices: []BifrostResponseChoice{
+			{FinishReason: &stop},
+			{FinishReason: &length},
+		},
+	}).ToBifrostResponsesResponse()
+
+	if resp == nil || resp.Status == nil {
+		t.Fatal("expected status to be set")
+	}
+	if *resp.Status != "incomplete" {
+		t.Fatalf("expected status %q, got %q", "incomplete", *resp.Status)
+	}
+	if resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != "max_output_tokens" {
+		t.Fatal("expected max_output_tokens incomplete_details")
+	}
+}
+
+func TestToBifrostResponsesResponse_UnknownFinishReasonLeavesStatusUnset(t *testing.T) {
+	unknown := "some_unmapped_reason"
+	resp := (&BifrostChatResponse{
+		Choices: []BifrostResponseChoice{
+			{FinishReason: &unknown},
+		},
+	}).ToBifrostResponsesResponse()
+
+	if resp == nil {
+		t.Fatal("expected non-nil response")
+	}
+	if resp.Status != nil {
+		t.Fatalf("expected status to be nil, got %q", *resp.Status)
+	}
+	if resp.IncompleteDetails != nil {
+		t.Fatal("expected incomplete_details to be nil")
+	}
+	if resp.StopReason != nil {
+		t.Fatalf("expected stop_reason to be nil, got %q", *resp.StopReason)
+	}
+}
+
+func TestToBifrostResponsesResponse_MapsContentFilterToIncomplete(t *testing.T) {
+	for _, finish := range []string{"content_filter", "guardrail_intervened"} {
+		t.Run(finish, func(t *testing.T) {
+			fr := finish
+			resp := (&BifrostChatResponse{
+				Choices: []BifrostResponseChoice{
+					{FinishReason: &fr},
+				},
+			}).ToBifrostResponsesResponse()
+
+			if resp == nil {
+				t.Fatal("expected non-nil response")
+			}
+			if resp.Status == nil || *resp.Status != ResponsesResponseStatusIncomplete {
+				t.Fatalf("expected status %q, got %v", ResponsesResponseStatusIncomplete, resp.Status)
+			}
+			if resp.IncompleteDetails == nil || resp.IncompleteDetails.Reason != ResponsesResponseIncompleteReasonContentFilter {
+				t.Fatalf("expected incomplete_details.reason %q, got %+v", ResponsesResponseIncompleteReasonContentFilter, resp.IncompleteDetails)
+			}
+			if resp.StopReason == nil || *resp.StopReason != finish {
+				t.Fatalf("expected stop_reason %q, got %v", finish, resp.StopReason)
+			}
+		})
+	}
+}
+
+func TestToBifrostResponsesStreamResponse_IncludesFunctionCallsInCompletedOutput(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	role := string(ChatMessageRoleAssistant)
+	part1 := "Let me help"
+	toolCallsFinish := string(BifrostFinishReasonToolCalls)
+	funcName := "get_weather"
+	toolCallID := "call_abc123"
+
+	var all []*BifrostResponsesStreamResponse
+
+	// Role chunk
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{
+						Role: &role,
+					},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	// Text content chunk
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{
+						Content: &part1,
+					},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	// Tool call chunk with function name
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{
+						ToolCalls: []ChatAssistantMessageToolCall{
+							{
+								Index:    0,
+								ID:       &toolCallID,
+								Function: ChatAssistantMessageToolCallFunction{Name: &funcName, Arguments: `{"city":`},
+							},
+						},
+					},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	// Tool call argument continuation
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{
+						ToolCalls: []ChatAssistantMessageToolCall{
+							{
+								Index:    0,
+								Function: ChatAssistantMessageToolCallFunction{Arguments: `"Paris"}`},
+							},
+						},
+					},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	// Finish with tool_calls
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				FinishReason: &toolCallsFinish,
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	var completed *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		if evt != nil && evt.Type == ResponsesStreamResponseTypeCompleted {
+			completed = evt
+		}
+	}
+
+	if completed == nil || completed.Response == nil {
+		t.Fatal("expected response.completed event")
+	}
+	if completed.Response.StopReason == nil || *completed.Response.StopReason != toolCallsFinish {
+		t.Fatalf("expected completed stop_reason %q, got %v", toolCallsFinish, completed.Response.StopReason)
+	}
+
+	output := completed.Response.Output
+	if len(output) < 2 {
+		t.Fatalf("expected at least 2 output items (text + function_call), got %d", len(output))
+	}
+
+	var hasText, hasFunctionCall bool
+	for _, item := range output {
+		if item.Type != nil && *item.Type == ResponsesMessageTypeMessage {
+			hasText = true
+			if item.Content == nil || len(item.Content.ContentBlocks) == 0 || item.Content.ContentBlocks[0].Text == nil {
+				t.Fatal("text message missing content")
+			}
+			if *item.Content.ContentBlocks[0].Text != "Let me help" {
+				t.Fatalf("expected text %q, got %q", "Let me help", *item.Content.ContentBlocks[0].Text)
+			}
+		}
+		if item.Type != nil && *item.Type == ResponsesMessageTypeFunctionCall {
+			hasFunctionCall = true
+			if item.ResponsesToolMessage == nil {
+				t.Fatal("function_call item missing ResponsesToolMessage")
+			}
+			if item.Name == nil || *item.Name != "get_weather" {
+				t.Fatalf("expected function name %q, got %v", "get_weather", item.Name)
+			}
+			if item.Arguments == nil || *item.Arguments != `{"city":"Paris"}` {
+				t.Fatalf("expected arguments %q, got %v", `{"city":"Paris"}`, item.Arguments)
+			}
+			if item.CallID == nil || *item.CallID != toolCallID {
+				t.Fatalf("expected call_id %q, got %v", toolCallID, item.CallID)
+			}
+		}
+	}
+
+	if !hasText {
+		t.Fatal("expected text message in completed output")
+	}
+	if !hasFunctionCall {
+		t.Fatal("expected function_call item in completed output")
+	}
+}
+
+func TestToBifrostResponsesStreamResponse_ToolCallsOnlyInCompletedOutput(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	role := string(ChatMessageRoleAssistant)
+	toolCallsFinish := string(BifrostFinishReasonToolCalls)
+	funcName := "get_weather"
+	toolCallID := "call_xyz789"
+
+	var all []*BifrostResponsesStreamResponse
+
+	// Role chunk
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{
+						Role: &role,
+					},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	// Tool call chunk (no text content at all)
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{
+						ToolCalls: []ChatAssistantMessageToolCall{
+							{
+								Index:    0,
+								ID:       &toolCallID,
+								Function: ChatAssistantMessageToolCallFunction{Name: &funcName, Arguments: `{"q":"test"}`},
+							},
+						},
+					},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	// Finish with tool_calls
+	all = append(all, (&BifrostChatResponse{
+		ID:    "chatcmpl-test",
+		Model: "test-model",
+		Choices: []BifrostResponseChoice{
+			{
+				FinishReason: &toolCallsFinish,
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{
+					Delta: &ChatStreamResponseChoiceDelta{},
+				},
+			},
+		},
+	}).ToBifrostResponsesStreamResponse(state)...)
+
+	var completed *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		if evt != nil && evt.Type == ResponsesStreamResponseTypeCompleted {
+			completed = evt
+		}
+	}
+
+	if completed == nil || completed.Response == nil {
+		t.Fatal("expected response.completed event")
+	}
+
+	output := completed.Response.Output
+	if len(output) != 1 {
+		t.Fatalf("expected 1 output item (function_call only), got %d", len(output))
+	}
+
+	item := output[0]
+	if item.Type == nil || *item.Type != ResponsesMessageTypeFunctionCall {
+		t.Fatal("expected function_call type")
+	}
+	if item.ResponsesToolMessage == nil {
+		t.Fatal("function_call item missing ResponsesToolMessage")
+	}
+	if item.Name == nil || *item.Name != "get_weather" {
+		t.Fatalf("expected function name %q, got %v", "get_weather", item.Name)
+	}
+	if item.Arguments == nil || *item.Arguments != `{"q":"test"}` {
+		t.Fatalf("expected arguments %q, got %v", `{"q":"test"}`, item.Arguments)
+	}
+}
+
+// TestToBifrostResponsesStreamResponse_ContentAfterToolStartNotEmittedPastDone pins the
+// /v1/responses side of text -> tool_call -> text: once the tool call closes the text
+// item (output_item.done), a trailing delta.content must not emit an output_text.delta
+// on that finished item, and must not leak into the completed output text.
+func TestToBifrostResponsesStreamResponse_ContentAfterToolStartNotEmittedPastDone(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	role := string(ChatMessageRoleAssistant)
+	text := "Running it."
+	newline := "\n"
+	toolCallsFinish := string(BifrostFinishReasonToolCalls)
+	funcName := "bash"
+	toolCallID := "call_1"
+
+	chunk := func(delta *ChatStreamResponseChoiceDelta, finish *string) *BifrostChatResponse {
+		return &BifrostChatResponse{
+			ID:    "chatcmpl-test",
+			Model: "test-model",
+			Choices: []BifrostResponseChoice{{
+				FinishReason:             finish,
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: delta},
+			}},
+		}
+	}
+
+	var all []*BifrostResponsesStreamResponse
+	all = append(all, chunk(&ChatStreamResponseChoiceDelta{Role: &role, Content: &text}, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, chunk(&ChatStreamResponseChoiceDelta{ToolCalls: []ChatAssistantMessageToolCall{{
+		Index: 0, ID: &toolCallID, Function: ChatAssistantMessageToolCallFunction{Name: &funcName, Arguments: `{"command":`},
+	}}}, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, chunk(&ChatStreamResponseChoiceDelta{Content: &newline, ToolCalls: []ChatAssistantMessageToolCall{{
+		Index: 0, Function: ChatAssistantMessageToolCallFunction{Arguments: `"echo hi"}`},
+	}}}, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, chunk(&ChatStreamResponseChoiceDelta{}, &toolCallsFinish).ToBifrostResponsesStreamResponse(state)...)
+
+	doneIndices := map[int]bool{}
+	var completed *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		switch evt.Type {
+		case ResponsesStreamResponseTypeOutputItemDone:
+			doneIndices[*evt.OutputIndex] = true
+		case ResponsesStreamResponseTypeOutputTextDelta:
+			if doneIndices[*evt.OutputIndex] {
+				t.Fatalf("output_text.delta %q emitted for output_index %d after its output_item.done", *evt.Delta, *evt.OutputIndex)
+			}
+		case ResponsesStreamResponseTypeCompleted:
+			completed = evt
+		}
+	}
+
+	if completed == nil || completed.Response == nil {
+		t.Fatal("expected response.completed event")
+	}
+	for _, item := range completed.Response.Output {
+		if item.Type != nil && *item.Type == ResponsesMessageTypeMessage {
+			if got := *item.Content.ContentBlocks[0].Text; got != text {
+				t.Fatalf("completed text = %q, want %q", got, text)
+			}
+		}
+		if item.Type != nil && *item.Type == ResponsesMessageTypeFunctionCall {
+			if item.Arguments == nil || *item.Arguments != `{"command":"echo hi"}` {
+				t.Fatalf("function_call arguments = %v, want %q", item.Arguments, `{"command":"echo hi"}`)
+			}
+		}
+	}
+}
+
+func TestToBifrostResponsesStreamResponse_MapsLengthToIncompleteEvent(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	makeChunk := func(role *string, content *string, finishReason *string) *BifrostChatResponse {
+		return &BifrostChatResponse{
+			ID:    "chatcmpl-test",
+			Model: "test-model",
+			Choices: []BifrostResponseChoice{
+				{
+					FinishReason: finishReason,
+					ChatStreamResponseChoice: &ChatStreamResponseChoice{
+						Delta: &ChatStreamResponseChoiceDelta{
+							Role:    role,
+							Content: content,
+						},
+					},
+				},
+			},
+		}
+	}
+
+	role := string(ChatMessageRoleAssistant)
+	part := "Hello"
+	length := string(BifrostFinishReasonLength)
+
+	var all []*BifrostResponsesStreamResponse
+	all = append(all, makeChunk(&role, nil, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, makeChunk(nil, &part, nil).ToBifrostResponsesStreamResponse(state)...)
+	all = append(all, makeChunk(nil, nil, &length).ToBifrostResponsesStreamResponse(state)...)
+
+	var completed *BifrostResponsesStreamResponse
+	var incomplete *BifrostResponsesStreamResponse
+	for _, evt := range all {
+		if evt == nil {
+			continue
+		}
+		if evt.Type == ResponsesStreamResponseTypeCompleted {
+			completed = evt
+		}
+		if evt.Type == ResponsesStreamResponseTypeIncomplete {
+			incomplete = evt
+		}
+	}
+
+	if completed != nil {
+		t.Fatal("did not expect response.completed for finish_reason=length")
+	}
+	if incomplete == nil || incomplete.Response == nil {
+		t.Fatal("expected response.incomplete with response payload")
+	}
+	if incomplete.Response.Status == nil || *incomplete.Response.Status != "incomplete" {
+		t.Fatal("expected terminal response status to be incomplete")
+	}
+	if incomplete.Response.IncompleteDetails == nil || incomplete.Response.IncompleteDetails.Reason != "max_output_tokens" {
+		t.Fatal("expected incomplete_details.reason to be max_output_tokens")
+	}
+	if incomplete.Response.StopReason == nil || *incomplete.Response.StopReason != length {
+		t.Fatalf("expected stop_reason %q, got %v", length, incomplete.Response.StopReason)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// response_format ↔ text.format conversion tests
+// ---------------------------------------------------------------------------
+
+func makeJSONSchemaResponseFormat(name, description string, strict bool, schema interface{}) interface{} {
+	jsObj := map[string]interface{}{
+		"name":   name,
+		"strict": strict,
+		"schema": schema,
+	}
+	if description != "" {
+		jsObj["description"] = description
+	}
+	return map[string]interface{}{
+		"type":        "json_schema",
+		"json_schema": jsObj,
+	}
+}
+
+func TestToResponsesRequest_ResponseFormat_JSONSchema(t *testing.T) {
+	schema := map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{"name": map[string]interface{}{"type": "string"}},
+		"required":   []interface{}{"name"},
+	}
+	rf := makeJSONSchemaResponseFormat("CityInfo", "City schema", true, schema)
+	chatReq := &BifrostChatRequest{
+		Params: &ChatParameters{ResponseFormat: &rf},
+	}
+
+	rr := chatReq.ToResponsesRequest()
+	if rr.Params == nil || rr.Params.Text == nil || rr.Params.Text.Format == nil {
+		t.Fatal("expected Text.Format to be set")
+	}
+	f := rr.Params.Text.Format
+	if f.Type != "json_schema" {
+		t.Fatalf("expected type json_schema, got %q", f.Type)
+	}
+	if f.Name == nil || *f.Name != "CityInfo" {
+		t.Fatalf("expected Name=CityInfo, got %v", f.Name)
+	}
+	if f.Description == nil || *f.Description != "City schema" {
+		t.Fatalf("expected Description='City schema', got %v", f.Description)
+	}
+	if f.Strict == nil || !*f.Strict {
+		t.Fatal("expected Strict=true")
+	}
+	// JSONSchemaFromMap populates typed fields, not the raw Schema *any blob.
+	if f.JSONSchema == nil {
+		t.Fatal("expected JSONSchema to be set")
+	}
+	if f.JSONSchema.Type == nil || *f.JSONSchema.Type != "object" {
+		t.Fatalf("expected JSONSchema.Type=object, got %v", f.JSONSchema.Type)
+	}
+	if f.JSONSchema.Properties == nil {
+		t.Fatal("expected JSONSchema.Properties to be set")
+	}
+	if len(f.JSONSchema.Required) == 0 {
+		t.Fatal("expected JSONSchema.Required to be set")
+	}
+}
+
+func TestToResponsesRequest_ResponseFormat_JSONObject(t *testing.T) {
+	rf := interface{}(map[string]interface{}{"type": "json_object"})
+	chatReq := &BifrostChatRequest{
+		Params: &ChatParameters{ResponseFormat: &rf},
+	}
+
+	rr := chatReq.ToResponsesRequest()
+	if rr.Params == nil || rr.Params.Text == nil || rr.Params.Text.Format == nil {
+		t.Fatal("expected Text.Format to be set")
+	}
+	if rr.Params.Text.Format.Type != "json_object" {
+		t.Fatalf("expected type json_object, got %q", rr.Params.Text.Format.Type)
+	}
+}
+
+func TestToResponsesRequest_ResponseFormat_Text(t *testing.T) {
+	rf := interface{}(map[string]interface{}{"type": "text"})
+	chatReq := &BifrostChatRequest{
+		Params: &ChatParameters{ResponseFormat: &rf},
+	}
+
+	rr := chatReq.ToResponsesRequest()
+	if rr.Params == nil || rr.Params.Text == nil || rr.Params.Text.Format == nil {
+		t.Fatal("expected Text.Format to be set")
+	}
+	if rr.Params.Text.Format.Type != "text" {
+		t.Fatalf("expected type text, got %q", rr.Params.Text.Format.Type)
+	}
+}
+
+func TestToResponsesRequest_NoResponseFormat(t *testing.T) {
+	chatReq := &BifrostChatRequest{
+		Params: &ChatParameters{},
+	}
+	rr := chatReq.ToResponsesRequest()
+	if rr.Params != nil && rr.Params.Text != nil && rr.Params.Text.Format != nil {
+		t.Fatal("expected Text.Format to be nil when no response_format set")
+	}
+}
+
+func TestToChatRequest_TextFormat_JSONSchema(t *testing.T) {
+	// "type" before "required" is non-alphabetical on purpose: a regression to
+	// sorted marshaling would reorder them and fail the exact-bytes assertion below.
+	schema := NewOrderedMapFromPairs(
+		KV("type", "object"),
+		KV("required", []interface{}{"country"}),
+	)
+	rr := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{
+			Text: &ResponsesTextConfig{
+				Format: &ResponsesTextConfigFormat{
+					Type:        "json_schema",
+					Name:        Ptr("CityInfo"),
+					Description: Ptr("City schema"),
+					Strict:      Ptr(true),
+					JSONSchema:  &ResponsesTextConfigFormatJSONSchema{Schema: &JSONSchemaOrBool{SchemaMap: schema}},
+				},
+			},
+		},
+	}
+
+	cr := rr.ToChatRequest()
+	if cr.Params == nil || cr.Params.ResponseFormat == nil {
+		t.Fatal("expected ResponseFormat to be set")
+	}
+	rfMap := responseFormatAsMap(t, cr.Params.ResponseFormat)
+	if rfMap["type"] != "json_schema" {
+		t.Fatalf("expected type json_schema, got %v", rfMap["type"])
+	}
+	jsObj := nestedMap(t, rfMap, "json_schema")
+	if jsObj["name"] != "CityInfo" {
+		t.Fatalf("expected name=CityInfo, got %v", jsObj["name"])
+	}
+	if jsObj["description"] != "City schema" {
+		t.Fatalf("expected description='City schema', got %v", jsObj["description"])
+	}
+	if jsObj["strict"] != true {
+		t.Fatalf("expected strict=true, got %v", jsObj["strict"])
+	}
+	if jsObj["schema"] == nil {
+		t.Fatal("expected schema to be set")
+	}
+	schemaBytes, err := MarshalSorted(jsObj["schema"])
+	if err != nil {
+		t.Fatalf("failed to marshal schema: %v", err)
+	}
+	if want := `{"type":"object","required":["country"]}`; string(schemaBytes) != want {
+		t.Fatalf("schema key order not preserved: want %s, got %s", want, string(schemaBytes))
+	}
+}
+
+func TestToChatRequest_TextFormat_JSONObject(t *testing.T) {
+	rr := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{
+			Text: &ResponsesTextConfig{
+				Format: &ResponsesTextConfigFormat{Type: "json_object"},
+			},
+		},
+	}
+
+	cr := rr.ToChatRequest()
+	if cr.Params == nil || cr.Params.ResponseFormat == nil {
+		t.Fatal("expected ResponseFormat to be set")
+	}
+	rfMap := responseFormatAsMap(t, cr.Params.ResponseFormat)
+	if rfMap["type"] != "json_object" {
+		t.Fatalf("expected type json_object, got %v", rfMap["type"])
+	}
+	if _, hasJS := rfMap["json_schema"]; hasJS {
+		t.Fatal("json_schema key should not be present for json_object type")
+	}
+}
+
+func TestToChatRequest_NoTextFormat(t *testing.T) {
+	rr := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{},
+	}
+	cr := rr.ToChatRequest()
+	if cr.Params != nil && cr.Params.ResponseFormat != nil {
+		t.Fatal("expected ResponseFormat to be nil when no text.format set")
+	}
+}
+
+func TestResponseFormatRoundTrip_ChatToResponsesAndBack(t *testing.T) {
+	schema := map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{"city": map[string]interface{}{"type": "string"}},
+	}
+	rf := makeJSONSchemaResponseFormat("CityInfo", "City schema", true, schema)
+	chatReq := &BifrostChatRequest{
+		Params: &ChatParameters{ResponseFormat: &rf},
+	}
+
+	// Chat → Responses → Chat
+	rr := chatReq.ToResponsesRequest()
+	cr := rr.ToChatRequest()
+
+	if cr.Params == nil || cr.Params.ResponseFormat == nil {
+		t.Fatal("expected ResponseFormat to survive round-trip")
+	}
+	rfMap := responseFormatAsMap(t, cr.Params.ResponseFormat)
+	if rfMap["type"] != "json_schema" {
+		t.Fatalf("type did not survive round-trip: got %v", rfMap["type"])
+	}
+	jsObj := nestedMap(t, rfMap, "json_schema")
+	if jsObj["name"] != "CityInfo" {
+		t.Fatalf("name did not survive round-trip: got %v", jsObj["name"])
+	}
+	if jsObj["description"] != "City schema" {
+		t.Fatalf("description did not survive round-trip: got %v", jsObj["description"])
+	}
+	if jsObj["strict"] != true {
+		t.Fatalf("strict did not survive round-trip: got %v", jsObj["strict"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// JSON wire-format tests (catch serialization bugs, not just struct values)
+// ---------------------------------------------------------------------------
+
+// TestToResponsesRequest_JSONSchema_NoDoubleNesting verifies that the json_schema
+// body serializes as "schema": {...} and NOT "schema": {"schema": {...}}.
+func TestToResponsesRequest_JSONSchema_NoDoubleNesting(t *testing.T) {
+	schema := map[string]interface{}{
+		"type":       "object",
+		"properties": map[string]interface{}{"name": map[string]interface{}{"type": "string"}},
+		"required":   []interface{}{"name"},
+	}
+	rf := makeJSONSchemaResponseFormat("CityInfo", "", true, schema)
+	chatReq := &BifrostChatRequest{
+		Params: &ChatParameters{ResponseFormat: &rf},
+	}
+
+	rr := chatReq.ToResponsesRequest()
+	if rr.Params == nil || rr.Params.Text == nil || rr.Params.Text.Format == nil {
+		t.Fatal("expected Text.Format to be set")
+	}
+
+	// Marshal to JSON and inspect the wire shape
+	b, err := json.Marshal(rr.Params.Text.Format)
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+
+	var wire map[string]interface{}
+	if err := json.Unmarshal(b, &wire); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+
+	schemaVal, ok := wire["schema"]
+	if !ok {
+		t.Fatalf("expected 'schema' key in wire format, got: %s", string(b))
+	}
+
+	schemaMap, ok := schemaVal.(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected schema to be an object, got: %T — wire: %s", schemaVal, string(b))
+	}
+
+	// Must NOT have a nested "schema" key (double-nesting bug)
+	if _, nested := schemaMap["schema"]; nested {
+		t.Fatalf("double-nested schema detected: wire=%s", string(b))
+	}
+
+	// Must have the actual schema fields at the top level
+	if schemaMap["type"] != "object" {
+		t.Fatalf("expected schema.type=object, wire=%s", string(b))
+	}
+}
+
+// TestToChatRequest_TextFormat_TypedFields verifies that when a Responses API
+// request has schema fields spread across the typed fields of
+// ResponsesTextConfigFormatJSONSchema (Schema==nil), ToChatRequest still
+// produces a valid response_format with a non-empty json_schema.schema body.
+func TestToChatRequest_TextFormat_TypedFields(t *testing.T) {
+	// "zip" before "age" is non-alphabetical on purpose: a regression to sorted
+	// marshaling would reorder them and fail the exact-bytes assertion below.
+	props := NewOrderedMapFromPairs(
+		KV("zip", map[string]any{"type": "string"}),
+		KV("age", map[string]any{"type": "integer"}),
+	)
+	rr := &BifrostResponsesRequest{
+		Params: &ResponsesParameters{
+			Text: &ResponsesTextConfig{
+				Format: &ResponsesTextConfigFormat{
+					Type:   "json_schema",
+					Name:   Ptr("CityInfo"),
+					Strict: Ptr(true),
+					// Schema is nil — fields are spread across typed fields (direct client path)
+					JSONSchema: &ResponsesTextConfigFormatJSONSchema{
+						Type:       Ptr("object"),
+						Properties: props,
+						Required:   []string{"zip", "age"},
+						// Schema is intentionally nil here
+					},
+				},
+			},
+		},
+	}
+
+	cr := rr.ToChatRequest()
+	if cr.Params == nil || cr.Params.ResponseFormat == nil {
+		t.Fatal("expected ResponseFormat to be set")
+	}
+
+	rfMap := responseFormatAsMap(t, cr.Params.ResponseFormat)
+
+	jsObj := nestedMap(t, rfMap, "json_schema")
+
+	// Schema body must be present and non-empty
+	schemaVal, ok := jsObj["schema"]
+	if !ok {
+		t.Fatalf("schema body silently dropped: json_schema=%v", jsObj)
+	}
+
+	// The schema is handed back as an OrderedMap so the key order the client
+	// declared survives the Responses -> Chat rewrite.
+	schemaMap, ok := SafeExtractOrderedMap(schemaVal)
+	if !ok {
+		t.Fatalf("expected schema to be an ordered map, got %T", schemaVal)
+	}
+	if schemaType, _ := schemaMap.Get("type"); schemaType != "object" {
+		t.Fatalf("expected schema.type=object, got %v", schemaType)
+	}
+	schemaProps, _ := schemaMap.Get("properties")
+	propsBytes, err := MarshalSorted(schemaProps)
+	if err != nil {
+		t.Fatalf("failed to marshal properties: %v", err)
+	}
+	if want := `{"zip":{"type":"string"},"age":{"type":"integer"}}`; string(propsBytes) != want {
+		t.Fatalf("properties key order not preserved: want %s, got %s", want, string(propsBytes))
+	}
+}
+
+// streamChunk builds a single Chat streaming chunk for the reasoning/text ordering tests.
+func streamChunk(id string, delta *ChatStreamResponseChoiceDelta, finishReason *string) *BifrostChatResponse {
+	return &BifrostChatResponse{
+		ID:    id,
+		Model: "deepseek-reasoner",
+		Choices: []BifrostResponseChoice{
+			{
+				Index:                    0,
+				FinishReason:             finishReason,
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: delta},
+			},
+		},
+	}
+}
+
+// TestToBifrostResponsesStreamResponse_ReasoningOpensThinkingBlock reproduces the
+// Claude Code "Content block not found" disconnect: a Chat-Completions reasoning
+// model (reasoning_content first, then content) must yield a proper reasoning output
+// item (added -> deltas carrying its ItemID -> done) BEFORE the text item, so the
+// Anthropic reverse converter emits content_block_start type=thinking before any
+// thinking delta. Previously reasoning only opened a text item and the reasoning
+// delta had no ItemID, producing an orphan thinking block.
+func TestToBifrostResponsesStreamResponse_ReasoningOpensThinkingBlock(t *testing.T) {
+	state := AcquireChatToResponsesStreamState()
+	defer ReleaseChatToResponsesStreamState(state)
+
+	chunks := []*BifrostChatResponse{
+		streamChunk("c1", &ChatStreamResponseChoiceDelta{Role: Ptr("assistant"), Reasoning: Ptr("")}, nil),
+		streamChunk("c1", &ChatStreamResponseChoiceDelta{Reasoning: Ptr("The")}, nil),
+		streamChunk("c1", &ChatStreamResponseChoiceDelta{Reasoning: Ptr(" user")}, nil),
+		streamChunk("c1", &ChatStreamResponseChoiceDelta{Content: Ptr("Run ")}, nil),
+		streamChunk("c1", &ChatStreamResponseChoiceDelta{Content: Ptr("tests")}, nil),
+		streamChunk("c1", &ChatStreamResponseChoiceDelta{}, Ptr("stop")),
+	}
+
+	var events []*BifrostResponsesStreamResponse
+	for _, c := range chunks {
+		events = append(events, c.ToBifrostResponsesStreamResponse(state)...)
+	}
+
+	var reasoningItemID string
+	reasoningOutputIndex, textOutputIndex := -1, -1
+	reasoningAddedIdx, reasoningDoneIdx, textAddedIdx := -1, -1, -1
+	firstReasoningDeltaIdx := -1
+
+	for i, e := range events {
+		switch e.Type {
+		case ResponsesStreamResponseTypeOutputItemAdded:
+			if e.Item != nil && e.Item.Type != nil && *e.Item.Type == ResponsesMessageTypeReasoning {
+				if reasoningAddedIdx == -1 {
+					reasoningAddedIdx = i
+				}
+				if e.Item.ID != nil {
+					reasoningItemID = *e.Item.ID
+				}
+				if e.OutputIndex != nil {
+					reasoningOutputIndex = *e.OutputIndex
+				}
+			}
+			if e.Item != nil && e.Item.Type != nil && *e.Item.Type == ResponsesMessageTypeMessage {
+				if textAddedIdx == -1 {
+					textAddedIdx = i
+				}
+				if e.OutputIndex != nil {
+					textOutputIndex = *e.OutputIndex
+				}
+			}
+		case ResponsesStreamResponseTypeReasoningSummaryTextDelta:
+			if firstReasoningDeltaIdx == -1 {
+				firstReasoningDeltaIdx = i
+			}
+			if e.ItemID == nil || *e.ItemID == "" {
+				t.Fatalf("reasoning delta at event %d has no ItemID (orphan thinking block)", i)
+			}
+			if e.ItemID != nil && *e.ItemID != reasoningItemID {
+				t.Fatalf("reasoning delta ItemID %q != reasoning item ID %q", *e.ItemID, reasoningItemID)
+			}
+		case ResponsesStreamResponseTypeOutputItemDone:
+			if e.Item != nil && e.Item.Type != nil && *e.Item.Type == ResponsesMessageTypeReasoning && reasoningDoneIdx == -1 {
+				reasoningDoneIdx = i
+			}
+		}
+	}
+
+	if reasoningAddedIdx == -1 {
+		t.Fatal("no reasoning output_item.added emitted")
+	}
+	if firstReasoningDeltaIdx == -1 {
+		t.Fatal("no reasoning delta emitted")
+	}
+	if reasoningAddedIdx >= firstReasoningDeltaIdx {
+		t.Fatalf("reasoning output_item.added (%d) must precede first reasoning delta (%d)", reasoningAddedIdx, firstReasoningDeltaIdx)
+	}
+	if reasoningDoneIdx == -1 {
+		t.Fatal("no reasoning output_item.done emitted (thinking block never closed)")
+	}
+	if textAddedIdx == -1 {
+		t.Fatal("no text output_item.added emitted")
+	}
+	if reasoningDoneIdx >= textAddedIdx {
+		t.Fatalf("reasoning output_item.done (%d) must precede text output_item.added (%d)", reasoningDoneIdx, textAddedIdx)
+	}
+	if reasoningOutputIndex != 0 {
+		t.Fatalf("reasoning output index = %d, want 0 (reasoning first)", reasoningOutputIndex)
+	}
+	if textOutputIndex <= reasoningOutputIndex {
+		t.Fatalf("text output index %d must be greater than reasoning output index %d", textOutputIndex, reasoningOutputIndex)
+	}
+}
+
+// responseFormatAsMap reads a converted chat response_format regardless of its
+// representation. The Responses to Chat conversion emits raw JSON (the same
+// representation the chat wire decode produces), so tests read it through the
+// same accessor providers use rather than type-asserting a map.
+func responseFormatAsMap(t *testing.T, responseFormat *interface{}) map[string]interface{} {
+	t.Helper()
+	om, ok := SafeExtractOrderedMap(*responseFormat)
+	if !ok || om == nil {
+		t.Fatalf("expected response_format to be readable as an object, got %T", *responseFormat)
+	}
+	return om.ToMap()
+}
+
+func nestedMap(t *testing.T, parent map[string]interface{}, key string) map[string]interface{} {
+	t.Helper()
+	om, ok := SafeExtractOrderedMap(parent[key])
+	if !ok || om == nil {
+		t.Fatalf("expected %q to be an object, got %T", key, parent[key])
+	}
+	return om.ToMap()
+}
+
+func responsesTextOutput(text string) []ResponsesMessage {
+	return []ResponsesMessage{
+		{
+			Type: Ptr(ResponsesMessageTypeMessage),
+			Role: Ptr(ResponsesInputMessageRoleAssistant),
+			Content: &ResponsesMessageContent{
+				ContentBlocks: []ResponsesMessageContentBlock{
+					{Type: ResponsesOutputMessageContentTypeText, Text: &text},
+				},
+			},
+		},
+	}
+}
+
+func TestToBifrostChatResponse_MapsCompletedToStop(t *testing.T) {
+	chatResp := (&BifrostResponsesResponse{
+		Status: Ptr(ResponsesResponseStatusCompleted),
+		Output: responsesTextOutput("ok"),
+	}).ToBifrostChatResponse()
+
+	if chatResp == nil || len(chatResp.Choices) == 0 {
+		t.Fatal("expected at least one choice")
+	}
+	if chatResp.Choices[0].FinishReason == nil {
+		t.Fatal("expected finish_reason to be set")
+	}
+	if got := *chatResp.Choices[0].FinishReason; got != string(BifrostFinishReasonStop) {
+		t.Fatalf("expected finish_reason %q, got %q", BifrostFinishReasonStop, got)
+	}
+}
+
+func TestToBifrostChatResponse_MapsFunctionCallToToolCalls(t *testing.T) {
+	chatResp := (&BifrostResponsesResponse{
+		Status: Ptr(ResponsesResponseStatusCompleted),
+		Output: []ResponsesMessage{
+			{
+				Type: Ptr(ResponsesMessageTypeFunctionCall),
+				Role: Ptr(ResponsesInputMessageRoleAssistant),
+				ResponsesToolMessage: &ResponsesToolMessage{
+					CallID:    Ptr("call_1"),
+					Name:      Ptr("search"),
+					Arguments: Ptr(`{"q":"x"}`),
+				},
+			},
+		},
+	}).ToBifrostChatResponse()
+
+	if chatResp == nil || len(chatResp.Choices) == 0 {
+		t.Fatal("expected at least one choice")
+	}
+	if chatResp.Choices[0].FinishReason == nil {
+		t.Fatal("expected finish_reason to be set")
+	}
+	if got := *chatResp.Choices[0].FinishReason; got != string(BifrostFinishReasonToolCalls) {
+		t.Fatalf("expected finish_reason %q, got %q", BifrostFinishReasonToolCalls, got)
+	}
+}
+
+func TestToBifrostChatResponse_MapsIncompleteDetails(t *testing.T) {
+	cases := map[string]string{
+		ResponsesResponseIncompleteReasonMaxOutputTokens: string(BifrostFinishReasonLength),
+		ResponsesResponseIncompleteReasonContentFilter:   "content_filter",
+	}
+
+	for reason, expected := range cases {
+		t.Run(reason, func(t *testing.T) {
+			chatResp := (&BifrostResponsesResponse{
+				Status:            Ptr(ResponsesResponseStatusIncomplete),
+				IncompleteDetails: &ResponsesResponseIncompleteDetails{Reason: reason},
+				Output:            responsesTextOutput("partial"),
+			}).ToBifrostChatResponse()
+
+			if chatResp == nil || len(chatResp.Choices) == 0 {
+				t.Fatal("expected at least one choice")
+			}
+			if chatResp.Choices[0].FinishReason == nil {
+				t.Fatal("expected finish_reason to be set")
+			}
+			if got := *chatResp.Choices[0].FinishReason; got != expected {
+				t.Fatalf("expected finish_reason %q, got %q", expected, got)
+			}
+		})
+	}
+}
+
+func TestToBifrostChatResponse_PrefersExplicitStopReason(t *testing.T) {
+	// A recognized stop_reason wins over the status-derived reason.
+	chatResp := (&BifrostResponsesResponse{
+		Status:     Ptr(ResponsesResponseStatusCompleted),
+		StopReason: Ptr("guardrail_intervened"),
+		Output:     responsesTextOutput("blocked"),
+	}).ToBifrostChatResponse()
+
+	if chatResp == nil || len(chatResp.Choices) == 0 {
+		t.Fatal("expected at least one choice")
+	}
+	if chatResp.Choices[0].FinishReason == nil || *chatResp.Choices[0].FinishReason != "guardrail_intervened" {
+		t.Fatalf("expected finish_reason %q, got %v", "guardrail_intervened", chatResp.Choices[0].FinishReason)
+	}
+}
+
+func TestToBifrostChatResponse_LeavesFinishReasonUnsetForNonTerminalState(t *testing.T) {
+	for _, status := range []string{ResponsesResponseStatusInProgress, ResponsesResponseStatusQueued} {
+		t.Run(status, func(t *testing.T) {
+			// The stop_reason is deliberately set and recognized: an in-flight status
+			// must outrank it, otherwise this test passes for the wrong reason.
+			chatResp := (&BifrostResponsesResponse{
+				Status:     Ptr(status),
+				StopReason: Ptr(string(BifrostFinishReasonStop)),
+				Output:     responsesTextOutput("partial"),
+			}).ToBifrostChatResponse()
+
+			if chatResp == nil || len(chatResp.Choices) == 0 {
+				t.Fatal("expected at least one choice")
+			}
+			if chatResp.Choices[0].FinishReason != nil {
+				t.Fatalf("expected finish_reason to be nil, got %q", *chatResp.Choices[0].FinishReason)
+			}
+		})
+	}
+}
+
+// The served tier/speed/geo drive billing and are echoed to the client, so a
+// chat request bridged to Responses (or a Responses request bridged to chat)
+// must carry them across; pre-fix service_tier "fast" came back null.
+func TestResponsesChatBridgeCarriesServedTier(t *testing.T) {
+	tier := BifrostServiceTierFast
+	speed, geo := "fast", "us"
+
+	chat := (&BifrostResponsesResponse{
+		Status:       Ptr(ResponsesResponseStatusCompleted),
+		Output:       responsesTextOutput("ok"),
+		ServiceTier:  &tier,
+		Speed:        &speed,
+		InferenceGeo: &geo,
+	}).ToBifrostChatResponse()
+	if chat.ServiceTier == nil || *chat.ServiceTier != tier {
+		t.Fatalf("responses->chat dropped service_tier: %v", chat.ServiceTier)
+	}
+	if chat.Speed == nil || *chat.Speed != speed || chat.InferenceGeo == nil || *chat.InferenceGeo != geo {
+		t.Fatalf("responses->chat dropped speed/inference_geo: %v %v", chat.Speed, chat.InferenceGeo)
+	}
+
+	back := (&BifrostChatResponse{ServiceTier: &tier, Speed: &speed, InferenceGeo: &geo}).ToBifrostResponsesResponse()
+	if back.ServiceTier == nil || *back.ServiceTier != tier {
+		t.Fatalf("chat->responses dropped service_tier: %v", back.ServiceTier)
+	}
+	if back.Speed == nil || *back.Speed != speed || back.InferenceGeo == nil || *back.InferenceGeo != geo {
+		t.Fatalf("chat->responses dropped speed/inference_geo: %v %v", back.Speed, back.InferenceGeo)
+	}
+
+	chunk := (&BifrostResponsesStreamResponse{
+		Type:     ResponsesStreamResponseTypeCompleted,
+		Response: &BifrostResponsesResponse{Status: Ptr(ResponsesResponseStatusCompleted), ServiceTier: &tier, Speed: &speed, InferenceGeo: &geo},
+	}).ToBifrostChatResponse()
+	if chunk.ServiceTier == nil || *chunk.ServiceTier != tier {
+		t.Fatalf("responses stream->chat chunk dropped service_tier: %v", chunk.ServiceTier)
+	}
+	if chunk.Speed == nil || *chunk.Speed != speed || chunk.InferenceGeo == nil || *chunk.InferenceGeo != geo {
+		t.Fatalf("responses stream->chat chunk dropped speed/inference_geo: %v %v", chunk.Speed, chunk.InferenceGeo)
+	}
+}
+
+// A chat stream served to a Responses client must carry the served tier/speed/geo onto
+// the terminal response even when, as with OpenAI, they ride an earlier chunk and the
+// finish chunk omits them; and a pooled state must not leak them into the next stream.
+func TestChatStreamToResponsesStreamCarriesServedTier(t *testing.T) {
+	tier := BifrostServiceTierFast
+	speed, geo := "fast", "us"
+	role := string(ChatMessageRoleAssistant)
+	text := "ok"
+	stop := string(BifrostFinishReasonStop)
+	chunk := func(delta *ChatStreamResponseChoiceDelta, finish *string, served bool) *BifrostChatResponse {
+		cr := &BifrostChatResponse{
+			ID:    "chatcmpl-tier",
+			Model: "gpt-6-astra",
+			Choices: []BifrostResponseChoice{{
+				FinishReason:             finish,
+				ChatStreamResponseChoice: &ChatStreamResponseChoice{Delta: delta},
+			}},
+		}
+		if served {
+			cr.ServiceTier, cr.Speed, cr.InferenceGeo = &tier, &speed, &geo
+		}
+		return cr
+	}
+	terminal := func(served bool) *BifrostResponsesResponse {
+		state := AcquireChatToResponsesStreamState()
+		defer ReleaseChatToResponsesStreamState(state)
+		var events []*BifrostResponsesStreamResponse
+		events = append(events, chunk(&ChatStreamResponseChoiceDelta{Role: &role}, nil, served).ToBifrostResponsesStreamResponse(state)...)
+		events = append(events, chunk(&ChatStreamResponseChoiceDelta{Content: &text}, nil, served).ToBifrostResponsesStreamResponse(state)...)
+		events = append(events, chunk(&ChatStreamResponseChoiceDelta{}, &stop, false).ToBifrostResponsesStreamResponse(state)...)
+		for _, evt := range events {
+			if evt != nil && evt.Type == ResponsesStreamResponseTypeCompleted {
+				return evt.Response
+			}
+		}
+		t.Fatal("no response.completed event")
+		return nil
+	}
+
+	served := terminal(true)
+	if served.ServiceTier == nil || *served.ServiceTier != tier {
+		t.Fatalf("chat stream->responses completed dropped service_tier: %v", served.ServiceTier)
+	}
+	if served.Speed == nil || *served.Speed != speed || served.InferenceGeo == nil || *served.InferenceGeo != geo {
+		t.Fatalf("chat stream->responses completed dropped speed/inference_geo: %v %v", served.Speed, served.InferenceGeo)
+	}
+
+	plain := terminal(false)
+	if plain.ServiceTier != nil || plain.Speed != nil || plain.InferenceGeo != nil {
+		t.Fatalf("pooled stream state leaked served metadata into the next stream: %v %v %v", plain.ServiceTier, plain.Speed, plain.InferenceGeo)
+	}
+}
+
+func TestResponsesStreamToBifrostChatResponse_MapsIncompleteContentFilter(t *testing.T) {
+	chunk := &BifrostResponsesStreamResponse{
+		Type: ResponsesStreamResponseTypeIncomplete,
+		Response: &BifrostResponsesResponse{
+			Status:            Ptr(ResponsesResponseStatusIncomplete),
+			IncompleteDetails: &ResponsesResponseIncompleteDetails{Reason: ResponsesResponseIncompleteReasonContentFilter},
+		},
+	}
+
+	resp := chunk.ToBifrostChatResponse()
+	if resp == nil || len(resp.Choices) == 0 {
+		t.Fatal("expected at least one choice")
+	}
+	if resp.Choices[0].FinishReason == nil || *resp.Choices[0].FinishReason != "content_filter" {
+		t.Fatalf("expected finish_reason %q, got %v", "content_filter", resp.Choices[0].FinishReason)
+	}
+}
+
+// Cohere never sets Status and Gemini sets it only on error, so a nil or "failed"
+// status must still resolve through stop_reason rather than falling through to unset.
+func TestToBifrostChatResponse_MapsStopReasonWithoutTerminalStatus(t *testing.T) {
+	cases := []struct {
+		name       string
+		status     *string
+		stopReason string
+		expected   string
+	}{
+		{"nil status (cohere)", nil, string(BifrostFinishReasonStop), string(BifrostFinishReasonStop)},
+		{"nil status tool calls", nil, string(BifrostFinishReasonToolCalls), string(BifrostFinishReasonToolCalls)},
+		{"failed status (gemini safety)", Ptr(ResponsesResponseStatusFailed), "content_filter", "content_filter"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			chatResp := (&BifrostResponsesResponse{
+				Status:     tc.status,
+				StopReason: Ptr(tc.stopReason),
+				Output:     responsesTextOutput("hi"),
+			}).ToBifrostChatResponse()
+
+			if chatResp == nil || len(chatResp.Choices) == 0 {
+				t.Fatal("expected at least one choice")
+			}
+			if chatResp.Choices[0].FinishReason == nil {
+				t.Fatal("expected finish_reason to be set")
+			}
+			if got := *chatResp.Choices[0].FinishReason; got != tc.expected {
+				t.Fatalf("expected finish_reason %q, got %q", tc.expected, got)
+			}
+		})
+	}
+}
+
+// The Responses schema requires reasoning.summary to be an array. A nil slice marshals
+// to null, which upstreams reject with "Invalid 'input': value did not match any
+// expected variant" — breaking multi-turn tool loops that replay encrypted reasoning.
+func TestToResponsesMessages_EncryptedReasoningMarshalsSummaryAsArray(t *testing.T) {
+	encrypted := "rsn_abc123"
+	cm := &ChatMessage{
+		Role: ChatMessageRoleAssistant,
+		ChatAssistantMessage: &ChatAssistantMessage{
+			ReasoningDetails: []ChatReasoningDetails{
+				{Index: 0, Type: BifrostReasoningDetailsTypeEncrypted, Data: &encrypted},
+			},
+		},
+	}
+
+	out := cm.ToResponsesMessages()
+	if len(out) == 0 {
+		t.Fatal("expected a reasoning message")
+	}
+	if out[0].Type == nil || *out[0].Type != ResponsesMessageTypeReasoning {
+		t.Fatalf("expected a reasoning item, got %#v", out[0].Type)
+	}
+	if out[0].ResponsesReasoning == nil {
+		t.Fatal("expected reasoning payload to be set")
+	}
+	if out[0].ResponsesReasoning.Summary == nil {
+		t.Fatal("summary must be a non-nil slice so it marshals as [] rather than null")
+	}
+
+	encoded, err := json.Marshal(out[0])
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"summary":[]`) {
+		t.Fatalf(`expected "summary":[] in %s`, encoded)
+	}
+	if strings.Contains(string(encoded), `"summary":null`) {
+		t.Fatalf("summary must never marshal as null: %s", encoded)
+	}
+}
+
+// Every response family carrying a Usage must be reachable through
+// NormalizedUsage, or be listed as a known exclusion. DecisionResponse was added
+// to the logging plugin's switch but not here, so decision rows silently lost
+// their token counts.
+func TestNormalizedUsageCoversEveryUsageBearingFamily(t *testing.T) {
+	handled := map[string]bool{}
+	for _, name := range normalizedUsageFamilies {
+		handled[name] = true
+	}
+	// Pre-existing gaps, present in the hand-rolled switch this replaced too.
+	// Streams are accumulated into their non-stream family before they reach a
+	// logging or span path; video has never been wired to either.
+	knownExcluded := map[string]string{
+		"SpeechStreamResponse":          "accumulated into SpeechResponse",
+		"TranscriptionStreamResponse":   "accumulated into TranscriptionResponse",
+		"ImageGenerationStreamResponse": "accumulated into ImageGenerationResponse",
+		"VideoGenerationResponse":       "never wired to logging or spans",
+	}
+
+	rt := reflect.TypeOf(BifrostResponse{})
+	for i := 0; i < rt.NumField(); i++ {
+		f := rt.Field(i)
+		if !strings.HasSuffix(f.Name, "Response") || f.Type.Kind() != reflect.Ptr {
+			continue
+		}
+		inner := f.Type.Elem()
+		if inner.Kind() != reflect.Struct {
+			continue
+		}
+		if _, hasUsage := inner.FieldByName("Usage"); !hasUsage {
+			continue
+		}
+		if handled[f.Name] {
+			if _, excluded := knownExcluded[f.Name]; excluded {
+				t.Errorf("%s is both handled and listed as excluded", f.Name)
+			}
+			continue
+		}
+		if _, excluded := knownExcluded[f.Name]; !excluded {
+			t.Errorf("%s carries a Usage field but NormalizedUsage does not read it; "+
+				"a request of that family would report zero tokens", f.Name)
+		}
+	}
+	// A stale exclusion is drift too.
+	for name := range knownExcluded {
+		if _, ok := rt.FieldByName(name); !ok {
+			t.Errorf("knownExcluded lists %s, which is no longer a BifrostResponse field", name)
+		}
+	}
+}
+
+// normalizedUsageFamilies lists what NormalizedUsage reads.
+var normalizedUsageFamilies = []string{
+	"TextCompletionResponse", "ChatResponse", "ResponsesResponse", "CompactionResponse",
+	"EmbeddingResponse", "RerankResponse", "DecisionResponse", "TranscriptionResponse",
+	"SpeechResponse", "ImageGenerationResponse", "PassthroughResponse",
+}
+
+// A provider may report total_tokens: 0 alongside real input/output counts.
+// Speech derived the total in that case; transcription only did so when the
+// pointer was nil, so it returned zero. Both now agree.
+func TestNormalizedUsageDerivesTotalWhenReportedZero(t *testing.T) {
+	i64 := func(v int) *int { return &v }
+
+	for _, tc := range []struct {
+		name      string
+		resp      *BifrostResponse
+		wantTotal int
+	}{
+		{
+			"transcription, total reported zero",
+			&BifrostResponse{TranscriptionResponse: &BifrostTranscriptionResponse{
+				Usage: &TranscriptionUsage{InputTokens: i64(7), OutputTokens: i64(3), TotalTokens: i64(0)},
+			}},
+			10,
+		},
+		{
+			"transcription, total nil",
+			&BifrostResponse{TranscriptionResponse: &BifrostTranscriptionResponse{
+				Usage: &TranscriptionUsage{InputTokens: i64(7), OutputTokens: i64(3)},
+			}},
+			10,
+		},
+		{
+			"transcription, total reported and correct",
+			&BifrostResponse{TranscriptionResponse: &BifrostTranscriptionResponse{
+				Usage: &TranscriptionUsage{InputTokens: i64(7), OutputTokens: i64(3), TotalTokens: i64(10)},
+			}},
+			10,
+		},
+		{
+			"transcription, provider total wins when non-zero",
+			&BifrostResponse{TranscriptionResponse: &BifrostTranscriptionResponse{
+				Usage: &TranscriptionUsage{InputTokens: i64(7), OutputTokens: i64(3), TotalTokens: i64(99)},
+			}},
+			99,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			u := tc.resp.NormalizedUsage()
+			if u == nil {
+				t.Fatal("NormalizedUsage returned nil")
+			}
+			if u.TotalTokens != tc.wantTotal {
+				t.Errorf("TotalTokens = %d, want %d", u.TotalTokens, tc.wantTotal)
+			}
+		})
+	}
+}
+
+// reasoning.type must survive the chat<->responses conversion used when a
+// provider only implements one of the two APIs.
+func TestReasoningTypeSurvivesChatResponsesConversion(t *testing.T) {
+	chat := &BifrostChatRequest{
+		Model:  "claude-sonnet-5-5",
+		Params: &ChatParameters{Reasoning: &ChatReasoning{Type: Ptr("between_tools")}},
+	}
+	responses := chat.ToResponsesRequest()
+	if responses.Params == nil || responses.Params.Reasoning == nil || responses.Params.Reasoning.Type == nil ||
+		*responses.Params.Reasoning.Type != "between_tools" {
+		t.Fatalf("chat->responses dropped reasoning.type: %+v", responses.Params)
+	}
+	back := responses.ToChatRequest()
+	if back.Params == nil || back.Params.Reasoning == nil || back.Params.Reasoning.Type == nil ||
+		*back.Params.Reasoning.Type != "between_tools" {
+		t.Fatalf("responses->chat dropped reasoning.type: %+v", back.Params)
+	}
+}
+
+// reasoning.mode must survive the chat<->responses conversion: a chat request that
+// sets it is served by the Responses API, and a mode-only reasoning object must not
+// be dropped by the "anything set?" guard.
+func TestReasoningModeSurvivesChatResponsesConversion(t *testing.T) {
+	chat := &BifrostChatRequest{
+		Model:  "gpt-6-luna",
+		Params: &ChatParameters{Reasoning: &ChatReasoning{Mode: Ptr("pro")}},
+	}
+	responses := chat.ToResponsesRequest()
+	if responses.Params == nil || responses.Params.Reasoning == nil || responses.Params.Reasoning.Mode == nil ||
+		*responses.Params.Reasoning.Mode != "pro" {
+		t.Fatalf("chat->responses dropped reasoning.mode: %+v", responses.Params)
+	}
+	back := responses.ToChatRequest()
+	if back.Params == nil || back.Params.Reasoning == nil || back.Params.Reasoning.Mode == nil ||
+		*back.Params.Reasoning.Mode != "pro" {
+		t.Fatalf("responses->chat dropped reasoning.mode: %+v", back.Params)
+	}
+}
+
+// TestGuardContentMarkerSurvivesChatResponsesMux: the Bedrock guard marker crosses the
+// chat <-> responses bridge in both directions, like cache_control does.
+func TestGuardContentMarkerSurvivesChatResponsesMux(t *testing.T) {
+	marker := &GuardContent{Qualifiers: []string{"query"}}
+	chat := ChatMessage{
+		Role: ChatMessageRoleUser,
+		Content: &ChatMessageContent{ContentBlocks: []ChatContentBlock{
+			{Type: ChatContentBlockTypeText, Text: Ptr("context")},
+			{Type: ChatContentBlockTypeText, Text: Ptr("question"), GuardContent: marker},
+		}},
+	}
+	responses := chat.ToResponsesMessages()
+	if len(responses) != 1 || responses[0].Content == nil || len(responses[0].Content.ContentBlocks) != 2 {
+		t.Fatalf("unexpected responses shape: %+v", responses)
+	}
+	if responses[0].Content.ContentBlocks[0].GuardContent != nil {
+		t.Error("unmarked block gained a guard marker")
+	}
+	if responses[0].Content.ContentBlocks[1].GuardContent != marker {
+		t.Fatal("guard marker dropped on chat -> responses")
+	}
+
+	back := ToChatMessages(responses)
+	if len(back) != 1 || back[0].Content == nil || len(back[0].Content.ContentBlocks) != 2 {
+		t.Fatalf("unexpected chat shape: %+v", back)
+	}
+	if back[0].Content.ContentBlocks[1].GuardContent != marker {
+		t.Fatal("guard marker dropped on responses -> chat")
+	}
+}
+
+// OpenAI pairs a reasoning item's id with its encrypted_content, and rejects a
+// replay whose id does not match the token. The chat shape must therefore carry
+// the id out on reasoning_details and hand the same id back when it is replayed.
+func TestReasoningItemIDSurvivesChatRoundTrip(t *testing.T) {
+	encrypted := "gAAAA-encrypted-token"
+	items := []ResponsesMessage{
+		{
+			ID:   Ptr("rs_openai_original"),
+			Type: Ptr(ResponsesMessageTypeReasoning),
+			ResponsesReasoning: &ResponsesReasoning{
+				Summary:          []ResponsesReasoningSummary{{Type: ResponsesReasoningContentBlockTypeSummaryText, Text: "thought about it"}},
+				EncryptedContent: &encrypted,
+			},
+		},
+		{
+			Role:    Ptr(ResponsesInputMessageRoleAssistant),
+			Content: &ResponsesMessageContent{ContentStr: Ptr("answer")},
+		},
+	}
+
+	chat := ToChatMessages(items)
+	var assistant *ChatMessage
+	for i := range chat {
+		if chat[i].Role == ChatMessageRoleAssistant && chat[i].ChatAssistantMessage != nil {
+			assistant = &chat[i]
+		}
+	}
+	if assistant == nil || len(assistant.ChatAssistantMessage.ReasoningDetails) == 0 {
+		t.Fatalf("expected reasoning_details on the assistant message, got %#v", chat)
+	}
+	for _, d := range assistant.ChatAssistantMessage.ReasoningDetails {
+		if d.ID == nil || *d.ID != "rs_openai_original" {
+			t.Fatalf("reasoning_details[%d] (%s) lost the reasoning item id: %#v", d.Index, d.Type, d.ID)
+		}
+	}
+
+	replayed := assistant.ToResponsesMessages()
+	if len(replayed) == 0 || replayed[0].Type == nil || *replayed[0].Type != ResponsesMessageTypeReasoning {
+		t.Fatalf("expected a reasoning item first, got %#v", replayed)
+	}
+	if replayed[0].ID == nil || *replayed[0].ID != "rs_openai_original" {
+		t.Fatalf("replay minted a new id instead of reusing the original: %#v", replayed[0].ID)
+	}
+
+	t.Run("no recorded id still mints a fresh rs_ id", func(t *testing.T) {
+		cm := &ChatMessage{
+			Role: ChatMessageRoleAssistant,
+			ChatAssistantMessage: &ChatAssistantMessage{
+				ReasoningDetails: []ChatReasoningDetails{{Index: 0, Type: BifrostReasoningDetailsTypeEncrypted, Data: &encrypted}},
+			},
+		}
+		out := cm.ToResponsesMessages()
+		if len(out) == 0 || out[0].ID == nil || !strings.HasPrefix(*out[0].ID, "rs_") || len(*out[0].ID) <= len("rs_") {
+			t.Fatalf("expected a freshly minted rs_ id, got %#v", out)
+		}
+	})
+
+	t.Run("the encrypted detail's id wins when several reasoning items merge", func(t *testing.T) {
+		cm := &ChatMessage{
+			Role: ChatMessageRoleAssistant,
+			ChatAssistantMessage: &ChatAssistantMessage{
+				ReasoningDetails: []ChatReasoningDetails{
+					{ID: Ptr("rs_summary_only"), Index: 0, Type: BifrostReasoningDetailsTypeSummary, Summary: Ptr("s")},
+					{ID: Ptr("rs_with_token"), Index: 1, Type: BifrostReasoningDetailsTypeEncrypted, Data: &encrypted},
+				},
+			},
+		}
+		out := cm.ToResponsesMessages()
+		if len(out) == 0 || out[0].ID == nil || *out[0].ID != "rs_with_token" {
+			t.Fatalf("expected the id paired with the encrypted token, got %#v", out[0].ID)
+		}
+	})
+}
+
+// The id sent with a reasoning item must be the one its encrypted token was issued with. When the
+// token's own detail carries no id, borrowing another detail's id would pair the token with an id it
+// was never issued with (OpenAI rejects that), so a fresh id is minted instead.
+func TestReasoningIDIsTakenFromTheEncryptedDetailThatIsEmitted(t *testing.T) {
+	tokenA, tokenB := "token-A", "token-B"
+	replay := func(details ...ChatReasoningDetails) ResponsesMessage {
+		t.Helper()
+		out := (&ChatMessage{Role: ChatMessageRoleAssistant, ChatAssistantMessage: &ChatAssistantMessage{ReasoningDetails: details}}).ToResponsesMessages()
+		if len(out) == 0 || out[0].Type == nil || *out[0].Type != ResponsesMessageTypeReasoning {
+			t.Fatalf("expected a reasoning item first, got %#v", out)
+		}
+		return out[0]
+	}
+
+	t.Run("an encrypted detail without an id does not borrow a neighbour's id", func(t *testing.T) {
+		item := replay(
+			ChatReasoningDetails{ID: Ptr("rs_summary_only"), Index: 0, Type: BifrostReasoningDetailsTypeSummary, Summary: Ptr("s")},
+			ChatReasoningDetails{Index: 1, Type: BifrostReasoningDetailsTypeEncrypted, Data: &tokenA},
+		)
+		if item.ResponsesReasoning == nil || item.ResponsesReasoning.EncryptedContent == nil || *item.ResponsesReasoning.EncryptedContent != tokenA {
+			t.Fatalf("the encrypted token must still be replayed, got %#v", item.ResponsesReasoning)
+		}
+		if item.ID == nil || *item.ID == "rs_summary_only" {
+			t.Fatalf("the token was paired with an unrelated id: %#v", item.ID)
+		}
+		if !strings.HasPrefix(*item.ID, "rs_") || len(*item.ID) <= len("rs_") {
+			t.Fatalf("expected a freshly minted rs_ id, got %q", *item.ID)
+		}
+	})
+
+	t.Run("with two encrypted details the one whose token is emitted decides the id", func(t *testing.T) {
+		item := replay(
+			ChatReasoningDetails{ID: Ptr("rs_a"), Index: 0, Type: BifrostReasoningDetailsTypeEncrypted, Data: &tokenA},
+			ChatReasoningDetails{ID: Ptr("rs_b"), Index: 1, Type: BifrostReasoningDetailsTypeEncrypted, Data: &tokenB},
+		)
+		if item.ResponsesReasoning == nil || item.ResponsesReasoning.EncryptedContent == nil || *item.ResponsesReasoning.EncryptedContent != tokenB {
+			t.Fatalf("expected the last token to be emitted, got %#v", item.ResponsesReasoning)
+		}
+		if item.ID == nil || *item.ID != "rs_b" {
+			t.Fatalf("expected the id paired with the emitted token (rs_b), got %#v", item.ID)
+		}
+	})
+
+	t.Run("with no token to pair, the first recorded id is kept", func(t *testing.T) {
+		item := replay(
+			ChatReasoningDetails{ID: Ptr("rs_summary_only"), Index: 0, Type: BifrostReasoningDetailsTypeSummary, Summary: Ptr("s")},
+			ChatReasoningDetails{ID: Ptr("rs_later"), Index: 1, Type: BifrostReasoningDetailsTypeSummary, Summary: Ptr("t")},
+		)
+		if item.ID == nil || *item.ID != "rs_summary_only" {
+			t.Fatalf("expected the first recorded id, got %#v", item.ID)
+		}
+	})
+}
+
+// reasoning.summary sent on a chat request must reach the Responses request the
+// mux builds, including when it is the only reasoning field set.
+func TestReasoningSummarySurvivesChatResponsesConversion(t *testing.T) {
+	for body, want := range map[string]string{
+		`{"reasoning":{"summary":"auto"}}`:                     "auto",
+		`{"reasoning":{"effort":"high","summary":"detailed"}}`: "detailed",
+	} {
+		var params ChatParameters
+		if err := Unmarshal([]byte(body), &params); err != nil {
+			t.Fatalf("decode %s: %v", body, err)
+		}
+		chat := &BifrostChatRequest{Model: "gpt-6-astra", Params: &params}
+		responses := chat.ToResponsesRequest()
+		if responses.Params == nil || responses.Params.Reasoning == nil || responses.Params.Reasoning.Summary == nil {
+			t.Fatalf("%s: chat->responses dropped reasoning.summary: %+v", body, responses.Params)
+		}
+		if *responses.Params.Reasoning.Summary != want {
+			t.Fatalf("%s: summary = %q, want %q", body, *responses.Params.Reasoning.Summary, want)
+		}
+		back := responses.ToChatRequest().ToResponsesRequest()
+		if back.Params == nil || back.Params.Reasoning == nil || back.Params.Reasoning.Summary == nil ||
+			*back.Params.Reasoning.Summary != want {
+			t.Fatalf("%s: responses->chat dropped reasoning.summary: %+v", body, back.Params)
+		}
+	}
+}
+
+// TestToChatMessages_DropsToolChangeBlocks: Responses-to-Chat is the fallback that
+// OpenAI-compatible providers (Groq, Nebius, ...) take. Chat has no tool_addition /
+// tool_removal content part, so the blocks are dropped: text siblings stay, a system message
+// left with nothing is skipped rather than sent as an empty content array.
+func TestToChatMessages_DropsToolChangeBlocks(t *testing.T) {
+	removal := &ResponsesToolChangeTarget{Type: ResponsesToolChangeTargetTypeToolReference, Name: Ptr("get_weather")}
+	chat := ToChatMessages([]ResponsesMessage{
+		{Role: Ptr(ResponsesInputMessageRoleUser), Content: &ResponsesMessageContent{ContentStr: Ptr("What's the weather in Paris?")}},
+		{Role: Ptr(ResponsesInputMessageRoleSystem), Content: &ResponsesMessageContent{ContentBlocks: []ResponsesMessageContentBlock{
+			{Type: ResponsesInputMessageContentBlockTypeToolRemoval, ToolChange: removal},
+			{Type: ResponsesInputMessageContentBlockTypeText, Text: Ptr("Weather lookups are disabled.")},
+		}}},
+		{Role: Ptr(ResponsesInputMessageRoleSystem), Content: &ResponsesMessageContent{ContentBlocks: []ResponsesMessageContentBlock{
+			{Type: ResponsesInputMessageContentBlockTypeToolRemoval, ToolChange: removal},
+		}}},
+	})
+	if len(chat) != 2 {
+		t.Fatalf("chat messages = %d, want 2 (the tool-change-only system message must be dropped): %+v", len(chat), chat)
+	}
+	sys := chat[1]
+	if sys.Role != ChatMessageRoleSystem || sys.Content == nil {
+		t.Fatalf("chat[1] = %+v, want the system message with content", sys)
+	}
+	var blocks []ChatContentBlock
+	if sys.Content.ContentBlocks != nil {
+		blocks = sys.Content.ContentBlocks
+	}
+	for _, b := range blocks {
+		if string(b.Type) == string(ResponsesInputMessageContentBlockTypeToolRemoval) || string(b.Type) == string(ResponsesInputMessageContentBlockTypeToolAddition) {
+			t.Fatalf("tool-change block forwarded as an unknown chat content part: %+v", blocks)
+		}
+	}
+	if sys.Content.ContentStr != nil {
+		if *sys.Content.ContentStr != "Weather lookups are disabled." {
+			t.Errorf("system text = %q, want the text sibling", *sys.Content.ContentStr)
+		}
+	} else if len(blocks) != 1 || blocks[0].Text == nil || *blocks[0].Text != "Weather lookups are disabled." {
+		t.Errorf("system content = %+v, want only the text sibling", blocks)
+	}
+}
+
+// TestToChatMessages_DropsConfigurationUpdateItem pins #8616 on the Responses->Chat fallback:
+// Chat Completions has no mid-conversation effort item, so a configuration_update must be
+// dropped rather than emitted as a roleless, contentless chat message.
+func TestToChatMessages_DropsConfigurationUpdateItem(t *testing.T) {
+	var input []ResponsesMessage
+	if err := Unmarshal([]byte(`[{"type":"configuration_update","reasoning":{"effort":"high"}},{"role":"user","content":"Say hi."}]`), &input); err != nil {
+		t.Fatalf("unmarshal input: %v", err)
+	}
+
+	got := ToChatMessages(input)
+	if len(got) != 1 {
+		t.Fatalf("expected only the user message, got %d messages: %+v", len(got), got)
+	}
+	if got[0].Role != ChatMessageRoleUser {
+		t.Fatalf("expected the surviving message to be the user turn, got role %q", got[0].Role)
+	}
+}
+
+func TestUsageConvertersKeepIterations(t *testing.T) {
+	pass := ResponsesResponseUsage{Type: Ptr("advisor_message"), Model: Ptr("claude-opus-4-8"), InputTokens: 2000, OutputTokens: 900}
+	responses := &ResponsesResponseUsage{InputTokens: 10, OutputTokens: 1, TotalTokens: 11, Iterations: []ResponsesResponseUsage{pass}}
+
+	llm := responses.ToBifrostLLMUsage()
+	if len(llm.Iterations) != 1 || llm.Iterations[0].InputTokens != 2000 {
+		t.Fatalf("ToBifrostLLMUsage Iterations = %+v, want the advisor pass", llm.Iterations)
+	}
+	back := llm.ToResponsesResponseUsage()
+	if len(back.Iterations) != 1 || back.Iterations[0].Model == nil || *back.Iterations[0].Model != "claude-opus-4-8" {
+		t.Fatalf("ToResponsesResponseUsage Iterations = %+v, want the advisor pass", back.Iterations)
+	}
+	back.Iterations[0].InputTokens = 999
+	if responses.Iterations[0].InputTokens != 2000 || llm.Iterations[0].InputTokens != 2000 {
+		t.Fatal("converted Iterations alias the source")
+	}
+}

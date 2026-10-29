@@ -1,0 +1,22 @@
+{
+  "name": "@bifrost/e2e-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Playwright E2E tests for Bifrost UI",
+  "scripts": {
+    "test": "node scripts/run-e2e.mjs",
+    "test:headed": "node scripts/run-e2e.mjs --headed",
+    "test:ui": "node scripts/run-e2e.mjs --ui",
+    "test:rerun": "node scripts/run-e2e.mjs --rerun reports/e2e-results.json",
+    "test:a11y": "playwright test --config=playwright.a11y.config.ts",
+    "down": "node scripts/run-e2e.mjs --down",
+    "report": "playwright show-report",
+    "codegen": "playwright codegen http://localhost:18181"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.57.0",
+    "@types/node": "20.19.27",
+    "typescript": "5.9.3"
+  }
+}

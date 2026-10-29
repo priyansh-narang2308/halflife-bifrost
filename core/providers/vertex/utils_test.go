@@ -1,0 +1,1868 @@
+package vertex
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/maximhq/bifrost/core/providers/anthropic"
+	"github.com/maximhq/bifrost/core/providers/gemini"
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/tidwall/gjson"
+	"github.com/valyala/fasthttp"
+	"golang.org/x/oauth2"
+)
+
+type vertexEndpointTestLogger struct{}
+
+func (vertexEndpointTestLogger) Debug(string, ...any)                   {}
+func (vertexEndpointTestLogger) Info(string, ...any)                    {}
+func (vertexEndpointTestLogger) Warn(string, ...any)                    {}
+func (vertexEndpointTestLogger) Error(string, ...any)                   {}
+func (vertexEndpointTestLogger) Fatal(string, ...any)                   {}
+func (vertexEndpointTestLogger) SetLevel(schemas.LogLevel)              {}
+func (vertexEndpointTestLogger) SetOutputType(schemas.LoggerOutputType) {}
+func (vertexEndpointTestLogger) LogHTTPRequest(schemas.LogLevel, string) schemas.LogEventBuilder {
+	return schemas.NoopLogEvent
+}
+
+func vertexOpenAIEndpointTestProvider(t testing.TB, handler http.Handler) (*VertexProvider, schemas.Key) {
+	t.Helper()
+	upstream := httptest.NewTLSServer(handler)
+	t.Cleanup(upstream.Close)
+	config := &schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 5}}
+	config.CheckAndSetDefaults()
+	provider, err := NewVertexProvider(config, vertexEndpointTestLogger{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range []*fasthttp.Client{provider.client, provider.streamingClient} {
+		client.Dial = func(string) (net.Conn, error) { return net.Dial("tcp", upstream.Listener.Addr().String()) }
+		client.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+		t.Cleanup(client.CloseIdleConnections)
+	}
+	key := schemas.Key{Value: *schemas.NewSecretVar("must-not-use-api-key"), VertexKeyConfig: &schemas.VertexKeyConfig{
+		ProjectID: *schemas.NewSecretVar("project-123"), Region: *schemas.NewSecretVar("us-west1"),
+		AuthCredentials: *schemas.NewSecretVar("test-credentials"),
+	}}
+	provider.tokenSources.Store(getClientKey(vertexCredentialIdentity(key)), oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+	return provider, key
+}
+
+func TestVertexEndpointChat(t *testing.T) {
+	for _, method := range []string{"raw_predict", "chat_completions"} {
+		t.Run(method, func(t *testing.T) {
+			type sent struct{ path, auth, body string }
+			received := make(chan sent, 1)
+			provider, key := vertexOpenAIEndpointTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				data, _ := io.ReadAll(r.Body)
+				received <- sent{r.URL.RequestURI(), r.Header.Get("Authorization"), string(data)}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{"id":"chatcmpl-custom","object":"chat.completion","model":"1234567890","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+			}))
+			var aliases schemas.KeyAliases
+			if err := json.Unmarshal([]byte(`{"vllm":{"model_id":"1234567890","vertex_endpoint":{"endpoint_id":"2222222222","format":"openai_chat","method":"`+method+`"}}}`), &aliases); err != nil {
+				t.Fatal(err)
+			}
+			alias := aliases["vllm"]
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: "vllm", Config: &alias})
+			response, bifrostErr := provider.ChatCompletion(ctx, key, &schemas.BifrostChatRequest{
+				Provider: schemas.Vertex, Model: alias.ModelID,
+				Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: new("hi")}}},
+			})
+			if bifrostErr != nil {
+				t.Fatalf("chat completion: %v", bifrostErr)
+			}
+			call := <-received
+			wantPath := "/v1/projects/project-123/locations/us-west1/endpoints/2222222222:rawPredict"
+			if method == "chat_completions" {
+				wantPath = "/v1beta1/projects/project-123/locations/us-west1/endpoints/2222222222/chat/completions"
+			}
+			if call.path != wantPath || call.auth != "Bearer test-token" {
+				t.Fatalf("upstream = %s (%s), want %s with OAuth", call.path, call.auth, wantPath)
+			}
+			if gjson.Get(call.body, "model").String() != alias.ModelID || !gjson.Get(call.body, "messages").IsArray() || gjson.Get(call.body, "contents").Exists() {
+				t.Fatalf("expected OpenAI request with served model preserved, got %s", call.body)
+			}
+			if response == nil || len(response.Choices) != 1 || response.Choices[0].Message.Content.ContentStr == nil || *response.Choices[0].Message.Content.ContentStr != "hello" {
+				t.Fatalf("expected OpenAI chat response, got %+v", response)
+			}
+		})
+	}
+}
+
+func BenchmarkVertexChatCompletionCommonCase(b *testing.B) {
+	provider, key := vertexOpenAIEndpointTestProvider(b, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"candidates":[{"content":{"role":"model","parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1,"totalTokenCount":3}}`)
+	}))
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	request := &schemas.BifrostChatRequest{Provider: schemas.Vertex, Model: "gemini-2.5-flash", Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: new("hi")}}}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := provider.ChatCompletion(ctx, key, request); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func TestVertexEndpointResponsesAndStreaming(t *testing.T) {
+	for _, method := range []schemas.VertexEndpointMethod{schemas.VertexEndpointRawPredict, schemas.VertexEndpointChatCompletions} {
+		for _, route := range []string{"chat-stream", "responses", "responses-stream"} {
+			for _, model := range []string{"gemma-custom", "claude-custom", "mistral-custom"} {
+				t.Run(string(method)+"/"+route+"/"+model, func(t *testing.T) {
+					type sent struct{ path, body, auth string }
+					received := make(chan sent, 1)
+					provider, key := vertexOpenAIEndpointTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						data, _ := io.ReadAll(r.Body)
+						received <- sent{r.URL.RequestURI(), string(data), r.Header.Get("Authorization")}
+						if strings.HasSuffix(route, "stream") {
+							w.Header().Set("Content-Type", "text/event-stream")
+							_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-custom\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n")
+							_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-custom\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n")
+							_, _ = io.WriteString(w, "data: {\"id\":\"chatcmpl-custom\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"custom\",\"choices\":[],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":1,\"total_tokens\":3}}\n\ndata: [DONE]\n\n")
+						} else {
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = io.WriteString(w, `{"id":"chatcmpl-custom","object":"chat.completion","model":"custom","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}`)
+						}
+					}))
+					ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+					alias := &schemas.AliasConfig{ModelID: model, ModelFamily: schemas.Ptr(schemas.ModelFamilyAnthropic), VertexAliasCfg: &schemas.VertexAliasCfg{
+						VertexEndpoint: &schemas.VertexEndpoint{EndpointID: "2222222222", Format: schemas.VertexEndpointOpenAIChat, Method: method},
+					}}
+					ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Key: "vllm", Config: alias})
+					chat := &schemas.BifrostChatRequest{Provider: schemas.Vertex, Model: model, Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: new("hi")}}}}
+					responses := &schemas.BifrostResponsesRequest{Provider: schemas.Vertex, Model: model, Input: []schemas.ResponsesMessage{{Role: new(schemas.ResponsesInputMessageRoleUser), Content: &schemas.ResponsesMessageContent{ContentStr: new("hi")}}}}
+					noHooks := func(_ *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+						return result, err
+					}
+					if route == "responses" {
+						response, err := provider.Responses(ctx, key, responses)
+						if err != nil || response == nil || len(response.Output) == 0 || response.Usage == nil {
+							t.Fatalf("Responses conversion failed: response=%+v error=%v", response, err)
+						}
+					} else {
+						var stream chan *schemas.BifrostStreamChunk
+						var err *schemas.BifrostError
+						if route == "responses-stream" {
+							stream, err = provider.ResponsesStream(ctx, noHooks, nil, key, responses)
+						} else {
+							stream, err = provider.ChatCompletionStream(ctx, noHooks, nil, key, chat)
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						timer := time.NewTimer(5 * time.Second)
+						defer timer.Stop()
+						var text strings.Builder
+						var hasUsage bool
+					loop:
+						for {
+							select {
+							case chunk, ok := <-stream:
+								if !ok {
+									break loop
+								}
+								if chunk.BifrostError != nil {
+									t.Fatal(chunk.BifrostError)
+								}
+								if route == "responses-stream" {
+									if chunk.BifrostResponsesStreamResponse == nil {
+										t.Fatalf("expected Responses event: %+v", chunk)
+									}
+									encoded, _ := json.Marshal(chunk.BifrostResponsesStreamResponse)
+									if gjson.GetBytes(encoded, "type").String() == "response.output_text.delta" {
+										text.WriteString(gjson.GetBytes(encoded, "delta").String())
+									}
+									if gjson.GetBytes(encoded, "response.usage.total_tokens").Int() == 3 {
+										hasUsage = true
+									}
+								} else if chunk.BifrostChatResponse != nil {
+									for _, choice := range chunk.BifrostChatResponse.Choices {
+										if choice.Delta != nil && choice.Delta.Content != nil {
+											text.WriteString(*choice.Delta.Content)
+										}
+									}
+									if chunk.BifrostChatResponse.Usage != nil && chunk.BifrostChatResponse.Usage.TotalTokens == 3 {
+										hasUsage = true
+									}
+								}
+							case <-timer.C:
+								t.Fatal("stream did not finish")
+							}
+						}
+						if text.String() != "hello" || !hasUsage {
+							t.Fatalf("stream text=%q usage=%v", text.String(), hasUsage)
+						}
+					}
+					call := <-received
+					wantSuffix := ":rawPredict"
+					if strings.HasSuffix(route, "stream") {
+						wantSuffix = ":streamRawPredict"
+					}
+					if method == schemas.VertexEndpointChatCompletions {
+						wantSuffix = "/chat/completions"
+					}
+					if !strings.HasSuffix(call.path, "endpoints/2222222222"+wantSuffix) || call.auth != "Bearer test-token" {
+						t.Fatalf("wrong upstream call: %+v", call)
+					}
+					if gjson.Get(call.body, "model").String() != model || !gjson.Get(call.body, "messages").IsArray() || gjson.Get(call.body, "anthropic_version").Exists() {
+						t.Fatalf("wrong wire format: %s", call.body)
+					}
+					if strings.HasSuffix(route, "stream") && !gjson.Get(call.body, "stream").Bool() {
+						t.Fatalf("missing stream=true: %s", call.body)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestVertexEndpointURL(t *testing.T) {
+	key := schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{ProjectID: *schemas.NewSecretVar("key-project"), Region: *schemas.NewSecretVar("us-central1")}}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Config: &schemas.AliasConfig{
+		ProjectID: schemas.NewSecretVar("alias-project"), Region: schemas.NewSecretVar("us-west1"),
+	}})
+	url, err := openAIEndpointURL(ctx, key, &schemas.VertexEndpoint{EndpointID: "2222", Format: schemas.VertexEndpointOpenAIChat}, true)
+	if err != nil || url != "https://us-west1-aiplatform.googleapis.com/v1/projects/alias-project/locations/us-west1/endpoints/2222:streamRawPredict" {
+		t.Fatalf("url=%s error=%v", url, err)
+	}
+	for _, region := range []string{"", "global", "us", "eu", "evil.example/"} {
+		key.VertexKeyConfig.Region = *schemas.NewSecretVar(region)
+		if _, err := openAIEndpointURL(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), key, &schemas.VertexEndpoint{EndpointID: "2222", Format: schemas.VertexEndpointOpenAIChat}, false); err == nil {
+			t.Errorf("accepted region %q", region)
+		}
+	}
+}
+
+func TestVertexEndpointErrorEvictsCredentials(t *testing.T) {
+	provider, key := vertexOpenAIEndpointTestProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = io.WriteString(w, `{"error":{"code":403,"message":"permission denied","status":"PERMISSION_DENIED"}}`)
+	}))
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Config: &schemas.AliasConfig{VertexAliasCfg: &schemas.VertexAliasCfg{VertexEndpoint: &schemas.VertexEndpoint{EndpointID: "2222", Format: schemas.VertexEndpointOpenAIChat}}}})
+	_, err := provider.ChatCompletion(ctx, key, &schemas.BifrostChatRequest{Provider: schemas.Vertex, Model: "custom", Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser}}})
+	if err == nil || err.StatusCode == nil || *err.StatusCode != 403 || err.Error.Message != "permission denied" {
+		t.Fatalf("wrong error: %v", err)
+	}
+	if _, ok := provider.tokenSources.Load(getClientKey(vertexCredentialIdentity(key))); ok {
+		t.Fatal("credentials were not evicted")
+	}
+}
+
+func BenchmarkVertexEndpointSelection(b *testing.B) {
+	for _, configured := range []bool{false, true} {
+		name := "standard"
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		if configured {
+			name = "custom"
+			ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{Config: &schemas.AliasConfig{VertexAliasCfg: &schemas.VertexAliasCfg{VertexEndpoint: &schemas.VertexEndpoint{EndpointID: "2222", Format: schemas.VertexEndpointOpenAIChat}}}})
+		}
+		b.Run(name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				_ = schemas.GetVertexEndpoint(ctx)
+			}
+		})
+	}
+}
+
+func TestGetVertexAPIHost(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		region   string
+		expected string
+	}{
+		{
+			name:     "global endpoint",
+			region:   "global",
+			expected: "aiplatform.googleapis.com",
+		},
+		{
+			name:     "us multi-region pool endpoint",
+			region:   "us",
+			expected: "aiplatform.us.rep.googleapis.com",
+		},
+		{
+			name:     "eu multi-region pool endpoint",
+			region:   "eu",
+			expected: "aiplatform.eu.rep.googleapis.com",
+		},
+		{
+			name:     "single region endpoint",
+			region:   "us-central1",
+			expected: "us-central1-aiplatform.googleapis.com",
+		},
+		{
+			name:     "single european region endpoint",
+			region:   "europe-west1",
+			expected: "europe-west1-aiplatform.googleapis.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			actual := getVertexAPIHost(tt.region)
+			if actual != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestVertexGeminiImageURLSchemesAllowGCS(t *testing.T) {
+	result, err := gemini.ToGeminiChatCompletionRequestWithImageURLSchemes(nil, &schemas.BifrostChatRequest{
+		Model: "gemini-3-flash-preview",
+		Input: []schemas.ChatMessage{
+			{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{
+					ContentBlocks: []schemas.ChatContentBlock{
+						{
+							Type: schemas.ChatContentBlockTypeImage,
+							ImageURLStruct: &schemas.ChatInputImage{
+								URL: "gs://my-bucket/xxx.png",
+							},
+						},
+					},
+				},
+			},
+		},
+	}, geminiImageURLSchemes...)
+	if err != nil {
+		t.Fatalf("expected Vertex Gemini schemes to allow gs:// image URLs, got: %v", err)
+	}
+	if len(result.Contents) != 1 || len(result.Contents[0].Parts) != 1 || result.Contents[0].Parts[0].FileData == nil {
+		t.Fatalf("expected one fileData part, got %#v", result.Contents)
+	}
+	if result.Contents[0].Parts[0].FileData.FileURI != "gs://my-bucket/xxx.png" {
+		t.Fatalf("expected gs:// fileUri, got %q", result.Contents[0].Parts[0].FileData.FileURI)
+	}
+}
+
+func TestIsVertexMultiRegionEndpoint(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		region   string
+		expected bool
+	}{
+		{region: "us", expected: true},
+		{region: "eu", expected: true},
+		{region: "global", expected: false},
+		{region: "us-central1", expected: false},
+		{region: "europe-west1", expected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.region, func(t *testing.T) {
+			t.Parallel()
+
+			actual := isVertexMultiRegionEndpoint(tt.region)
+			if actual != tt.expected {
+				t.Fatalf("expected %v, got %v", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestGetVertexModelListingAPIHost(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		region   string
+		expected string
+	}{
+		{
+			name:     "global listing endpoint",
+			region:   "global",
+			expected: "aiplatform.googleapis.com",
+		},
+		{
+			name:     "us multi-region uses standard listing endpoint",
+			region:   "us",
+			expected: "aiplatform.googleapis.com",
+		},
+		{
+			name:     "eu multi-region uses standard listing endpoint",
+			region:   "eu",
+			expected: "aiplatform.googleapis.com",
+		},
+		{
+			name:     "single region listing endpoint",
+			region:   "us-central1",
+			expected: "us-central1-aiplatform.googleapis.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			actual := getVertexModelListingAPIHost(tt.region)
+			if actual != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestGetVertexPublisherModelURL(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		region   string
+		expected string
+	}{
+		{
+			name:     "global raw predict",
+			region:   "global",
+			expected: "https://aiplatform.googleapis.com/v1/projects/project-123/locations/global/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "us multi-region raw predict",
+			region:   "us",
+			expected: "https://aiplatform.us.rep.googleapis.com/v1/projects/project-123/locations/us/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "eu multi-region raw predict",
+			region:   "eu",
+			expected: "https://aiplatform.eu.rep.googleapis.com/v1/projects/project-123/locations/eu/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "single region raw predict",
+			region:   "us-central1",
+			expected: "https://us-central1-aiplatform.googleapis.com/v1/projects/project-123/locations/us-central1/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			actual := getVertexPublisherModelURL(tt.region, "v1", "project-123", "anthropic", "claude-opus-4-7", ":rawPredict")
+			if actual != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestGetVertexModelAwareAPIHost(t *testing.T) {
+	// IsVertexMultiRegionOnlyModel asks the resolver for (Vertex, model).
+	providerUtils.SetCapabilityResolver(func(provider schemas.ModelProvider, model string) *schemas.ModelCapabilities {
+		if provider != schemas.Vertex {
+			return nil
+		}
+		switch model {
+		case "claude-opus-4-7":
+			return &schemas.ModelCapabilities{IsVertexMultiRegionOnly: schemas.Ptr(true)}
+		case "claude-sonnet-4-5":
+			return &schemas.ModelCapabilities{IsVertexMultiRegionOnly: schemas.Ptr(false)}
+		}
+		return nil
+	})
+	t.Cleanup(func() { providerUtils.SetCapabilityResolver(nil) })
+
+	tests := []struct {
+		name              string
+		region            string
+		model             string
+		forceSingleRegion bool
+		expected          string
+	}{
+		{
+			name:     "global endpoint ignores model flag",
+			region:   "global",
+			model:    "claude-opus-4-7",
+			expected: "aiplatform.googleapis.com",
+		},
+		{
+			name:     "us multi-region always uses rep host (flagged model)",
+			region:   "us",
+			model:    "claude-opus-4-7",
+			expected: "aiplatform.us.rep.googleapis.com",
+		},
+		{
+			name:     "eu multi-region always uses rep host (flagged model)",
+			region:   "eu",
+			model:    "claude-opus-4-7",
+			expected: "aiplatform.eu.rep.googleapis.com",
+		},
+		{
+			name:     "us multi-region always uses rep host (unflagged model)",
+			region:   "us",
+			model:    "claude-sonnet-4-5",
+			expected: "aiplatform.us.rep.googleapis.com",
+		},
+		{
+			name:     "eu multi-region always uses rep host (unknown model)",
+			region:   "eu",
+			model:    "some-unknown-model",
+			expected: "aiplatform.eu.rep.googleapis.com",
+		},
+		{
+			name:     "single region promotes flagged model to us multi-region pool",
+			region:   "us-central1",
+			model:    "claude-opus-4-7",
+			expected: "aiplatform.us.rep.googleapis.com",
+		},
+		{
+			name:     "single region promotes flagged model to eu multi-region pool",
+			region:   "europe-west1",
+			model:    "claude-opus-4-7",
+			expected: "aiplatform.eu.rep.googleapis.com",
+		},
+		{
+			name:     "asia region does NOT promote flagged model (no pool)",
+			region:   "asia-southeast1",
+			model:    "claude-opus-4-7",
+			expected: "asia-southeast1-aiplatform.googleapis.com",
+		},
+		{
+			name:     "me region does NOT promote flagged model (no pool)",
+			region:   "me-west1",
+			model:    "claude-opus-4-7",
+			expected: "me-west1-aiplatform.googleapis.com",
+		},
+		{
+			name:     "single region keeps standard host for unflagged model",
+			region:   "us-central1",
+			model:    "claude-sonnet-4-5",
+			expected: "us-central1-aiplatform.googleapis.com",
+		},
+		{
+			name:              "force single region skips us pool promotion for flagged model",
+			region:            "us-east5",
+			model:             "claude-opus-4-7",
+			forceSingleRegion: true,
+			expected:          "us-east5-aiplatform.googleapis.com",
+		},
+		{
+			name:              "force single region skips eu pool promotion for flagged model",
+			region:            "europe-west1",
+			model:             "claude-opus-4-7",
+			forceSingleRegion: true,
+			expected:          "europe-west1-aiplatform.googleapis.com",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			actual := getVertexModelAwareAPIHost(tt.region, tt.model, tt.forceSingleRegion, nil)
+			if actual != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestGetVertexModelAwarePublisherModelURL(t *testing.T) {
+	// IsVertexMultiRegionOnlyModel asks the resolver for (Vertex, model).
+	providerUtils.SetCapabilityResolver(func(provider schemas.ModelProvider, model string) *schemas.ModelCapabilities {
+		if provider == schemas.Vertex && model == "claude-opus-4-7" {
+			return &schemas.ModelCapabilities{IsVertexMultiRegionOnly: schemas.Ptr(true)}
+		}
+		return nil
+	})
+	t.Cleanup(func() { providerUtils.SetCapabilityResolver(nil) })
+
+	tests := []struct {
+		name              string
+		region            string
+		model             string
+		forceSingleRegion bool
+		expected          string
+	}{
+		{
+			name:     "us multi-region flagged model gets rep host URL",
+			region:   "us",
+			model:    "claude-opus-4-7",
+			expected: "https://aiplatform.us.rep.googleapis.com/v1/projects/project-123/locations/us/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "eu multi-region flagged model gets rep host URL",
+			region:   "eu",
+			model:    "claude-opus-4-7",
+			expected: "https://aiplatform.eu.rep.googleapis.com/v1/projects/project-123/locations/eu/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "us multi-region unflagged model still gets rep host URL",
+			region:   "us",
+			model:    "claude-3-5-sonnet",
+			expected: "https://aiplatform.us.rep.googleapis.com/v1/projects/project-123/locations/us/publishers/anthropic/models/claude-3-5-sonnet:rawPredict",
+		},
+		{
+			name:     "single region flagged model gets promoted to us pool",
+			region:   "us-central1",
+			model:    "claude-opus-4-7",
+			expected: "https://aiplatform.us.rep.googleapis.com/v1/projects/project-123/locations/us/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "single region europe flagged model gets promoted to eu pool",
+			region:   "europe-west1",
+			model:    "claude-opus-4-7",
+			expected: "https://aiplatform.eu.rep.googleapis.com/v1/projects/project-123/locations/eu/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+		{
+			name:     "single region unflagged model keeps standard host",
+			region:   "us-central1",
+			model:    "claude-3-5-sonnet",
+			expected: "https://us-central1-aiplatform.googleapis.com/v1/projects/project-123/locations/us-central1/publishers/anthropic/models/claude-3-5-sonnet:rawPredict",
+		},
+		{
+			name:              "force single region keeps flagged model on requested region host and path",
+			region:            "us-east5",
+			model:             "claude-opus-4-7",
+			forceSingleRegion: true,
+			expected:          "https://us-east5-aiplatform.googleapis.com/v1/projects/project-123/locations/us-east5/publishers/anthropic/models/claude-opus-4-7:rawPredict",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			actual := getVertexModelAwarePublisherModelURL(tt.region, "v1", "project-123", "anthropic", tt.model, ":rawPredict", tt.forceSingleRegion, nil)
+			if actual != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestVertexRegionToPool(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		region       string
+		expectedPool string
+		expectedOK   bool
+	}{
+		{region: "us-central1", expectedPool: "us", expectedOK: true},
+		{region: "us-east1", expectedPool: "us", expectedOK: true},
+		{region: "us-east5", expectedPool: "us", expectedOK: true},
+		{region: "europe-west1", expectedPool: "eu", expectedOK: true},
+		{region: "europe-west4", expectedPool: "eu", expectedOK: true},
+		{region: "asia-southeast1", expectedPool: "", expectedOK: false},
+		{region: "me-west1", expectedPool: "", expectedOK: false},
+		{region: "southamerica-east1", expectedPool: "", expectedOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.region, func(t *testing.T) {
+			t.Parallel()
+
+			pool, ok := vertexRegionToPool(tt.region)
+			if ok != tt.expectedOK {
+				t.Fatalf("expected ok=%v, got ok=%v", tt.expectedOK, ok)
+			}
+			if pool != tt.expectedPool {
+				t.Fatalf("expected %q, got %q", tt.expectedPool, pool)
+			}
+		})
+	}
+}
+
+// TestResolveVertexProjectID_AliasOverride verifies the per-alias ProjectID
+// override lets one Vertex credential serve deployments across distinct GCP
+// projects.
+func TestResolveVertexProjectID_AliasOverride(t *testing.T) {
+	keyProject := "key-level-project"
+	aliasProject := "alias-level-project"
+	key := schemas.Key{
+		VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectID: *schemas.NewSecretVar(keyProject),
+		},
+	}
+
+	if got := resolveVertexProjectID(nil, key); got != keyProject {
+		t.Errorf("nil ctx: got %q, want key-level %q", got, keyProject)
+	}
+
+	ctx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	if got := resolveVertexProjectID(ctx, key); got != keyProject {
+		t.Errorf("empty ctx: got %q, want key-level %q", got, keyProject)
+	}
+
+	ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "best-claude",
+		Config: &schemas.AliasConfig{
+			ModelID: "claude-sonnet-4-5",
+			VertexAliasCfg: &schemas.VertexAliasCfg{
+				ProjectID: schemas.NewSecretVar(aliasProject),
+			},
+		},
+	})
+	if got := resolveVertexProjectID(ctx, key); got != aliasProject {
+		t.Errorf("alias override should win: got %q, want %q", got, aliasProject)
+	}
+
+	// Empty alias ProjectID falls through to key-level.
+	ctx2 := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctx2.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "x",
+		Config: &schemas.AliasConfig{
+			ModelID: "x",
+			VertexAliasCfg: &schemas.VertexAliasCfg{
+				ProjectID: schemas.NewSecretVar(""),
+			},
+		},
+	})
+	if got := resolveVertexProjectID(ctx2, key); got != keyProject {
+		t.Errorf("empty alias ProjectID should fall through: got %q, want %q", got, keyProject)
+	}
+}
+
+// TestResolveVertexRegion_AliasOverride verifies the top-level
+// AliasConfig.Region override for Vertex.
+func TestResolveVertexRegion_AliasOverride(t *testing.T) {
+	keyRegion := "us-central1"
+	aliasRegion := "us-east5"
+	key := schemas.Key{
+		VertexKeyConfig: &schemas.VertexKeyConfig{
+			Region: *schemas.NewSecretVar(keyRegion),
+		},
+	}
+
+	if got := resolveVertexRegion(nil, key); got != keyRegion {
+		t.Errorf("nil ctx: got %q, want %q", got, keyRegion)
+	}
+
+	ctx0 := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	if got := resolveVertexRegion(ctx0, key); got != keyRegion {
+		t.Errorf("empty ctx: got %q, want key-level %q", got, keyRegion)
+	}
+
+	ctx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "best-claude",
+		Config: &schemas.AliasConfig{
+			ModelID: "claude-sonnet-4-5",
+			Region:  schemas.NewSecretVar(aliasRegion),
+		},
+	})
+	if got := resolveVertexRegion(ctx, key); got != aliasRegion {
+		t.Errorf("alias Region should win: got %q, want %q", got, aliasRegion)
+	}
+
+	ctx2 := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctx2.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "x",
+		Config: &schemas.AliasConfig{
+			ModelID: "x",
+			Region:  schemas.NewSecretVar(""),
+		},
+	})
+	if got := resolveVertexRegion(ctx2, key); got != keyRegion {
+		t.Errorf("empty alias Region should fall through: got %q, want %q", got, keyRegion)
+	}
+}
+
+// TestResolveVertexProjectNumber_AliasOverride mirrors the ProjectID test.
+func TestResolveVertexProjectNumber_AliasOverride(t *testing.T) {
+	keyNumber := "111111"
+	aliasNumber := "222222"
+	key := schemas.Key{
+		VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectNumber: *schemas.NewSecretVar(keyNumber),
+		},
+	}
+
+	if got := resolveVertexProjectNumber(nil, key); got != keyNumber {
+		t.Errorf("nil ctx: got %q, want %q", got, keyNumber)
+	}
+
+	ctx0 := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	if got := resolveVertexProjectNumber(ctx0, key); got != keyNumber {
+		t.Errorf("empty ctx: got %q, want key-level %q", got, keyNumber)
+	}
+
+	ctx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "x",
+		Config: &schemas.AliasConfig{
+			ModelID: "x",
+			VertexAliasCfg: &schemas.VertexAliasCfg{
+				ProjectNumber: schemas.NewSecretVar(aliasNumber),
+			},
+		},
+	})
+	if got := resolveVertexProjectNumber(ctx, key); got != aliasNumber {
+		t.Errorf("alias ProjectNumber should win: got %q, want %q", got, aliasNumber)
+	}
+
+	ctx2 := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctx2.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "x",
+		Config: &schemas.AliasConfig{
+			ModelID: "x",
+			VertexAliasCfg: &schemas.VertexAliasCfg{
+				ProjectNumber: schemas.NewSecretVar(""),
+			},
+		},
+	})
+	if got := resolveVertexProjectNumber(ctx2, key); got != keyNumber {
+		t.Errorf("empty alias ProjectNumber should fall through: got %q, want %q", got, keyNumber)
+	}
+}
+
+// TestResolveVertexForceSingleRegion_AliasOverride verifies the per-alias
+// VertexAliasCfg.ForceSingleRegion (*bool) override: an explicit alias-level
+// value wins over the key-level bool — including an alias false overriding a key
+// true — while a nil alias value falls through to the key-level bool.
+func TestResolveVertexForceSingleRegion_AliasOverride(t *testing.T) {
+	keyForceTrue := schemas.Key{
+		VertexKeyConfig: &schemas.VertexKeyConfig{ForceSingleRegion: true},
+	}
+	keyForceFalse := schemas.Key{
+		VertexKeyConfig: &schemas.VertexKeyConfig{ForceSingleRegion: false},
+	}
+
+	// nil ctx uses the key-level value.
+	if got := resolveVertexForceSingleRegion(nil, keyForceTrue); !got {
+		t.Errorf("nil ctx: got %v, want key-level true", got)
+	}
+
+	// empty ctx (no resolved alias) uses the key-level value.
+	ctx0 := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	if got := resolveVertexForceSingleRegion(ctx0, keyForceFalse); got {
+		t.Errorf("empty ctx: got %v, want key-level false", got)
+	}
+
+	// Alias-level true overrides key-level false.
+	ctxTrue := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctxTrue.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "best-claude",
+		Config: &schemas.AliasConfig{
+			ModelID:        "claude-opus-4-7",
+			VertexAliasCfg: &schemas.VertexAliasCfg{ForceSingleRegion: schemas.Ptr(true)},
+		},
+	})
+	if got := resolveVertexForceSingleRegion(ctxTrue, keyForceFalse); !got {
+		t.Errorf("alias true should win over key false: got %v, want true", got)
+	}
+
+	// Alias-level false overrides key-level true (explicit set beats nil).
+	ctxFalse := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctxFalse.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "best-claude",
+		Config: &schemas.AliasConfig{
+			ModelID:        "claude-opus-4-7",
+			VertexAliasCfg: &schemas.VertexAliasCfg{ForceSingleRegion: schemas.Ptr(false)},
+		},
+	})
+	if got := resolveVertexForceSingleRegion(ctxFalse, keyForceTrue); got {
+		t.Errorf("alias false should win over key true: got %v, want false", got)
+	}
+
+	// Alias present but ForceSingleRegion nil falls through to the key-level value.
+	ctxNil := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	ctxNil.SetValue(schemas.BifrostContextKeyResolvedAlias, &schemas.ResolvedAlias{
+		Key: "best-claude",
+		Config: &schemas.AliasConfig{
+			ModelID:        "claude-opus-4-7",
+			VertexAliasCfg: &schemas.VertexAliasCfg{ForceSingleRegion: nil},
+		},
+	})
+	if got := resolveVertexForceSingleRegion(ctxNil, keyForceTrue); !got {
+		t.Errorf("nil alias value should fall through to key true: got %v, want true", got)
+	}
+}
+
+// TestGeminiImageURLSchemesContract pins the exact allowlist that Vertex passes
+// into the Gemini converter. vertex.go reuses geminiImageURLSchemes across
+// ChatCompletion / ChatCompletionStream / Responses / ResponsesStream / CountTokens,
+// so a regression that drops "gs" (or accidentally adds e.g. "file") is caught
+// here without having to drive each provider entrypoint end-to-end.
+func TestGeminiImageURLSchemesContract(t *testing.T) {
+	want := []string{"http", "https", "gs"}
+	if !reflect.DeepEqual(geminiImageURLSchemes, want) {
+		t.Fatalf("geminiImageURLSchemes = %v, want %v", geminiImageURLSchemes, want)
+	}
+}
+
+func TestVertexServiceTierHeaderValue_Gemini35FlashLiteFlex(t *testing.T) {
+	t.Parallel()
+
+	flex := schemas.BifrostServiceTierFlex
+	if got := vertexServiceTierHeaderValue("global", "gemini-3.5-flash-lite", flex); got != "flex" {
+		t.Fatalf("expected flex header for gemini-3.5-flash-lite on global, got %q", got)
+	}
+	if got := vertexServiceTierHeaderValue("us-central1", "gemini-3.5-flash-lite", flex); got != "" {
+		t.Fatalf("expected no flex header outside global region, got %q", got)
+	}
+}
+
+// TestClassifyURLSource pins the capability matrix this provider implements. Vertex
+// serves two model families with different source support -- Claude-on-Vertex takes
+// base64 only, Gemini-on-Vertex takes fileData.fileUri -- so the same URL is downloaded
+// for one and forwarded for the other. Getting this wrong is invisible until a live
+// request fails, which is how the gs:// regression shipped.
+func TestClassifyURLSource(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		url       string
+		anthropic bool
+		want      urlSourceDisposition
+	}{
+		{name: "https to gemini is fetched", url: "https://example.com/a.pdf", want: urlSourceFetchHTTP},
+		{name: "http to gemini is fetched", url: "http://example.com/a.pdf", want: urlSourceFetchHTTP},
+		{name: "gcs to gemini is forwarded", url: "gs://bucket/clip.mp4", want: urlSourceForward},
+		{name: "data uri to gemini is forwarded", url: "data:image/png;base64,iVBORw0KGgo=", want: urlSourceForward},
+
+		{name: "https to claude is fetched", url: "https://example.com/a.pdf", anthropic: true, want: urlSourceFetchHTTP},
+		{name: "http to claude is fetched", url: "http://example.com/a.pdf", anthropic: true, want: urlSourceFetchHTTP},
+		{name: "gcs to claude is fetched from storage", url: "gs://bucket/clip.mp4", anthropic: true, want: urlSourceFetchGCS},
+		{name: "data uri to claude is forwarded", url: "data:image/png;base64,iVBORw0KGgo=", anthropic: true, want: urlSourceForward},
+
+		// Schemes bifrost cannot fetch are still handed to the provider rather than
+		// rejected here: bifrost does not decide what the provider accepts, and the
+		// provider's own answer is the authoritative one.
+		{name: "s3 is forwarded for gemini", url: "s3://bucket/a.pdf", want: urlSourceForward},
+		{name: "s3 is forwarded for claude", url: "s3://bucket/a.pdf", anthropic: true, want: urlSourceForward},
+		{name: "file scheme is forwarded", url: "file:///etc/passwd", want: urlSourceForward},
+		{name: "scheme-less value is forwarded", url: "bucket/a.pdf", want: urlSourceForward},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := classifyURLSource(tt.url, tt.anthropic); got != tt.want {
+				t.Fatalf("classifyURLSource(%q, anthropic=%v) = %v, want %v", tt.url, tt.anthropic, got, tt.want)
+			}
+		})
+	}
+}
+
+// forwardedGeminiURLs are the URL forms a Gemini-family request must reach Vertex with
+// intact. gs:// is the load-bearing case: downloading it fails outright today (the
+// reported bug) and forwarding keeps large media out of the 25 MiB inline path.
+// https is deliberately absent -- Vertex rejects a forwarded https fileUri, measured
+// against harness 47.10, so it stays on the fetch path. See classifyURLSource.
+var forwardedGeminiURLs = []struct {
+	name string
+	url  string
+}{
+	{name: "gcs", url: "gs://my-bucket/video-eval/clip.mp4"},
+	{name: "data uri", url: "data:image/png;base64,iVBORw0KGgo="},
+}
+
+func TestInlineRemoteURLSourcesForwardsGeminiURLs(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range forwardedGeminiURLs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			provider := &VertexProvider{}
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			fileURL := tc.url
+			request := &schemas.BifrostChatRequest{
+				Model: "gemini-3.1-pro-preview",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentBlocks: []schemas.ChatContentBlock{
+								{
+									Type: schemas.ChatContentBlockTypeFile,
+									File: &schemas.ChatInputFile{FileURL: &fileURL},
+								},
+								{
+									Type:           schemas.ChatContentBlockTypeImage,
+									ImageURLStruct: &schemas.ChatInputImage{URL: tc.url},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			if err := provider.inlineRemoteURLSources(ctx, schemas.Key{}, request); err != nil {
+				t.Fatalf("inlineRemoteURLSources(%q) returned error, want forward: %v", tc.url, err)
+			}
+
+			blocks := request.Input[0].Content.ContentBlocks
+			if got := blocks[0].File.FileURL; got == nil || *got != tc.url {
+				t.Errorf("file url = %v, want %q untouched", got, tc.url)
+			}
+			if blocks[0].File.FileData != nil {
+				t.Errorf("file data = %q, want nil (nothing should have been fetched)", *blocks[0].File.FileData)
+			}
+			if got := blocks[1].ImageURLStruct.URL; got != tc.url {
+				t.Errorf("image url = %q, want %q untouched", got, tc.url)
+			}
+		})
+	}
+}
+
+func TestInlineDocumentURLsResponsesForwardsGeminiURLs(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range forwardedGeminiURLs {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			provider := &VertexProvider{}
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			fileURL := tc.url
+			imageURL := tc.url
+			role := schemas.ResponsesInputMessageRoleUser
+			request := &schemas.BifrostResponsesRequest{
+				Model: "gemini-3.1-pro-preview",
+				Input: []schemas.ResponsesMessage{
+					{
+						Role: &role,
+						Content: &schemas.ResponsesMessageContent{
+							ContentBlocks: []schemas.ResponsesMessageContentBlock{
+								{
+									Type:                                  schemas.ResponsesInputMessageContentBlockTypeFile,
+									ResponsesInputMessageContentBlockFile: &schemas.ResponsesInputMessageContentBlockFile{FileURL: &fileURL},
+								},
+								{
+									Type:                                   schemas.ResponsesInputMessageContentBlockTypeImage,
+									ResponsesInputMessageContentBlockImage: &schemas.ResponsesInputMessageContentBlockImage{ImageURL: &imageURL},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			if err := provider.inlineDocumentURLsResponses(ctx, schemas.Key{}, request); err != nil {
+				t.Fatalf("inlineDocumentURLsResponses(%q) returned error, want forward: %v", tc.url, err)
+			}
+
+			blocks := request.Input[0].Content.ContentBlocks
+			if got := blocks[0].ResponsesInputMessageContentBlockFile.FileURL; got == nil || *got != tc.url {
+				t.Errorf("file url = %v, want %q untouched", got, tc.url)
+			}
+			if got := blocks[1].ResponsesInputMessageContentBlockImage.ImageURL; got == nil || *got != tc.url {
+				t.Errorf("image url = %v, want %q untouched", got, tc.url)
+			}
+			// An unchanged URL alone does not prove the object was left alone: a
+			// regression that fetched the bytes AND kept the URL would satisfy the two
+			// checks above. FileData is what says nothing was downloaded, which is the
+			// actual claim of this test. The chat twin already asserts it, so without
+			// this the invariant is only half covered - and the uncovered half is the
+			// Responses path.
+			if got := blocks[0].ResponsesInputMessageContentBlockFile.FileData; got != nil {
+				t.Errorf("file data = %v, want nil (the reference must be forwarded, not fetched)", *got)
+			}
+		})
+	}
+}
+
+// TestInlineRemoteURLSourcesForwardsUnfetchableSchemes: a scheme bifrost cannot download
+// is passed through untouched rather than rejected. Bifrost does not model which sources
+// a provider accepts - the provider answers for itself, and its capabilities can change
+// without a bifrost release.
+func TestInlineRemoteURLSourcesForwardsUnfetchableSchemes(t *testing.T) {
+	t.Parallel()
+
+	for _, rawURL := range []string{"s3://my-bucket/doc.pdf", "bucket/doc.pdf", "file:///etc/passwd"} {
+		t.Run(rawURL, func(t *testing.T) {
+			t.Parallel()
+
+			provider := &VertexProvider{}
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			fileURL := rawURL
+			request := &schemas.BifrostChatRequest{
+				Model: "gemini-3.1-pro-preview",
+				Input: []schemas.ChatMessage{
+					{
+						Role: schemas.ChatMessageRoleUser,
+						Content: &schemas.ChatMessageContent{
+							ContentBlocks: []schemas.ChatContentBlock{
+								{
+									Type: schemas.ChatContentBlockTypeFile,
+									File: &schemas.ChatInputFile{FileURL: &fileURL},
+								},
+							},
+						},
+					},
+				},
+			}
+
+			if err := provider.inlineRemoteURLSources(ctx, schemas.Key{}, request); err != nil {
+				t.Fatalf("inlineRemoteURLSources(%q) errored, want pass-through: %v", rawURL, err)
+			}
+
+			block := request.Input[0].Content.ContentBlocks[0]
+			if got := block.File.FileURL; got == nil || *got != rawURL {
+				t.Errorf("file url = %v, want %q forwarded untouched", got, rawURL)
+			}
+			if block.File.FileData != nil {
+				t.Errorf("file data = %q, want nil: bifrost must not have fetched anything", *block.File.FileData)
+			}
+		})
+	}
+}
+
+// TestVertexGeminiGCSFileURLSurvivesInlining is the end-to-end regression for the
+// reported failure: a video file block carrying a gs:// URI must reach the Gemini
+// converter intact and come out as a fileData part. TestVertexGeminiImageURLSchemesAllowGCS
+// only exercises the converter in isolation, which is why the inliner running ahead of it
+// went unnoticed.
+func TestVertexGeminiGCSFileURLSurvivesInlining(t *testing.T) {
+	t.Parallel()
+
+	const gcsURI = "gs://dropbox-ml-dev-uploads/video-eval/clip.mp4"
+	provider := &VertexProvider{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	fileURL := gcsURI
+	fileType := "video/mp4"
+	request := &schemas.BifrostChatRequest{
+		Model: "gemini-3.1-pro-preview",
+		Input: []schemas.ChatMessage{
+			{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{
+					ContentBlocks: []schemas.ChatContentBlock{
+						{
+							Type: schemas.ChatContentBlockTypeFile,
+							File: &schemas.ChatInputFile{FileURL: &fileURL, FileType: &fileType},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if err := provider.inlineRemoteURLSources(ctx, schemas.Key{}, request); err != nil {
+		t.Fatalf("inlineRemoteURLSources returned error for gs:// file source: %v", err)
+	}
+
+	result, err := gemini.ToGeminiChatCompletionRequestWithImageURLSchemes(ctx, request, geminiImageURLSchemes...)
+	if err != nil {
+		t.Fatalf("converting gs:// file source failed: %v", err)
+	}
+	if len(result.Contents) != 1 || len(result.Contents[0].Parts) != 1 {
+		t.Fatalf("expected one part, got %#v", result.Contents)
+	}
+	part := result.Contents[0].Parts[0]
+	if part.FileData == nil {
+		t.Fatalf("expected a fileData part, got %#v", part)
+	}
+	if part.FileData.FileURI != gcsURI {
+		t.Errorf("fileUri = %q, want %q", part.FileData.FileURI, gcsURI)
+	}
+	if part.FileData.MIMEType != fileType {
+		t.Errorf("mimeType = %q, want %q", part.FileData.MIMEType, fileType)
+	}
+}
+
+// TestVertexServiceTierReadsDatasheet covers the datasheet side of the tier gate.
+// The published-prefix fallback is covered by the test above; these pin that a
+// service_tiers list overrides it in both directions, and that the list is
+// per-tier rather than a single on/off.
+func TestVertexServiceTierReadsDatasheet(t *testing.T) {
+	install := func(t *testing.T, model string, tiers []string) {
+		t.Helper()
+		schemas.SetCapabilityResolver(func(_ schemas.ModelProvider, m string) *schemas.ModelCapabilities {
+			if m != model {
+				return nil
+			}
+			return &schemas.ModelCapabilities{ServiceTiers: tiers}
+		})
+		t.Cleanup(func() { schemas.SetCapabilityResolver(nil) })
+	}
+
+	t.Run("list_opts_an_unlisted_model_in", func(t *testing.T) {
+		const model = "gemini-4-hypothetical"
+		install(t, model, []string{"priority"})
+
+		if got := vertexServiceTierHeaderValue("global", model, schemas.BifrostServiceTierPriority); got != "priority" {
+			t.Fatalf("expected priority header from service_tiers, got %q", got)
+		}
+		if got := vertexServiceTierHeaderValue("global", model, schemas.BifrostServiceTierFlex); got != "" {
+			t.Fatalf("expected no flex header for a priority-only row, got %q", got)
+		}
+	})
+
+	t.Run("list_opts_a_published_model_out", func(t *testing.T) {
+		// gemini-2.5-pro is in vertexPriorityModels; an explicit list must win.
+		const model = "gemini-2.5-pro"
+		install(t, model, []string{"flex"})
+
+		if got := vertexServiceTierHeaderValue("global", model, schemas.BifrostServiceTierPriority); got != "" {
+			t.Fatalf("expected service_tiers to drop priority, got %q", got)
+		}
+		if got := vertexServiceTierHeaderValue("global", model, schemas.BifrostServiceTierFlex); got != "flex" {
+			t.Fatalf("expected flex header from service_tiers, got %q", got)
+		}
+	})
+
+	t.Run("region_gate_still_applies", func(t *testing.T) {
+		const model = "gemini-4-hypothetical"
+		install(t, model, []string{"priority"})
+
+		if got := vertexServiceTierHeaderValue("us-central1", model, schemas.BifrostServiceTierPriority); got != "" {
+			t.Fatalf("service tiers are global-endpoint only, got %q", got)
+		}
+	})
+}
+
+func TestIsAnthropicPassthroughPath(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		path string
+		want bool
+	}{
+		{"/v1/projects/p/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict", true},
+		{"/v1/projects/p/locations/us-east5/publishers/anthropic/models/claude-opus-4-5:rawPredict", true},
+		{"/projects/p/locations/global/publishers/ANTHROPIC/models/claude-sonnet-4-5:rawPredict", true},
+		{"/v1/projects/p/locations/global/publishers/anthropic/models/claude-sonnet-4-5:streamRawPredict?alt=sse", true},
+		{"/v1beta/projects/p/locations/us-central1/publishers/google/models/gemini-2.5-flash:streamGenerateContent", false},
+		{"/v1beta/models/gemini-2.5-flash:generateContent", false},
+		{"", false},
+	}
+
+	for _, tc := range cases {
+		if got := isAnthropicPassthroughPath(tc.path); got != tc.want {
+			t.Errorf("isAnthropicPassthroughPath(%q) = %v, want %v", tc.path, got, tc.want)
+		}
+	}
+}
+
+// The Anthropic-on-Vertex stream carries usage in Messages events, which the Gemini parser
+// drops — the empty token/cost half of issue #6073.
+func TestVertexAnthropicPassthroughStreamUsage(t *testing.T) {
+	t.Parallel()
+
+	messageStart := []byte(`{"type":"message_start","message":{"usage":{"input_tokens":522,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}`)
+	messageDelta := []byte(`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":522,"output_tokens":13,"output_tokens_details":{"thinking_tokens":0}}}`)
+
+	path := "/v1/projects/p/locations/global/publishers/anthropic/models/claude-sonnet-4-5@20250929:streamRawPredict"
+	if u := gemini.ExtractGeminiPassthroughUsage(path, nil, messageDelta); u != nil {
+		t.Fatalf("gemini parser unexpectedly produced usage for an anthropic event: %+v", u)
+	}
+
+	acc := &anthropic.AnthropicPassthroughStreamUsage{}
+	acc.ObserveEvent(messageStart)
+	usage := acc.ObserveEvent(messageDelta)
+	if usage == nil || usage.LLMUsage == nil {
+		t.Fatalf("expected usage from anthropic accumulator, got %+v", usage)
+	}
+	if usage.LLMUsage.PromptTokens != 522 || usage.LLMUsage.CompletionTokens != 13 || usage.LLMUsage.TotalTokens != 535 {
+		t.Fatalf("unexpected usage: %+v", usage.LLMUsage)
+	}
+}
+func TestVertexResourceNamesStayOnExpectedEndpoint(t *testing.T) {
+	t.Parallel()
+
+	key := schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{ProjectID: *schemas.NewSecretVar("proj"), Region: *schemas.NewSecretVar("us-central1")}}
+	validBatch := map[string]string{
+		"123": "https://us-central1-aiplatform.googleapis.com/v1/projects/proj/locations/us-central1/batchPredictionJobs/123",
+		// Vertex returns the project number, and the job may live in another region.
+		"projects/987654321/locations/europe-west4/batchPredictionJobs/123": "https://europe-west4-aiplatform.googleapis.com/v1/projects/987654321/locations/europe-west4/batchPredictionJobs/123",
+	}
+	for id, want := range validBatch {
+		got, bifrostErr := vertexBatchJobURL(key, id)
+		if bifrostErr != nil || got != want {
+			t.Fatalf("vertexBatchJobURL(%q) = %q, %v; want %q", id, got, bifrostErr, want)
+		}
+	}
+	for _, id := range []string{
+		"../endpoints",
+		"123?x=1",
+		"projects/p/locations/attacker.example#/batchPredictionJobs/1",
+		"projects/p/locations/us-central1/endpoints/1",
+		"projects/p/locations/us-central1/batchPredictionJobs/../endpoints",
+		"projects/p/locations/us-central1/batchPredictionJobs/1/extra",
+	} {
+		if got, bifrostErr := vertexBatchJobURL(key, id); bifrostErr == nil {
+			t.Fatalf("vertexBatchJobURL(%q) = %q, want error", id, got)
+		}
+	}
+
+	operation := "projects/proj/locations/europe-west4/publishers/google/models/veo-3/operations/op-1"
+	if got, bifrostErr := vertexVideoOperationURL(operation); bifrostErr != nil || got != "https://europe-west4-aiplatform.googleapis.com/v1/projects/proj/locations/europe-west4/publishers/google/models/veo-3:fetchPredictOperation" {
+		t.Fatalf("vertexVideoOperationURL = %q, %v", got, bifrostErr)
+	}
+	for _, id := range []string{
+		"projects/proj/locations/us-central1/../../endpoints/operations/op-1",
+		"projects/proj/locations/attacker.example#/publishers/google/models/veo-3/operations/op-1",
+	} {
+		if got, bifrostErr := vertexVideoOperationURL(id); bifrostErr == nil {
+			t.Fatalf("vertexVideoOperationURL(%q) = %q, want error", id, got)
+		}
+	}
+
+	if got, bifrostErr := expandVertexCachedContentName("cachedContents/abc", "proj", "us-central1"); bifrostErr != nil || got != "projects/proj/locations/us-central1/cachedContents/abc" {
+		t.Fatalf("expandVertexCachedContentName = %q, %v", got, bifrostErr)
+	}
+	if got, bifrostErr := expandVertexCachedContentName("projects/proj/locations/us-central1/cachedContents/../endpoints", "proj", "us-central1"); bifrostErr == nil {
+		t.Fatalf("expandVertexCachedContentName accepted a traversal: %q", got)
+	}
+}
+
+// A Veo operation lives in the region that created it, so polls must go there whatever region
+// the selected key is configured for.
+func TestVertexVideoPollUsesOperationRegion(t *testing.T) {
+	var mu sync.Mutex
+	var dialed []string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		dialed = append(dialed, r.Host)
+		mu.Unlock()
+		http.Error(w, "recorded", http.StatusBadGateway)
+	}))
+	defer proxy.Close()
+
+	config := &schemas.ProviderConfig{
+		NetworkConfig: schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 10},
+		ProxyConfig:   &schemas.ProxyConfig{Type: schemas.HTTPProxy, URL: schemas.NewSecretVar(proxy.URL)},
+	}
+	config.CheckAndSetDefaults()
+	provider, err := NewVertexProvider(config, nil)
+	if err != nil {
+		t.Fatalf("NewVertexProvider: %v", err)
+	}
+
+	key := schemas.Key{
+		Value:           *schemas.NewSecretVar("api-key"),
+		VertexKeyConfig: &schemas.VertexKeyConfig{ProjectID: *schemas.NewSecretVar("proj"), Region: *schemas.NewSecretVar("us-east5")},
+	}
+	videoID := providerUtils.AddVideoIDProviderSuffix("projects/proj/locations/us-central1/publishers/google/models/veo-3.0-generate-001/operations/op-1", schemas.Vertex)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+
+	if _, bifrostErr := provider.VideoRetrieve(ctx, key, &schemas.BifrostVideoRetrieveRequest{Provider: schemas.Vertex, ID: videoID}); bifrostErr == nil {
+		t.Fatal("VideoRetrieve succeeded against the recording proxy")
+	}
+	if _, bifrostErr := provider.VideoDownload(ctx, key, &schemas.BifrostVideoDownloadRequest{Provider: schemas.Vertex, ID: videoID}); bifrostErr == nil {
+		t.Fatal("VideoDownload succeeded against the recording proxy")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"us-central1-aiplatform.googleapis.com:443", "us-central1-aiplatform.googleapis.com:443"}
+	if !reflect.DeepEqual(dialed, want) {
+		t.Fatalf("video polls dialed %v, want %v", dialed, want)
+	}
+}
+
+// The /genai_passthrough router strips the API version with its prefix, so Vertex must build
+// the upstream URL from the version the client addressed: Interactions exists only under v1beta1.
+// Model calls keep the v1 they have always used.
+func TestVertexPassthroughUsesClientAPIVersion(t *testing.T) {
+	var mu sync.Mutex
+	var paths []string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"i-1"}`))
+	}))
+	defer upstream.Close()
+
+	config := &schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 10}}
+	config.CheckAndSetDefaults()
+	provider, err := NewVertexProvider(config, nil)
+	if err != nil {
+		t.Fatalf("NewVertexProvider: %v", err)
+	}
+	for _, client := range []*fasthttp.Client{provider.client, provider.streamingClient} {
+		client.Dial = func(string) (net.Conn, error) { return net.Dial("tcp", upstream.Listener.Addr().String()) }
+		client.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	key := schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{
+		ProjectID:       *schemas.NewSecretVar("proj"),
+		Region:          *schemas.NewSecretVar("global"),
+		AuthCredentials: *schemas.NewSecretVar("test-credentials"),
+	}}
+	provider.tokenSources.Store(getClientKey(vertexCredentialIdentity(key)), oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+	noHooks := func(_ *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		return result, err
+	}
+
+	interactions := "/projects/client-proj/locations/global/interactions"
+	claudeStream := "/projects/client-proj/locations/global/publishers/anthropic/models/claude-sonnet-4-6:streamRawPredict"
+	geminiGenerate := "/projects/client-proj/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"
+	for _, tc := range []struct {
+		apiVersion string
+		path       string
+		want       string
+	}{
+		{"v1beta1", interactions, "/v1beta1/projects/proj/locations/global/interactions"},
+		{"v1", interactions, "/v1/projects/proj/locations/global/interactions"},
+		{"", interactions, "/v1/projects/proj/locations/global/interactions"},
+		{"v1beta", interactions, "/v1/projects/proj/locations/global/interactions"}, // Gemini-only version; Vertex has no v1beta
+		{"v2", interactions, "/v2/projects/proj/locations/global/interactions"},     // any other version is forwarded as sent
+		// Model calls keep v1: Google's v1beta1 streamRawPredict answers 500 for Claude.
+		{"v1beta1", claudeStream, "/v1/projects/proj/locations/global/publishers/anthropic/models/claude-sonnet-4-6:streamRawPredict"},
+		{"v1beta1", geminiGenerate, "/v1/projects/proj/locations/global/publishers/google/models/gemini-2.5-flash:generateContent"},
+	} {
+		mu.Lock()
+		paths = nil
+		mu.Unlock()
+		req := &schemas.BifrostPassthroughRequest{
+			Method:      http.MethodPost,
+			Path:        tc.path,
+			APIVersion:  tc.apiVersion,
+			Body:        []byte(`{"model":"gemini-3-flash","input":"hi"}`),
+			SafeHeaders: map[string]string{"content-type": "application/json"},
+		}
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		if _, bifrostErr := provider.Passthrough(ctx, key, req); bifrostErr != nil {
+			t.Fatalf("Passthrough(%q, %s): %s", tc.apiVersion, tc.path, bifrostErr.GetErrorString())
+		}
+		stream, bifrostErr := provider.PassthroughStream(ctx, noHooks, nil, key, req)
+		if bifrostErr != nil {
+			t.Fatalf("PassthroughStream(%q, %s): %s", tc.apiVersion, tc.path, bifrostErr.GetErrorString())
+		}
+		for drained := false; !drained; {
+			select {
+			case _, ok := <-stream:
+				drained = !ok
+			case <-time.After(5 * time.Second):
+				t.Fatalf("PassthroughStream(%q) did not finish", tc.apiVersion)
+			}
+		}
+
+		mu.Lock()
+		got := paths
+		mu.Unlock()
+		if want := []string{tc.want, tc.want}; !reflect.DeepEqual(got, want) {
+			t.Errorf("APIVersion %q %s: upstream paths %v, want %v (unary and stream)", tc.apiVersion, tc.path, got, want)
+		}
+	}
+}
+
+func TestPassthroughWireFormat(t *testing.T) {
+	tests := []struct {
+		path string
+		want schemas.ModelProvider
+	}{
+		{"/projects/p/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:rawPredict", schemas.Anthropic},
+		{"/projects/p/locations/us-east5/publishers/Anthropic/models/claude-sonnet-4-5:streamRawPredict?alt=sse", schemas.Anthropic},
+		{"/projects/p/locations/us-central1/publishers/mistralai/models/mistral-large:rawPredict", schemas.Mistral},
+		{"/projects/p/locations/us-central1/endpoints/openapi/chat/completions", schemas.OpenAI},
+		{"/projects/p/locations/us-central1/publishers/google/models/gemini-2.5-pro:generateContent", schemas.Gemini},
+		{"/models/gemini-2.5-flash:streamGenerateContent", schemas.Gemini},
+	}
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			if got := PassthroughWireFormat(tt.path); got != tt.want {
+				t.Fatalf("PassthroughWireFormat(%q) = %q, want %q", tt.path, got, tt.want)
+			}
+		})
+	}
+}
+
+// Session routing sends prompt_cache_key as session_id only from a Vertex key that opts in, only on
+// Gemini generateContent calls, and never over a session ID the caller passes through itself.
+func TestVertexSessionRoutingSendsPromptCacheKey(t *testing.T) {
+	const geminiResponse = `{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}`
+	const anthropicResponse = `{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	type sent struct{ path, body string }
+	var mu sync.Mutex
+	var requests []sent
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		requests = append(requests, sent{r.URL.Path, string(body)})
+		mu.Unlock()
+		switch {
+		case strings.HasSuffix(r.URL.Path, ":streamGenerateContent"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: " + geminiResponse + "\n\n"))
+		case strings.HasSuffix(r.URL.Path, ":countTokens"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"totalTokens":3}`))
+		case strings.Contains(r.URL.Path, "/publishers/anthropic/"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(anthropicResponse))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(geminiResponse))
+		}
+	}))
+	defer upstream.Close()
+
+	config := &schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 10}}
+	config.CheckAndSetDefaults()
+	provider, err := NewVertexProvider(config, nil)
+	if err != nil {
+		t.Fatalf("NewVertexProvider: %v", err)
+	}
+	for _, client := range []*fasthttp.Client{provider.client, provider.streamingClient} {
+		client.Dial = func(string) (net.Conn, error) { return net.Dial("tcp", upstream.Listener.Addr().String()) }
+		client.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	keyWith := func(sessionRouting bool) schemas.Key {
+		key := schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{
+			ProjectID:         *schemas.NewSecretVar("proj"),
+			Region:            *schemas.NewSecretVar("global"),
+			AuthCredentials:   *schemas.NewSecretVar("test-credentials"),
+			UseSessionRouting: sessionRouting,
+		}}
+		provider.tokenSources.Store(getClientKey(vertexCredentialIdentity(key)), oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+		return key
+	}
+	on, off := keyWith(true), keyWith(false)
+	noHooks := func(_ *schemas.BifrostContext, result *schemas.BifrostResponse, err *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		return result, err
+	}
+	drain := func(stream chan *schemas.BifrostStreamChunk, bifrostErr *schemas.BifrostError) *schemas.BifrostError {
+		if bifrostErr != nil {
+			return bifrostErr
+		}
+		for {
+			select {
+			case _, ok := <-stream:
+				if !ok {
+					return nil
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("stream did not finish")
+			}
+		}
+	}
+	newCtx := func() *schemas.BifrostContext {
+		return schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	}
+	chat := func(model string, params *schemas.ChatParameters) *schemas.BifrostChatRequest {
+		return &schemas.BifrostChatRequest{
+			Provider: schemas.Vertex,
+			Model:    model,
+			Input:    []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: new("hi")}}},
+			Params:   params,
+		}
+	}
+	responses := func(model string, params *schemas.ResponsesParameters) *schemas.BifrostResponsesRequest {
+		return &schemas.BifrostResponsesRequest{
+			Provider: schemas.Vertex,
+			Model:    model,
+			Input:    []schemas.ResponsesMessage{{Role: new(schemas.ResponsesInputMessageRoleUser), Content: &schemas.ResponsesMessageContent{ContentStr: new("hi")}}},
+			Params:   params,
+		}
+	}
+	genai := func(body string) *schemas.BifrostResponsesRequest {
+		var in gemini.GeminiGenerationRequest
+		if err := in.UnmarshalJSON([]byte(body)); err != nil {
+			t.Fatalf("genai body: %v", err)
+		}
+		return in.ToBifrostResponsesRequest(newCtx())
+	}
+	chatKey := &schemas.ChatParameters{PromptCacheKey: new("prefix-1")}
+	responsesKey := &schemas.ResponsesParameters{PromptCacheKey: new("prefix-1")}
+	anthropicIngress := (&anthropic.AnthropicMessageRequest{
+		Model:     "vertex/gemini-3.8-flash",
+		MaxTokens: 16,
+		Messages:  []anthropic.AnthropicMessage{{Role: "user", Content: anthropic.AnthropicContent{ContentStr: new("hi")}}},
+		Metadata:  &anthropic.AnthropicMetaData{UserID: new("user-1")},
+	}).ToBifrostResponsesRequest(newCtx())
+	passthroughCtx := newCtx()
+	passthroughCtx.SetValue(schemas.BifrostContextKeyPassthroughExtraParams, true)
+
+	for _, tc := range []struct {
+		name          string
+		call          func() *schemas.BifrostError
+		wantPath      string
+		wantSessionID string // raw JSON of session_id; "" means absent
+	}{
+		{"/v1/chat/completions", func() *schemas.BifrostError {
+			_, e := provider.ChatCompletion(newCtx(), on, chat("gemini-3.8-flash", chatKey))
+			return e
+		}, ":generateContent", `"prefix-1"`},
+		{"/v1/chat/completions stream", func() *schemas.BifrostError {
+			return drain(provider.ChatCompletionStream(newCtx(), noHooks, nil, on, chat("gemini-3.8-flash", chatKey)))
+		}, ":streamGenerateContent", `"prefix-1"`},
+		{"/v1/responses", func() *schemas.BifrostError {
+			_, e := provider.Responses(newCtx(), on, responses("gemini-3.8-flash", responsesKey))
+			return e
+		}, ":generateContent", `"prefix-1"`},
+		{"/v1/responses stream", func() *schemas.BifrostError {
+			return drain(provider.ResponsesStream(newCtx(), noHooks, nil, on, responses("gemini-3.8-flash", responsesKey)))
+		}, ":streamGenerateContent", `"prefix-1"`},
+		{"/anthropic metadata.user_id", func() *schemas.BifrostError {
+			_, e := provider.Responses(newCtx(), on, anthropicIngress)
+			return e
+		}, ":generateContent", `"user-1"`},
+		{"/genai session_id", func() *schemas.BifrostError {
+			_, e := provider.Responses(newCtx(), on, genai(`{"model":"vertex/gemini-3.8-flash","contents":[{"role":"user","parts":[{"text":"hi"}]}],"session_id":"prefix-g"}`))
+			return e
+		}, ":generateContent", `"prefix-g"`},
+		{"/genai numeric session_id is sent as a string", func() *schemas.BifrostError {
+			_, e := provider.Responses(newCtx(), on, genai(`{"model":"vertex/gemini-3.8-flash","contents":[{"role":"user","parts":[{"text":"hi"}]}],"session_id":12345}`))
+			return e
+		}, ":generateContent", `"12345"`},
+		{"key without session routing", func() *schemas.BifrostError {
+			_, e := provider.ChatCompletion(newCtx(), off, chat("gemini-3.8-flash", chatKey))
+			return e
+		}, ":generateContent", ""},
+		{"empty prompt_cache_key", func() *schemas.BifrostError {
+			_, e := provider.ChatCompletion(newCtx(), on, chat("gemini-3.8-flash", &schemas.ChatParameters{PromptCacheKey: new("")}))
+			return e
+		}, ":generateContent", ""},
+		{"count tokens rejects session_id, so it never gets one", func() *schemas.BifrostError {
+			_, e := provider.CountTokens(newCtx(), on, responses("gemini-3.8-flash", responsesKey))
+			return e
+		}, ":countTokens", ""},
+		{"Claude on Vertex", func() *schemas.BifrostError {
+			_, e := provider.Responses(newCtx(), on, responses("claude-sonnet-4-6", responsesKey))
+			return e
+		}, ":rawPredict", ""},
+		{"caller session_id passed through wins", func() *schemas.BifrostError {
+			params := &schemas.ChatParameters{PromptCacheKey: new("prefix-1"), ExtraParams: map[string]interface{}{"session_id": "caller"}}
+			_, e := provider.ChatCompletion(passthroughCtx, on, chat("gemini-3.8-flash", params))
+			return e
+		}, ":generateContent", `"caller"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mu.Lock()
+			requests = nil
+			mu.Unlock()
+			if bifrostErr := tc.call(); bifrostErr != nil {
+				t.Fatalf("call failed: %s", bifrostErr.GetErrorString())
+			}
+			mu.Lock()
+			got := requests
+			mu.Unlock()
+			if len(got) != 1 || !strings.HasSuffix(got[0].path, tc.wantPath) {
+				t.Fatalf("upstream requests = %+v, want one to *%s", got, tc.wantPath)
+			}
+			if raw := gjson.Get(got[0].body, "session_id").Raw; raw != tc.wantSessionID {
+				t.Fatalf("session_id = %s, want %s; body %s", raw, tc.wantSessionID, got[0].body)
+			}
+			if gjson.Get(got[0].body, "sessionId").Exists() {
+				t.Fatalf("camelCase sessionId sent; body %s", got[0].body)
+			}
+		})
+	}
+}
+
+func BenchmarkApplyVertexSessionRouting(b *testing.B) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	promptCacheKey := new("prefix-1")
+	for _, bc := range []struct {
+		name string
+		key  schemas.Key
+	}{
+		{"no vertex config", schemas.Key{}},
+		{"off", schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{}}},
+		{"on", schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{UseSessionRouting: true}}},
+	} {
+		b.Run(bc.name, func(b *testing.B) {
+			var req gemini.GeminiGenerationRequest
+			b.ReportAllocs()
+			for b.Loop() {
+				req.SessionID = nil
+				applyVertexSessionRouting(ctx, bc.key, "gemini-3.8-flash", promptCacheKey, &req)
+			}
+		})
+	}
+}
+
+// Vertex reads the anthropic-beta header when it validates a beta-gated request field:
+// thinking.display "updates" still 400s ("Input should be 'summarized', 'omitted'") with the beta
+// only in the anthropic_beta body array. The non-stream chat path sends the header next to the
+// body field, as the Responses and streaming paths already do.
+func TestVertexChatCompletionSendsBetaHeader(t *testing.T) {
+	const anthropicResponse = `{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-5-5","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
+	var mu sync.Mutex
+	var betaHeader, body string
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		betaHeader, body = r.Header.Get("anthropic-beta"), string(raw)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(anthropicResponse))
+	}))
+	defer upstream.Close()
+
+	config := &schemas.ProviderConfig{NetworkConfig: schemas.NetworkConfig{DefaultRequestTimeoutInSeconds: 10}}
+	config.CheckAndSetDefaults()
+	provider, err := NewVertexProvider(config, nil)
+	if err != nil {
+		t.Fatalf("NewVertexProvider: %v", err)
+	}
+	for _, client := range []*fasthttp.Client{provider.client, provider.streamingClient} {
+		client.Dial = func(string) (net.Conn, error) { return net.Dial("tcp", upstream.Listener.Addr().String()) }
+		client.TLSConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	key := schemas.Key{VertexKeyConfig: &schemas.VertexKeyConfig{
+		ProjectID:       *schemas.NewSecretVar("proj"),
+		Region:          *schemas.NewSecretVar("global"),
+		AuthCredentials: *schemas.NewSecretVar("test-credentials"),
+	}}
+	provider.tokenSources.Store(getClientKey(vertexCredentialIdentity(key)), oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "test-token"}))
+
+	for _, tc := range []struct {
+		name    string
+		display string
+		want    string
+	}{
+		{"updates sends the beta", "updates", anthropic.AnthropicThinkingDisplayUpdatesBetaHeader},
+		{"summarized needs no beta", "summarized", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := &schemas.BifrostChatRequest{
+				Provider: schemas.Vertex,
+				Model:    "claude-opus-5-5",
+				Input:    []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: new("hi")}}},
+				Params:   &schemas.ChatParameters{Reasoning: &schemas.ChatReasoning{Effort: new("high"), Display: new(tc.display)}},
+			}
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			if _, bifrostErr := provider.ChatCompletion(ctx, key, req); bifrostErr != nil {
+				t.Fatalf("ChatCompletion: %s", bifrostErr.GetErrorString())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if betaHeader != tc.want {
+				t.Errorf("anthropic-beta header = %q, want %q (body: %s)", betaHeader, tc.want, body)
+			}
+			if bodyBeta := gjson.Get(body, "anthropic_beta.0").String(); bodyBeta != tc.want {
+				t.Errorf("anthropic_beta body field = %q, want %q", bodyBeta, tc.want)
+			}
+		})
+	}
+}
+
+// vertexModelGarden serves ids as the google publisher's catalog and answers 404 for the
+// other publishers, the way a region without their models does. It counts every request.
+func vertexModelGarden(hits *atomic.Int32, ids ...string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.URL.Path != "/v1beta1/publishers/google/models" {
+			http.NotFound(w, r)
+			return
+		}
+		models := make([]map[string]string, 0, len(ids))
+		for _, id := range ids {
+			models = append(models, map[string]string{"name": "publishers/google/models/" + id, "versionId": "default"})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"publisherModels": models})
+	})
+}
+
+// listedVertexModels lists key's models and maps each listed id to its alias, "" when it has none.
+func listedVertexModels(t *testing.T, provider *VertexProvider, key schemas.Key) map[string]string {
+	t.Helper()
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	resp, bifrostErr := provider.listModelsByKey(ctx, key, &schemas.BifrostListModelsRequest{Provider: schemas.Vertex})
+	if bifrostErr != nil {
+		t.Fatalf("listModelsByKey: %s", bifrostErr.GetErrorString())
+	}
+	got := make(map[string]string, len(resp.Data))
+	for _, m := range resp.Data {
+		if _, dup := got[m.ID]; dup {
+			t.Fatalf("%s is listed twice", m.ID)
+		}
+		alias := ""
+		if m.Alias != nil {
+			alias = *m.Alias
+		}
+		got[m.ID] = alias
+	}
+	return got
+}
+
+// A key that can mint an OAuth token lists the Model Garden catalog through its allowlist and
+// adds its deployments, so "*" and regex: entries reach catalog models. It used to list only its
+// configuration whenever it had a deployment or an allowlist other than "*".
+func TestVertexListModelsOAuthKeyListsModelGarden(t *testing.T) {
+	catalog := []string{"gemini-2.5-flash", "gemini-3.1-flash-image", "text-embedding-005"}
+	for _, tc := range []struct {
+		name        string
+		models      schemas.WhiteList
+		deployments schemas.KeyAliases
+		want        map[string]string
+	}{
+		{
+			name:   "regex allowlist",
+			models: schemas.WhiteList{"regex:^gemini-.*$"},
+			want:   map[string]string{"vertex/gemini-2.5-flash": "", "vertex/gemini-3.1-flash-image": ""},
+		},
+		{
+			name:        "all models with a deployment",
+			models:      schemas.WhiteList{"*"},
+			deployments: schemas.KeyAliases{"gemini-3.1-flash-image-lite": {ModelID: "gemini-3.1-flash-image-lite"}},
+			want: map[string]string{
+				"vertex/gemini-2.5-flash":            "",
+				"vertex/gemini-3.1-flash-image":      "",
+				"vertex/text-embedding-005":          "",
+				"vertex/gemini-3.1-flash-image-lite": "gemini-3.1-flash-image-lite",
+			},
+		},
+		{
+			name:        "regex allowlist with custom endpoint deployments",
+			models:      schemas.WhiteList{"regex:^gemini-.*$"},
+			deployments: schemas.KeyAliases{"gemini-tuned": {ModelID: "1234567890"}, "tuned": {ModelID: "9876543210"}},
+			want: map[string]string{
+				"vertex/gemini-2.5-flash":       "",
+				"vertex/gemini-3.1-flash-image": "",
+				"vertex/gemini-tuned":           "1234567890",
+			},
+		},
+		{
+			name:   "exact allowlist",
+			models: schemas.WhiteList{"gemini-2.5-flash", "gemini-preview-only"},
+			want:   map[string]string{"vertex/gemini-2.5-flash": "", "vertex/gemini-preview-only": ""},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			provider, key := vertexOpenAIEndpointTestProvider(t, vertexModelGarden(&hits, catalog...))
+			key.Models = tc.models
+			key.Aliases = tc.deployments
+			if got := listedVertexModels(t, provider, key); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("listed %v, want %v", got, tc.want)
+			}
+			if hits.Load() == 0 {
+				t.Error("Model Garden was never called")
+			}
+		})
+	}
+}
+
+// Model Garden refuses API keys, so an API-key-only key keeps listing its configuration: the
+// deployments its allowlist covers and its exact entries, without calling Model Garden.
+func TestVertexListModelsAPIKeyOnlyKeyListsConfiguration(t *testing.T) {
+	var hits atomic.Int32
+	provider, key := vertexOpenAIEndpointTestProvider(t, vertexModelGarden(&hits, "gemini-2.5-flash"))
+	key.VertexKeyConfig.AuthCredentials = *schemas.NewSecretVar("")
+	key.Models = schemas.WhiteList{"regex:^gemini-.*$", "gemini-exact"}
+	key.Aliases = schemas.KeyAliases{"gemini-tuned": {ModelID: "1234567890"}, "tuned": {ModelID: "9876543210"}}
+	want := map[string]string{"vertex/gemini-tuned": "1234567890", "vertex/gemini-exact": ""}
+	if got := listedVertexModels(t, provider, key); !reflect.DeepEqual(got, want) {
+		t.Errorf("listed %v, want %v", got, want)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("an API-key-only key called Model Garden %d times", n)
+	}
+}

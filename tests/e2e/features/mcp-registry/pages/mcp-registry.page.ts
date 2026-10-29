@@ -1,0 +1,1143 @@
+import { APIRequestContext, Page, Locator, expect } from '@playwright/test'
+import { BasePage } from '../../../core/pages/base.page'
+import { waitForNetworkIdle } from '../../../core/utils/test-helpers'
+
+/**
+ * Connection types supported by MCP clients
+ */
+export type MCPConnectionType = 'http' | 'sse' | 'stdio' | 'openapi'
+
+/** How an OpenAPI document is supplied in the create sheet */
+export type OpenAPISourceMode = 'paste' | 'url' | 'upload'
+
+/** In-memory file handed to setInputFiles for the Upload source */
+export interface OpenAPISpecFile {
+  name: string
+  mimeType: string
+  buffer: Buffer
+}
+
+/**
+ * Authentication types for HTTP/SSE connections
+ */
+export type MCPAuthType = 'none' | 'headers' | 'oauth' | 'per_user_oauth'
+
+/** Header value shape used by API (value / env_var / from_env) */
+export type EnvVarLike = { value: string; env_var?: string; from_env?: boolean }
+
+/**
+ * MCP Client configuration
+ */
+export interface MCPClientConfig {
+  name: string
+  connectionType?: MCPConnectionType
+  connectionUrl?: string
+  authType?: MCPAuthType
+  /** Headers for auth_type 'headers'. API shape: Record<string, EnvVarLike> */
+  headers?: Record<string, EnvVarLike | string>
+  isCodeMode?: boolean
+  isPingAvailable?: boolean
+  /** Max protocol version option: 'global', 'auto' or a version */
+  maxProtocolVersion?: string
+  // STDIO specific
+  command?: string
+  args?: string
+  envs?: string
+  // OAuth specific
+  oauthClientId?: string
+  oauthClientSecret?: string
+  oauthAuthorizeUrl?: string
+  oauthTokenUrl?: string
+  oauthScopes?: string
+  // OpenAPI specific (connection_type 'openapi')
+  openapiSourceMode?: OpenAPISourceMode
+  openapiSpecText?: string
+  openapiSpecUrl?: string
+  openapiSpecFile?: OpenAPISpecFile
+  /** Tool names to untick in the preview after parsing (all are ticked by default) */
+  openapiDeselectTools?: string[]
+  /** Credential values keyed by securitySchemes name (apiKey / bearer schemes) */
+  openapiCredentials?: Record<string, string>
+  /** Custom base URL typed into the preview panel */
+  openapiBaseUrl?: string
+}
+
+/**
+ * Page object for the MCP Registry page
+ */
+export class MCPRegistryPage extends BasePage {
+  readonly table: Locator
+  readonly createBtn: Locator
+  readonly sheet: Locator
+  readonly detailSheet: Locator
+  readonly nameInput: Locator
+  readonly saveBtn: Locator
+  readonly cancelBtn: Locator
+  readonly connectionTypeSelect: Locator
+  readonly authTypeSelect: Locator
+  readonly authScopeSelect: Locator
+  readonly connectionUrlInput: Locator
+  readonly codeModeSwitch: Locator
+  readonly pingAvailableSwitch: Locator
+  // STDIO inputs
+  readonly commandInput: Locator
+  readonly argsInput: Locator
+  readonly envsInput: Locator
+  // OAuth inputs
+  readonly oauthClientIdInput: Locator
+  readonly oauthClientMetadataDocumentSwitch: Locator
+  readonly oauthClientSecretInput: Locator
+  readonly oauthAuthorizeUrlInput: Locator
+  readonly oauthTokenUrlInput: Locator
+  readonly oauthScopesInput: Locator
+
+  constructor(page: Page) {
+    super(page)
+    this.table = page.locator('[data-testid="mcp-clients-table"]').or(page.locator('table'))
+    this.createBtn = page.locator('[data-testid="create-mcp-client-btn"]').or(
+      page.getByRole('button', { name: /New MCP Server/i }).or(page.getByRole('button', { name: /Add/i }))
+    )
+    this.sheet = page.locator('[role="dialog"]')
+    this.detailSheet = page.locator('[role="dialog"]')
+    this.nameInput = page.locator('[data-testid="client-name-input"]').or(
+      this.sheet.getByLabel(/Name/i).first()
+    )
+    this.saveBtn = page.locator('[data-testid="save-client-btn"]').or(
+      this.sheet.getByRole('button', { name: /Create/i }).or(
+        this.sheet.getByRole('button', { name: /Save/i })
+      )
+    )
+    this.cancelBtn = page.locator('[data-testid="cancel-client-btn"]').or(
+      this.sheet.getByRole('button', { name: /Cancel/i })
+    )
+
+    // Connection type and auth
+    this.connectionTypeSelect = page.locator('[data-testid="connection-type-select"]')
+    this.authTypeSelect = page.locator('[data-testid="auth-type-select"]')
+    this.authScopeSelect = page.locator('[data-testid="auth-scope-select"]')
+    // Use placeholder as primary selector for EnvVarInput (more reliable)
+    this.connectionUrlInput = this.sheet.getByPlaceholder(/http:\/\/your-mcp-server/i).or(
+      page.locator('[data-testid="connection-url-input"]')
+    )
+
+    // Switches (Radix UI switches)
+    this.codeModeSwitch = page.locator('[data-testid="code-mode-switch"]')
+    this.pingAvailableSwitch = this.sheet.locator('#ping-available')
+
+    // STDIO inputs
+    this.commandInput = page.locator('[data-testid="stdio-command-input"]')
+    this.argsInput = page.locator('[data-testid="stdio-args-input"]')
+    this.envsInput = page.locator('[data-testid="stdio-envs-input"]')
+
+    // OAuth inputs
+    this.oauthClientIdInput = this.sheet.locator('[data-testid="mcp-oauth-client-id"]').or(this.sheet.getByPlaceholder(/your-client-id/i))
+    this.oauthClientMetadataDocumentSwitch = this.sheet.getByTestId('mcp-oauth-use-client-metadata-document')
+    this.oauthClientSecretInput = this.sheet.locator('[data-testid="mcp-oauth-client-secret"]').or(this.sheet.getByPlaceholder(/your-client-secret/i))
+    this.oauthAuthorizeUrlInput = this.sheet.locator('[data-testid="mcp-oauth-authorize-url"]').or(this.sheet.getByPlaceholder(/oauth\/authorize/i))
+    this.oauthTokenUrlInput = this.sheet.locator('[data-testid="mcp-oauth-token-url"]').or(this.sheet.getByPlaceholder(/oauth\/token/i))
+    this.oauthScopesInput = this.sheet.locator('[data-testid="mcp-oauth-scopes-input"]').or(this.sheet.getByPlaceholder(/read, write, admin/i))
+  }
+
+  async goto(): Promise<void> {
+    await this.page.goto('/workspace/mcp-registry')
+    await waitForNetworkIdle(this.page)
+    // Wait for table to be visible
+    await this.table.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {})
+  }
+
+  /** Get the table row for a client by name. Scoped to tbody so the header row is never matched; first() for stable single-row target. */
+  getClientRow(name: string): Locator {
+    return this.table.locator('tbody tr').filter({ hasText: name }).first()
+  }
+
+  async clientExists(name: string): Promise<boolean> {
+    try {
+      await expect(this.getClientRow(name)).toBeVisible({ timeout: 5000 })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private async openClientActions(name: string): Promise<void> {
+    const row = this.getClientRow(name)
+    await expect(row).toBeVisible({ timeout: 10000 })
+    await row.scrollIntoViewIfNeeded()
+
+    const actionsBtn = row.getByRole('button', { name: /MCP server actions/i })
+    await actionsBtn.waitFor({ state: 'visible', timeout: 10000 })
+    await actionsBtn.click()
+  }
+
+  /**
+   * Poll until the client row appears in the table or timeout.
+   * Used as a fallback success signal when the create form doesn't close (e.g. SSE/stdio).
+   */
+  async waitForClientInTable(name: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if ((await this.getClientRow(name).count()) > 0) return true
+      await this.page.waitForTimeout(500)
+    }
+    return false
+  }
+
+  async getClientCount(): Promise<number> {
+    // Exclude header row
+    const rows = this.table.locator('tbody tr')
+    return await rows.count()
+  }
+
+  /**
+   * Select the server source and connection type. "openapi" is a server source
+   * of its own (Generate from an OpenAPI spec); the transports live in the
+   * Connection Type dropdown of the MCP server source.
+   */
+  async selectConnectionType(type: MCPConnectionType): Promise<void> {
+    if (type === 'openapi') {
+      const openapiSource = this.page.getByTestId('mcp-server-source-openapi')
+      await expect(openapiSource).toBeVisible({ timeout: 5000 })
+      await openapiSource.click()
+      await expect(this.page.getByTestId('openapi-spec-source')).toBeVisible({ timeout: 5000 })
+      return
+    }
+    const mcpSource = this.page.getByTestId('mcp-server-source-mcp')
+    if (await mcpSource.isVisible().catch(() => false)) {
+      await mcpSource.click()
+    }
+
+    // Click the connection type select trigger
+    const selectTrigger = this.page.locator('[data-testid="connection-type-select"]')
+    await expect(selectTrigger).toBeVisible({ timeout: 5000 })
+    await selectTrigger.click()
+
+    // Wait for dropdown to open and select the option by data-testid
+    const optionTestId = `connection-type-${type}`
+    const option = this.page.locator(`[data-testid="${optionTestId}"]`)
+    await expect(option).toBeVisible({ timeout: 5000 })
+    await option.click()
+
+    // Wait for dropdown to close
+    await expect(option).not.toBeVisible({ timeout: 3000 }).catch(() => {})
+  }
+
+  /**
+   * Select authentication type from dropdown
+   */
+  async selectAuthType(type: MCPAuthType): Promise<void> {
+    const selectTrigger = this.page.locator('[data-testid="auth-type-select"]')
+    await expect(selectTrigger).toBeVisible({ timeout: 5000 })
+    await selectTrigger.click()
+
+    // The UI now splits auth configuration into auth type + auth scope.
+    const authKind = type === 'per_user_oauth' ? 'oauth' : type
+    const optionTestId = `auth-type-${authKind.replace(/_/g, '-')}`
+    const option = this.page.locator(`[data-testid="${optionTestId}"]`)
+    await expect(option).toBeVisible({ timeout: 5000 })
+    await option.click()
+
+    // Wait for dropdown to close
+    await expect(option).not.toBeVisible({ timeout: 3000 }).catch(() => {})
+
+    if (type === 'per_user_oauth') {
+      await this.selectAuthScope('per_user')
+    }
+  }
+
+  async selectAuthScope(scope: 'shared' | 'per_user'): Promise<void> {
+    const selectTrigger = this.page.locator('[data-testid="auth-scope-select"]')
+    await expect(selectTrigger).toBeVisible({ timeout: 5000 })
+    await selectTrigger.click()
+
+    const optionTestId = `auth-scope-${scope.replace(/_/g, '-')}`
+    const option = this.page.locator(`[data-testid="${optionTestId}"]`)
+    await expect(option).toBeVisible({ timeout: 5000 })
+    await option.click()
+
+    await expect(option).not.toBeVisible({ timeout: 3000 }).catch(() => {})
+  }
+
+  async expandOAuthAdvancedIfCollapsed(): Promise<void> {
+    const trigger = this.sheet.locator('[data-testid="oauth-advanced-trigger"]')
+    const visible = await trigger.isVisible().catch(() => false)
+    if (!visible) return
+
+    const clientIdVisible = await this.oauthClientIdInput.isVisible().catch(() => false)
+    if (clientIdVisible) return
+
+    await trigger.click()
+    await expect(this.oauthClientIdInput).toBeVisible({ timeout: 5000 })
+  }
+
+  async waitForOAuthAuthorizerAction(timeout = 10000): Promise<Locator> {
+    const continueBtn = this.page.locator('[data-testid="per-user-oauth-confirm"]')
+    const openWindowBtn = this.page.locator('[data-testid="oauth-open-window-btn"]')
+
+    const deadline = Date.now() + timeout
+    while (Date.now() < deadline) {
+      if (await continueBtn.isVisible().catch(() => false)) return continueBtn
+      if (await openWindowBtn.isVisible().catch(() => false)) return openWindowBtn
+      await this.page.waitForTimeout(200)
+    }
+
+    throw new Error('OAuth authorizer action was not shown')
+  }
+
+  /** The stored config of the named client over the API. */
+  async storedClientConfig(request: APIRequestContext, name: string): Promise<Record<string, unknown>> {
+    const res = await request.get(`/api/mcp/clients?search=${encodeURIComponent(name)}`)
+    expect(res.ok(), await res.text()).toBe(true)
+    const client = (await res.json()).clients.find((c: { config: { name: string } }) => c.config.name === name)
+    expect(client, `client ${name} is listed`).toBeTruthy()
+    return client.config
+  }
+
+  /** Replaces the named client's prompts/resources allow-lists over the API (omitted lists are kept). */
+  async setExposeLists(
+    request: APIRequestContext,
+    name: string,
+    lists: { prompts_to_expose?: string[]; resources_to_expose?: string[] },
+  ): Promise<void> {
+    const config = await this.storedClientConfig(request, name)
+    const res = await request.put(`/api/mcp/client/${config.client_id}`, { data: lists })
+    expect(res.ok(), await res.text()).toBe(true)
+  }
+
+  /**
+   * Sends one JSON-RPC request to Bifrost's MCP gateway, narrowed to the named client so other
+   * clients of the same fixture server do not answer for it. Returns the parsed JSON-RPC message.
+   */
+  async mcpGatewayCall(
+    request: APIRequestContext,
+    clientName: string,
+    method: string,
+    params?: Record<string, unknown>,
+  ): Promise<{ result?: Record<string, any>; error?: { code: number; message: string } }> {
+    const res = await request.post('/mcp', {
+      headers: {
+        Accept: 'application/json, text/event-stream',
+        'MCP-Protocol-Version': '2025-06-18',
+        'x-bf-mcp-include-clients': clientName,
+      },
+      data: params ? { jsonrpc: '2.0', id: 1, method, params } : { jsonrpc: '2.0', id: 1, method },
+    })
+    const text = await res.text()
+    expect(res.status(), text).toBe(200)
+    // The gateway answers as plain JSON or as an SSE 'data:' frame.
+    const frame = text.split('\n').map((line) => line.replace(/^data:\s*/, '').trim()).find((line) => line.startsWith('{'))
+    return JSON.parse(frame ?? text)
+  }
+
+  /** Opens the named client's Prompts & Resources tab. */
+  async openPromptsAndResources(name: string): Promise<void> {
+    await this.viewClientDetails(name)
+    await this.detailSheet.getByTestId('mcpclient-tab-resources').click()
+  }
+
+  /** The serve switch of one prompt (by the server's own name) or resource (by URI or URI template). */
+  exposeToggle(kind: 'prompts' | 'resources', key: string): Locator {
+    return this.detailSheet.getByTestId(`mcp-expose-${kind}-toggle-${key}`)
+  }
+
+  /** The "serve all" checkbox of a list. */
+  exposeAll(kind: 'prompts' | 'resources'): Locator {
+    return this.detailSheet.getByTestId(`mcp-expose-${kind}-all`)
+  }
+
+  /** The "All served" / "None served" / "N served" label of a list. */
+  exposeStatus(kind: 'prompts' | 'resources'): Locator {
+    return this.detailSheet.getByTestId(`mcp-expose-${kind}-status`)
+  }
+
+  /** Saves the open detail sheet and waits for it to close. */
+  async saveDetailSheet(): Promise<void> {
+    await this.detailSheet.getByRole('button', { name: /Save/i }).click()
+    await this.waitForSuccessToast()
+    await expect(this.detailSheet).not.toBeVisible({ timeout: 10000 })
+  }
+
+  /** The stored max_protocol_version of the named client over the API ("" = follows the global setting). */
+  async storedMaxProtocolVersion(request: APIRequestContext, name: string): Promise<string> {
+    return ((await this.storedClientConfig(request, name)).max_protocol_version as string | undefined) ?? ''
+  }
+
+  /** Picks a max protocol version option in the open add form or detail sheet. */
+  async selectMaxProtocolVersion(scope: Locator, value: string): Promise<void> {
+    await scope.getByTestId('mcp-client-max-protocol-version-select').click()
+    await this.page.getByTestId(`mcp-client-max-protocol-version-${value}`).click()
+  }
+
+  /**
+   * Fill the MCP client form with configuration (doesn't submit)
+   */
+  async fillClientForm(config: MCPClientConfig): Promise<void> {
+    // Fill name
+    await this.nameInput.fill(config.name)
+
+    if (config.maxProtocolVersion) {
+      await this.selectMaxProtocolVersion(this.sheet, config.maxProtocolVersion)
+    }
+
+    // Select connection type if specified
+    if (config.connectionType) {
+      await this.selectConnectionType(config.connectionType)
+    }
+
+    // Toggle code mode if specified (Radix Switch uses data-state="checked"/"unchecked")
+    if (config.isCodeMode !== undefined) {
+      await expect(this.codeModeSwitch).toBeVisible({ timeout: 5000 })
+      const dataState = await this.codeModeSwitch.getAttribute('data-state')
+      const currentState = dataState === 'checked'
+      if (currentState !== config.isCodeMode) {
+        await this.codeModeSwitch.click()
+        // Wait for state to change
+        const expectedState = config.isCodeMode ? 'checked' : 'unchecked'
+        await expect(this.codeModeSwitch).toHaveAttribute('data-state', expectedState, { timeout: 3000 })
+      }
+    }
+
+    // Toggle ping available if specified (Radix Switch)
+    if (config.isPingAvailable !== undefined) {
+      const dataState = await this.pingAvailableSwitch.getAttribute('data-state')
+      const currentState = dataState === 'checked'
+      if (currentState !== config.isPingAvailable) {
+        await this.pingAvailableSwitch.click()
+      }
+    }
+
+    // Handle connection-type specific fields
+    if (config.connectionType === 'http' || config.connectionType === 'sse' || !config.connectionType) {
+      // Wait for auth type field to be visible (only shows for HTTP/SSE)
+      await expect(this.authTypeSelect).toBeVisible({ timeout: 5000 })
+
+      // Select auth type if specified
+      if (config.authType) {
+        await this.selectAuthType(config.authType)
+      }
+
+      // Fill connection URL
+      if (config.connectionUrl) {
+        await expect(this.connectionUrlInput).toBeVisible({ timeout: 5000 })
+        await this.connectionUrlInput.fill(config.connectionUrl)
+      }
+
+      // Fill headers when auth_type is 'headers' (required for SSE test; export MCP_SSE_HEADERS in your environment)
+      if (config.authType === 'headers' && config.headers && Object.keys(config.headers).length > 0) {
+        const headersTable = this.sheet.locator('[data-testid="mcp-headers-table"]')
+        await expect(headersTable).toBeVisible({ timeout: 5000 })
+        const entries = Object.entries(config.headers)
+        for (let i = 0; i < entries.length; i++) {
+          const [key, val] = entries[i]
+          const valueStr = typeof val === 'object' && val !== null && 'value' in val ? (val as EnvVarLike).value : String(val)
+          const keyInput = headersTable.locator(`input[data-row="${i}"][data-column="key"]`)
+          const valueInput = headersTable.locator(`input[data-row="${i}"][data-column="value"]`).or(
+            headersTable.locator(`[data-row="${i}"][data-column="value"] input`)
+          )
+          await keyInput.waitFor({ state: 'visible', timeout: 8000 })
+          await keyInput.scrollIntoViewIfNeeded()
+          await keyInput.click()
+          await keyInput.fill(key)
+          const valueEl = valueInput.first()
+          await valueEl.waitFor({ state: 'visible', timeout: 3000 })
+          await valueEl.scrollIntoViewIfNeeded()
+          await valueEl.click()
+          await valueEl.fill(valueStr)
+        }
+      }
+
+      // Handle OAuth config (oauth and per_user_oauth share the same fields)
+      if (config.authType === 'oauth' || config.authType === 'per_user_oauth') {
+        await this.expandOAuthAdvancedIfCollapsed()
+        if (config.oauthClientId) {
+          await this.oauthClientIdInput.fill(config.oauthClientId)
+        }
+        if (config.oauthClientSecret) {
+          await this.oauthClientSecretInput.fill(config.oauthClientSecret)
+        }
+        if (config.oauthAuthorizeUrl) {
+          await this.oauthAuthorizeUrlInput.fill(config.oauthAuthorizeUrl)
+        }
+        if (config.oauthTokenUrl) {
+          await this.oauthTokenUrlInput.fill(config.oauthTokenUrl)
+        }
+        if (config.oauthScopes) {
+          await this.oauthScopesInput.fill(config.oauthScopes)
+        }
+      }
+    } else if (config.connectionType === 'openapi') {
+      await this.parseOpenAPISpec({ supply: () => this.fillOpenAPISource(config) })
+      for (const tool of config.openapiDeselectTools ?? []) {
+        await this.toggleOpenAPITool(tool)
+      }
+      for (const [scheme, value] of Object.entries(config.openapiCredentials ?? {})) {
+        await this.fillOpenAPICredential(scheme, value)
+      }
+      if (config.openapiBaseUrl) {
+        await this.setOpenAPICustomBaseUrl(config.openapiBaseUrl)
+      }
+      if (config.authType && config.authType !== 'none') {
+        await expect(this.authTypeSelect).toBeVisible({ timeout: 5000 })
+        await this.selectAuthType(config.authType)
+      }
+    } else if (config.connectionType === 'stdio') {
+      // Fill STDIO specific fields - wait for them to be visible after type change
+      if (config.command) {
+        await expect(this.commandInput).toBeVisible({ timeout: 5000 })
+        await this.commandInput.fill(config.command)
+      }
+      if (config.args) {
+        await expect(this.argsInput).toBeVisible({ timeout: 5000 })
+        await this.argsInput.fill(config.args)
+      }
+      if (config.envs) {
+        await expect(this.envsInput).toBeVisible({ timeout: 5000 })
+        await this.envsInput.fill(config.envs)
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // OpenAPI connection type
+  // ---------------------------------------------------------------------------
+
+  /** Pick the Paste / URL / Upload tab of the OpenAPI source control */
+  async selectOpenAPISourceMode(mode: OpenAPISourceMode): Promise<void> {
+    const tab = this.sheet.getByTestId(`openapi-spec-source-tab-${mode}`)
+    await expect(tab).toBeVisible({ timeout: 5000 })
+    await tab.click()
+  }
+
+  /** Set the Paste editor's (Monaco) document under `root`, replacing its content */
+  async pasteOpenAPISpec(text: string, root: Locator = this.sheet): Promise<void> {
+    const editor = root.getByTestId('openapi-spec-paste-editor')
+    await expect(editor).toBeVisible({ timeout: 10000 })
+    await editor.locator('textarea.inputarea').waitFor({ state: 'attached', timeout: 10000 })
+    // The replace panel keeps the editor read-only while it loads the stored document.
+    await expect(root.getByTestId('openapi-replace-spec-loading')).toHaveCount(0, { timeout: 10000 })
+    // Keystrokes and insertText go through Monaco's typing path, where auto-indent and
+    // auto-closing brackets rewrite a JSON document, so the model is set directly.
+    await editor.evaluate(async (el, value) => {
+      // Two frames let React register the editor's change listener, which runs in an effect after mount.
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)))
+      const monaco = (window as any).monaco
+      const target = monaco.editor.getEditors().find((e: any) => el.contains(e.getContainerDomNode()))
+      target.setValue(value)
+    }, text)
+  }
+
+  async fillOpenAPISpecUrl(url: string): Promise<void> {
+    const input = this.sheet.getByTestId('openapi-spec-url-input')
+    await expect(input).toBeVisible({ timeout: 5000 })
+    await input.fill(url)
+  }
+
+  async uploadOpenAPISpec(file: OpenAPISpecFile): Promise<void> {
+    const input = this.sheet.getByTestId('openapi-spec-upload-input')
+    await input.setInputFiles({ name: file.name, mimeType: file.mimeType, buffer: file.buffer })
+  }
+
+  /** Supply the document in whichever mode the config names (paste by default) */
+  async fillOpenAPISource(config: MCPClientConfig): Promise<void> {
+    const mode = config.openapiSourceMode ?? 'paste'
+    await this.selectOpenAPISourceMode(mode)
+    if (mode === 'url') {
+      if (!config.openapiSpecUrl) throw new Error('openapiSpecUrl is required for url mode')
+      await this.fillOpenAPISpecUrl(config.openapiSpecUrl)
+    } else if (mode === 'upload') {
+      if (!config.openapiSpecFile) throw new Error('openapiSpecFile is required for upload mode')
+      await this.uploadOpenAPISpec(config.openapiSpecFile)
+      await expect(this.sheet.getByTestId('openapi-spec-upload-filename')).toContainText(config.openapiSpecFile.name, { timeout: 5000 })
+    } else {
+      if (!config.openapiSpecText) throw new Error('openapiSpecText is required for paste mode')
+      await this.pasteOpenAPISpec(config.openapiSpecText)
+    }
+  }
+
+  /**
+   * Supply the document and wait for the preview endpoint. A pasted or uploaded
+   * document parses on its own; a URL is fetched with the Fetch button. The
+   * wait starts before the document is supplied so the automatic parse is not
+   * missed. Returns the response status so a test can assert a rejection
+   * without the preview ever rendering.
+   */
+  async parseOpenAPISpec(options: { supply: () => Promise<void>; expectOk?: boolean }): Promise<number> {
+    const expectOk = options.expectOk ?? true
+    const responsePromise = this.page.waitForResponse(
+      (response) => response.url().includes('/mcp/openapi/preview') && response.request().method() === 'POST',
+      { timeout: 30000 }
+    )
+    await options.supply()
+    if ((await this.sheet.getByTestId('openapi-spec-source-tab-url').getAttribute('data-state')) === 'active') {
+      await this.sheet.getByTestId('openapi-parse-btn').click()
+    }
+    const response = await responsePromise
+    if (expectOk) {
+      if (!response.ok()) {
+        throw new Error(`OpenAPI preview failed: ${response.status()} ${await response.text().catch(() => '')}`)
+      }
+      await expect(this.sheet.getByTestId('openapi-preview-title')).toBeVisible({ timeout: 10000 })
+    }
+    return response.status()
+  }
+
+  async getOpenAPIParseError(): Promise<string> {
+    const err = this.sheet.getByTestId('openapi-parse-error')
+    await expect(err).toBeVisible({ timeout: 5000 })
+    return (await err.textContent())?.trim() ?? ''
+  }
+
+  /** Names of every operation row in the preview (supported and unsupported) */
+  async getOpenAPIPreviewToolNames(): Promise<string[]> {
+    const rows = this.sheet.locator('[data-testid^="openapi-tool-row-"]')
+    const count = await rows.count()
+    const names: string[] = []
+    for (let i = 0; i < count; i++) {
+      const testId = await rows.nth(i).getAttribute('data-testid')
+      if (testId) names.push(testId.replace('openapi-tool-row-', ''))
+    }
+    return names
+  }
+
+  async isOpenAPIToolDisabled(name: string): Promise<boolean> {
+    return await this.sheet.getByTestId(`openapi-tool-checkbox-${name}`).isDisabled()
+  }
+
+  async isOpenAPIToolChecked(name: string): Promise<boolean> {
+    const state = await this.sheet.getByTestId(`openapi-tool-checkbox-${name}`).getAttribute('data-state')
+    return state === 'checked'
+  }
+
+  async toggleOpenAPITool(name: string): Promise<void> {
+    const checkbox = this.sheet.getByTestId(`openapi-tool-checkbox-${name}`)
+    await expect(checkbox).toBeVisible({ timeout: 5000 })
+    await checkbox.click()
+  }
+
+  async getOpenAPISelectedCountText(): Promise<string> {
+    return (await this.sheet.getByTestId('openapi-tools-selected-count').textContent())?.trim() ?? ''
+  }
+
+  /** Fill the value of an apiKey or bearer scheme credential */
+  async fillOpenAPICredential(scheme: string, value: string): Promise<void> {
+    const input = this.sheet.getByTestId(`openapi-security-${scheme}-input`)
+    await expect(input).toBeVisible({ timeout: 5000 })
+    await input.fill(value)
+  }
+
+  async setOpenAPICustomBaseUrl(url: string): Promise<void> {
+    const select = this.sheet.getByTestId('openapi-base-url-select')
+    if (await select.isVisible().catch(() => false)) {
+      await select.click()
+      await this.page.getByTestId('openapi-base-url-option-custom').click()
+    }
+    const input = this.sheet.getByTestId('openapi-base-url-input')
+    await expect(input).toBeVisible({ timeout: 5000 })
+    await input.fill(url)
+  }
+
+  /** Summary line of the stored document on the edit sheet's General tab */
+  async getOpenAPISummaryText(): Promise<string> {
+    const summary = this.detailSheet.getByTestId('mcp-client-sheet-openapi-summary')
+    await expect(summary).toBeVisible({ timeout: 10000 })
+    return (await summary.textContent())?.trim() ?? ''
+  }
+
+  /** Open the Replace spec card on the edit sheet (waits for the stored document to load) */
+  async openReplaceSpec(): Promise<void> {
+    const responsePromise = this.page
+      .waitForResponse((response) => response.url().includes('/openapi-spec') && response.request().method() === 'GET', { timeout: 15000 })
+      .catch(() => null)
+    await this.detailSheet.getByTestId('openapi-replace-spec-btn').click()
+    await expect(this.detailSheet.getByTestId('openapi-replace-spec-panel')).toBeVisible({ timeout: 5000 })
+    await responsePromise
+  }
+
+  /**
+   * Create an MCP client with full configuration
+   */
+  async createClient(config: MCPClientConfig): Promise<boolean> {
+    await this.dismissToasts()
+    await this.createBtn.click()
+    await expect(this.sheet).toBeVisible({ timeout: 5000 })
+
+    // Fill the form
+    await this.fillClientForm(config)
+
+    // Wait for save button to be enabled (validation passed)
+    await expect(this.saveBtn).toBeEnabled({ timeout: 10000 })
+
+    // Verify button is visible and contains expected text
+    await expect(this.saveBtn).toBeVisible()
+    await expect(this.saveBtn).toContainText(/Create|Save/i)
+
+    // Wait for create-client API response then click save (backend may be slow connecting to MCP server)
+    // Create is POST to /mcp/client (singular); do not match GET /mcp/clients
+    const responsePromise = this.page.waitForResponse(
+      (response) => {
+        const url = response.url()
+        const method = response.request().method()
+        return (
+          (url.includes('/mcp/client') && !url.endsWith('/mcp/clients')) &&
+          (method === 'POST' || method === 'PUT')
+        )
+      },
+      { timeout: 60000 }
+    )
+    await this.saveBtn.click({ force: true })
+    const response = await responsePromise.catch(() => null)
+    const ok = response && response.ok()
+    if (response && !ok) {
+      const body = await response.text().catch(() => '')
+      await this.page.keyboard.press('Escape')
+      await this.sheet.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {})
+      throw new Error(`Create MCP client failed: ${response.status()} ${body}`)
+    }
+
+    const responseBody = response ? await response.text().catch(() => '') : ''
+    const pendingOAuth = responseBody.includes('"status":"pending_oauth"')
+    if (pendingOAuth) {
+      await this.waitForOAuthAuthorizerAction()
+      return true
+    }
+
+    // Success: backend returned 2xx. Wait for create form to close (short timeout; UI usually updates quickly).
+    const createFormHeading = this.page.getByRole('heading', { name: 'New MCP Server' })
+    await createFormHeading.waitFor({ state: 'hidden', timeout: 15000 }).catch(() => null)
+    const createFormClosed = !(await createFormHeading.isVisible().catch(() => false))
+    if (createFormClosed) {
+      return true
+    }
+
+    // Backend succeeded but form may not close quickly (e.g. SSE/stdio). If client appears in table, treat as success.
+    const inTable = await this.waitForClientInTable(config.name, 10000)
+    if (inTable) {
+      await this.page.keyboard.press('Escape')
+      await this.sheet.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {})
+      return true
+    }
+
+    // Fallback: wait for toast or heading (e.g. slow UI)
+    const toast = this.getToast()
+    await Promise.race([
+      createFormHeading.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => null),
+      toast.waitFor({ state: 'visible', timeout: 10000 }).catch(() => null),
+    ])
+    if (!(await createFormHeading.isVisible().catch(() => true))) {
+      return true
+    }
+
+    // Sheet still open - check for toast (success or error)
+    let toastText = ''
+    let toastVisible = false
+    try {
+      toastVisible = await toast.isVisible()
+      if (toastVisible) toastText = (await toast.textContent()) || ''
+    } catch {
+      // ignore
+    }
+    if (toastVisible && toastText) {
+      const isSuccess =
+        toastText.toLowerCase().includes('success') ||
+        toastText.toLowerCase().includes('created') ||
+        toastText.toLowerCase().includes('server created')
+      if (isSuccess) {
+        await createFormHeading.waitFor({ state: 'hidden', timeout: 10000 }).catch(() => null)
+        return true
+      }
+      await this.page.keyboard.press('Escape')
+      await this.sheet.waitFor({ state: 'hidden', timeout: 5000 }).catch(() => {})
+      throw new Error(`Client creation failed with error: ${toastText}`)
+    }
+
+    // No toast, sheet still open - validation or unknown failure
+    const errorMessages = (await this.page.locator('[role="alert"]').allTextContents().catch(() => []))
+      .map((t) => t.trim())
+      .filter(Boolean)
+    if (errorMessages.length > 0) {
+      throw new Error(`Form validation errors: ${errorMessages.join(', ')}`)
+    }
+    const isDisabled = await this.saveBtn.isDisabled().catch(() => false)
+    if (isDisabled) {
+      throw new Error('Save button is disabled - form validation failed')
+    }
+    throw new Error('No toast appeared and sheet did not close - form submission may have failed')
+  }
+
+  async createOAuthClient(config: MCPClientConfig): Promise<{
+    status: string
+    authorize_url: string
+    oauth_config_id: string
+    complete_url?: string
+    status_url?: string
+    mcp_client_id: string
+  }> {
+    await this.dismissToasts()
+    await this.createBtn.click()
+    await expect(this.sheet).toBeVisible({ timeout: 5000 })
+
+    await this.fillClientForm(config)
+    await expect(this.saveBtn).toBeEnabled({ timeout: 10000 })
+
+    const responsePromise = this.page.waitForResponse(
+      (response) => {
+        const url = response.url()
+        const method = response.request().method()
+        return url.includes('/mcp/client') && !url.endsWith('/mcp/clients') && method === 'POST'
+      },
+      { timeout: 60000 }
+    )
+
+    await this.saveBtn.click({ force: true })
+    const response = await responsePromise
+    if (!response.ok()) {
+      const body = await response.text().catch(() => '')
+      throw new Error(`Create OAuth MCP client failed: ${response.status()} ${body}`)
+    }
+
+    const body = await response.json()
+    if (body?.status !== 'pending_oauth' || !body?.authorize_url || !body?.oauth_config_id) {
+      throw new Error(`Expected pending_oauth response, got: ${JSON.stringify(body)}`)
+    }
+
+    return body
+  }
+
+  /**
+   * View client details from the actions menu
+   */
+  async viewClientDetails(name: string): Promise<void> {
+    await this.openClientActions(name)
+    const editItem = this.page.getByRole('menuitem', { name: /Edit/i })
+    await expect(editItem).toBeVisible({ timeout: 5000 })
+    await editItem.click()
+    await expect(this.detailSheet).toBeVisible({ timeout: 5000 })
+  }
+
+  /**
+   * Close the detail sheet
+   */
+  async closeDetailSheet(): Promise<void> {
+    // Press Escape or click the X button
+    await this.page.keyboard.press('Escape')
+    await expect(this.detailSheet).not.toBeVisible({ timeout: 5000 }).catch(async () => {
+      // If still visible, try clicking X button
+      const closeBtn = this.detailSheet.locator('button').filter({ has: this.page.locator('svg.lucide-x') })
+      if (await closeBtn.isVisible()) {
+        await closeBtn.click()
+      }
+    })
+  }
+
+  /**
+   * Close any open sheet/dialog (create or detail) so the table is visible
+   */
+  async closeSheet(): Promise<void> {
+    const isVisible = await this.sheet.isVisible().catch(() => false)
+    if (isVisible) {
+      await this.page.keyboard.press('Escape')
+      await expect(this.sheet).not.toBeVisible({ timeout: 5000 }).catch(() => {})
+    }
+  }
+
+  /**
+   * Clean up MCP clients by name. Ensures we're on the page and any sheet is closed before deleting.
+   */
+  async cleanupMCPClients(names: string[]): Promise<void> {
+    if (names.length === 0) return
+
+    await this.goto()
+    await this.closeSheet()
+    await this.dismissToasts()
+    await this.table.waitFor({ state: 'visible', timeout: 10000 }).catch(() => {})
+
+    for (const name of names) {
+      const tryDelete = async (): Promise<void> => {
+        const exists = await this.clientExists(name)
+        if (!exists) return
+        await this.closeSheet()
+        await this.deleteClient(name, { requireToast: false })
+      }
+
+      try {
+        await tryDelete()
+      } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error)
+        console.error(`[CLEANUP ERROR] Failed to delete MCP client: ${name} - ${errorMsg}`)
+        await this.closeSheet()
+        await this.page.waitForTimeout(1000)
+        try {
+          await tryDelete()
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr)
+          console.error(`[CLEANUP ERROR] Retry failed for MCP client: ${name} - ${retryMsg}`)
+        }
+      }
+    }
+  }
+
+  /**
+   * Edit an existing client
+   */
+  async editClient(name: string, updates: Partial<MCPClientConfig>): Promise<void> {
+    await this.viewClientDetails(name)
+
+    // Update name if provided
+    if (updates.name) {
+      const nameInput = this.detailSheet.getByLabel(/Name/i).first()
+      await nameInput.clear()
+      await nameInput.fill(updates.name)
+    }
+
+    // Toggle code mode if specified
+    if (updates.isCodeMode !== undefined) {
+      const codeModeSwitch = this.detailSheet
+        .locator('input[type="checkbox"]')
+        .filter({ has: this.page.locator('#code-mode') })
+        .or(this.detailSheet.getByRole('switch', { name: /Code Mode/i }))
+      const isVisible = await codeModeSwitch.isVisible().catch(() => false)
+      if (isVisible) {
+        const currentState = await codeModeSwitch.isChecked()
+        if (currentState !== updates.isCodeMode) {
+          await codeModeSwitch.click()
+        }
+      }
+    }
+
+    if (updates.maxProtocolVersion) {
+      await this.selectMaxProtocolVersion(this.detailSheet, updates.maxProtocolVersion)
+    }
+
+    // Save changes
+    const saveBtn = this.detailSheet.getByRole('button', { name: /Save/i })
+    await saveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.detailSheet).not.toBeVisible({ timeout: 10000 })
+  }
+
+  /**
+   * Reconnect an MCP client
+   */
+  async reconnectClient(name: string): Promise<void> {
+    await this.openClientActions(name)
+
+    const reconnectMenuItem = this.page.getByRole('menuitem', { name: /Reconnect/i })
+    await expect(reconnectMenuItem).toBeVisible({ timeout: 10000 })
+    await reconnectMenuItem.click()
+
+    const reconnectDialog = this.page.locator('[role="alertdialog"], [role="dialog"]').filter({ hasText: /Reconnect/i }).first()
+    if (await reconnectDialog.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await reconnectDialog.getByRole('button', { name: /Reconnect|Continue|Confirm/i }).click()
+    }
+
+    await this.waitForSuccessToast('Reconnected')
+  }
+
+  /**
+   * Toggle tool enabled state in the detail sheet
+   */
+  async toggleToolEnabled(clientName: string, toolName: string): Promise<void> {
+    await this.viewClientDetails(clientName)
+
+    // Find the tool row and toggle its enabled switch
+    const toolRow = this.detailSheet.locator('tr').filter({ hasText: toolName })
+    const enabledSwitch = toolRow.locator('button[role="switch"]').first()
+    await enabledSwitch.click()
+
+    // Save
+    const saveBtn = this.detailSheet.getByRole('button', { name: /Save/i })
+    await saveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.detailSheet).not.toBeVisible({ timeout: 10000 })
+  }
+
+  /**
+   * Toggle auto-execute for a tool in the detail sheet
+   */
+  async toggleAutoExecute(clientName: string, toolName: string): Promise<void> {
+    await this.viewClientDetails(clientName)
+
+    // Find the tool row and toggle its auto-execute switch (second switch)
+    const toolRow = this.detailSheet.locator('tr').filter({ hasText: toolName })
+    const autoExecuteSwitch = toolRow.locator('button[role="switch"]').nth(1)
+    await autoExecuteSwitch.click()
+
+    // Save
+    const saveBtn = this.detailSheet.getByRole('button', { name: /Save/i })
+    await saveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.detailSheet).not.toBeVisible({ timeout: 10000 })
+  }
+
+  /**
+   * Toggle code mode for a client
+   */
+  async toggleCodeMode(clientName: string): Promise<void> {
+    await this.viewClientDetails(clientName)
+
+    // Find and toggle the code mode switch
+    const codeModeSwitch = this.detailSheet
+      .getByRole('switch', { name: /Code Mode/i })
+      .or(this.detailSheet.locator('#code-mode'))
+    await codeModeSwitch.click()
+
+    // Save
+    const saveBtn = this.detailSheet.getByRole('button', { name: /Save/i })
+    await saveBtn.click()
+    await this.waitForSuccessToast()
+    await expect(this.detailSheet).not.toBeVisible({ timeout: 10000 })
+  }
+
+  /**
+   * Get client status from the table
+   */
+  async getClientStatus(name: string): Promise<string> {
+    const row = this.getClientRow(name)
+    // The State column shows a badge such as "Healthy" or "Needs Reauth".
+    const headers = await this.page.locator('table thead th').allTextContents()
+    const index = headers.findIndex((h) => h.trim().startsWith('State'))
+    const statusText = await row.locator('td').nth(index).locator('[data-slot="badge"]').first().textContent()
+    return statusText?.toLowerCase().trim().replace(/\s+/g, '_') || ''
+  }
+
+  /**
+   * Opens the filter sidebar if it is collapsed, clears any active facet, and
+   * selects exactly these connection types (an empty list leaves no filter).
+   */
+  async setConnectionTypeFilter(types: string[]): Promise<void> {
+    const show = this.page.getByTestId('mcpClientsFilterSidebar-toggle-show')
+    if (await show.isVisible().catch(() => false)) {
+      await show.click()
+    }
+    const reset = this.page.getByTestId('mcpClientsFilterSidebar-reset-button')
+    if (await reset.isVisible().catch(() => false)) {
+      await reset.click()
+    }
+    for (const type of types) {
+      const checkbox = this.page.getByTestId(`mcp-clients-filter-connection-type-checkbox-${type}`)
+      if (!(await checkbox.isVisible().catch(() => false))) {
+        await this.page.getByTestId('mcp-clients-filter-connection-type-toggle').click()
+      }
+      await checkbox.click()
+    }
+  }
+
+  /** The connection type shown on every client row currently in the table. */
+  async getVisibleConnectionTypes(): Promise<string[]> {
+    return (await this.table.locator('tbody tr').getByTestId('mcp-client-connection-type').allTextContents()).map((t) => t.trim())
+  }
+
+  /**
+   * Get connection type displayed in the table (HTTP, SSE, STDIO, OpenAPI)
+   */
+  async getClientConnectionType(name: string): Promise<string> {
+    const row = this.getClientRow(name)
+    const typeCell = row.getByTestId('mcp-client-connection-type')
+    if ((await typeCell.count()) > 0) {
+      return (await typeCell.first().textContent())?.trim() ?? ''
+    }
+    const cells = row.locator('td')
+    if ((await cells.count()) >= 2) {
+      return (await cells.nth(1).textContent())?.trim() ?? ''
+    }
+    return ''
+  }
+
+  /**
+   * Get tools count from the client details sheet
+   * Assumes the detail sheet is already open
+   */
+  async getToolsCount(): Promise<number> {
+    // Tools live in a table on the detail sheet's Tools tab.
+    await this.detailSheet.getByTestId('mcpclient-tab-tools').click()
+    const toolRows = this.detailSheet.locator('table tbody tr')
+    await toolRows.first().waitFor({ timeout: 10000 }).catch(() => {})
+    return await toolRows.count()
+  }
+
+  /**
+   * Get enabled tools count from table
+   */
+  async getEnabledToolsCount(name: string): Promise<string | null> {
+    const row = this.getClientRow(name)
+    // Enabled tools is shown as "X/Y"; prefer the cell's testid over its index.
+    const cell = row.getByTestId('mcp-client-enabled-tools')
+    if ((await cell.count()) > 0) {
+      return (await cell.first().textContent())?.trim() ?? null
+    }
+    const cells = row.locator('td')
+    const count = await cells.count()
+    if (count >= 5) {
+      return await cells.nth(4).textContent()
+    }
+    return null
+  }
+
+  /**
+   * Cancel client creation
+   */
+  async cancelCreation(): Promise<void> {
+    // A toast from the last action can sit over the Cancel button.
+    await this.dismissToasts()
+    await this.cancelBtn.click()
+    await expect(this.sheet).not.toBeVisible({ timeout: 5000 })
+  }
+
+  /**
+   * Wait for the client row to disappear from the table (e.g. after delete or refetch).
+   * Polls so we don't rely on a stale locator.
+   */
+  async waitForClientGone(name: string, timeoutMs: number): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if ((await this.getClientRow(name).count()) === 0) return true
+      await this.page.waitForTimeout(500)
+    }
+    return false
+  }
+
+  /**
+   * Delete an MCP client. Success is determined by the DELETE API completing and the row
+   * disappearing from the table after the list refetches.
+   */
+  async deleteClient(name: string, options?: { requireToast?: boolean }): Promise<void> {
+    const exists = await this.clientExists(name)
+    if (!exists) return
+
+    await this.openClientActions(name)
+
+    const deleteMenuItem = this.page.getByRole('menuitem', { name: /Delete/i })
+    await expect(deleteMenuItem).toBeVisible({ timeout: 10000 })
+    await deleteMenuItem.click()
+
+    const confirmDialog = this.page.locator('[role="alertdialog"]')
+    await expect(confirmDialog).toBeVisible({ timeout: 5000 })
+    const deleteResponsePromise = this.page.waitForResponse(
+      (response) => {
+        const url = response.url()
+        return url.includes('/mcp/client/') && response.request().method() === 'DELETE'
+      },
+      { timeout: 15000 }
+    )
+    await confirmDialog.getByRole('button', { name: /Delete/i }).click()
+
+    await deleteResponsePromise.catch(() => null)
+
+    // Wait for table to refetch and row to disappear (poll fresh locator; avoid stale row reference)
+    const gone = await this.waitForClientGone(name, 20000)
+    if (!gone) {
+      throw new Error(`Client "${name}" still visible after delete`)
+    }
+
+    if (options?.requireToast !== false) {
+      await this.getToast().waitFor({ state: 'visible', timeout: 5000 }).catch(() => {})
+    }
+  }
+
+  /**
+   * Check if empty state is visible
+   */
+  async isEmptyStateVisible(): Promise<boolean> {
+    const emptyMessage = this.page.getByText(/No clients found/i)
+    return await emptyMessage.isVisible().catch(() => false)
+  }
+}

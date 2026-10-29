@@ -1,0 +1,1360 @@
+package tables
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/bytedance/sonic"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/encrypt"
+	"gorm.io/gorm"
+)
+
+// TableKey represents an API key configuration in the database
+type TableKey struct {
+	ID                    uint              `gorm:"primaryKey;autoIncrement" json:"id"`
+	Name                  string            `gorm:"type:varchar(255);uniqueIndex:idx_key_name;not null" json:"name"`
+	ProviderID            uint              `gorm:"index;not null" json:"provider_id"`
+	Provider              string            `gorm:"index;type:varchar(50)" json:"provider"`                          // ModelProvider as string
+	KeyID                 string            `gorm:"type:varchar(255);uniqueIndex:idx_key_id;not null" json:"key_id"` // UUID from schemas.Key
+	Value                 schemas.SecretVar `gorm:"type:text;not null" json:"value"`
+	ModelsJSON            string            `gorm:"type:text" json:"-"` // JSON serialized []string
+	BlacklistedModelsJSON string            `gorm:"type:text" json:"-"` // JSON serialized []string
+	Weight                *float64          `json:"weight"`
+	Enabled               *bool             `gorm:"default:true" json:"enabled,omitempty"`
+	CreatedAt             time.Time         `gorm:"index;not null" json:"created_at"`
+	UpdatedAt             time.Time         `gorm:"index;not null" json:"updated_at"`
+
+	// Config hash is used to detect changes synced from config.json file
+	ConfigHash string `gorm:"type:varchar(255);null" json:"config_hash"`
+
+	// Unified aliases
+	AliasesJSON *string `gorm:"type:text" json:"-"` // JSON serialized schemas.KeyAliases
+
+	// Azure config fields (embedded instead of separate table for simplicity)
+	AzureEndpoint     *schemas.SecretVar `gorm:"type:text" json:"azure_endpoint,omitempty"`
+	AzureClientID     *schemas.SecretVar `gorm:"type:text" json:"azure_client_id,omitempty"`
+	AzureClientSecret *schemas.SecretVar `gorm:"type:text" json:"azure_client_secret,omitempty"`
+	AzureTenantID     *schemas.SecretVar `gorm:"type:text" json:"azure_tenant_id,omitempty"`
+	AzureScopesJSON   *string            `gorm:"column:azure_scopes;type:text" json:"-"` // JSON serialized []string
+
+	AzureUseSpeechEndpoints *bool `gorm:"column:azure_use_speech_endpoints" json:"azure_use_speech_endpoints,omitempty"`
+
+	AzureUseVoiceLiveEndpoints *bool `gorm:"column:azure_use_voice_live_endpoints" json:"azure_use_voice_live_endpoints,omitempty"`
+
+	// Vertex config fields (embedded)
+	VertexProjectID               *schemas.SecretVar `gorm:"type:text" json:"vertex_project_id,omitempty"`
+	VertexProjectNumber           *schemas.SecretVar `gorm:"type:text" json:"vertex_project_number,omitempty"`
+	VertexRegion                  *schemas.SecretVar `gorm:"type:text" json:"vertex_region,omitempty"`
+	VertexAuthCredentials         *schemas.SecretVar `gorm:"type:text" json:"vertex_auth_credentials,omitempty"`
+	VertexForceSingleRegion       *bool              `gorm:"column:vertex_force_single_region" json:"vertex_force_single_region,omitempty"`
+	VertexUseSessionRouting       *bool              `gorm:"column:vertex_use_session_routing" json:"vertex_use_session_routing,omitempty"`
+	VertexAWSWorkloadIdentityJSON *string            `gorm:"type:text" json:"-"` // JSON serialized schemas.VertexAWSWorkloadIdentityConfig
+
+	// Bedrock config fields (embedded)
+	BedrockAccessKey         *schemas.SecretVar `gorm:"type:text" json:"bedrock_access_key,omitempty"`
+	BedrockSecretKey         *schemas.SecretVar `gorm:"type:text" json:"bedrock_secret_key,omitempty"`
+	BedrockSessionToken      *schemas.SecretVar `gorm:"type:text" json:"bedrock_session_token,omitempty"`
+	BedrockRegion            *schemas.SecretVar `gorm:"type:text" json:"bedrock_region,omitempty"`
+	BedrockARN               *schemas.SecretVar `gorm:"type:text" json:"bedrock_arn,omitempty"`
+	BedrockRoleARN           *schemas.SecretVar `gorm:"type:text" json:"bedrock_role_arn,omitempty"`
+	BedrockExternalID        *schemas.SecretVar `gorm:"type:text" json:"bedrock_external_id,omitempty"`
+	BedrockRoleSessionName   *schemas.SecretVar `gorm:"type:text" json:"bedrock_role_session_name,omitempty"`
+	BedrockBatchRoleARN      *schemas.SecretVar `gorm:"type:text" json:"bedrock_batch_role_arn,omitempty"`
+	BedrockProjectID         *schemas.SecretVar `gorm:"type:text" json:"bedrock_project_id,omitempty"`
+	BedrockBatchS3ConfigJSON *string            `gorm:"type:text" json:"-"` // JSON serialized schemas.BatchS3Config
+	BedrockEndpointsJSON     *string            `gorm:"type:text" json:"-"` // JSON serialized schemas.BedrockEndpoints
+
+	// Bedrock Mantle config fields (embedded)
+	BedrockMantleAccessKey       *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_access_key,omitempty"`
+	BedrockMantleSecretKey       *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_secret_key,omitempty"`
+	BedrockMantleSessionToken    *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_session_token,omitempty"`
+	BedrockMantleRegion          *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_region,omitempty"`
+	BedrockMantleRoleARN         *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_role_arn,omitempty"`
+	BedrockMantleExternalID      *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_external_id,omitempty"`
+	BedrockMantleRoleSessionName *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_role_session_name,omitempty"`
+	BedrockMantleProjectID       *schemas.SecretVar `gorm:"type:text" json:"bedrock_mantle_project_id,omitempty"`
+	BedrockMantleEndpointsJSON   *string            `gorm:"type:text" json:"-"` // JSON serialized schemas.BedrockEndpoints
+
+	// SageMaker config fields (embedded)
+	SageMakerAccessKey       *schemas.SecretVar `gorm:"type:text;column:sagemaker_access_key" json:"sagemaker_access_key,omitempty"`
+	SageMakerSecretKey       *schemas.SecretVar `gorm:"type:text;column:sagemaker_secret_key" json:"sagemaker_secret_key,omitempty"`
+	SageMakerSessionToken    *schemas.SecretVar `gorm:"type:text;column:sagemaker_session_token" json:"sagemaker_session_token,omitempty"`
+	SageMakerRegion          *schemas.SecretVar `gorm:"type:text;column:sagemaker_region" json:"sagemaker_region,omitempty"`
+	SageMakerRoleARN         *schemas.SecretVar `gorm:"type:text;column:sagemaker_role_arn" json:"sagemaker_role_arn,omitempty"`
+	SageMakerExternalID      *schemas.SecretVar `gorm:"type:text;column:sagemaker_external_id" json:"sagemaker_external_id,omitempty"`
+	SageMakerRoleSessionName *schemas.SecretVar `gorm:"type:text;column:sagemaker_role_session_name" json:"sagemaker_role_session_name,omitempty"`
+	SageMakerEndpointsJSON   *string            `gorm:"type:text;column:sagemaker_endpoints_json" json:"-"` // JSON serialized schemas.SageMakerEndpoints
+
+	// VLLM config fields (embedded)
+	VLLMUrl       *schemas.SecretVar `gorm:"type:text" json:"vllm_url,omitempty"`
+	VLLMModelName *string            `gorm:"type:varchar(255)" json:"vllm_model_name,omitempty"`
+
+	// Replicate config fields (embedded)
+	ReplicateUseDeploymentsEndpoint *bool `gorm:"column:replicate_use_deployments_endpoint" json:"replicate_use_deployments_endpoint,omitempty"`
+
+	// Ollama config fields (embedded)
+	OllamaUrl *schemas.SecretVar `gorm:"type:text" json:"ollama_url,omitempty"`
+
+	// SGL config fields (embedded)
+	SGLUrl *schemas.SecretVar `gorm:"type:text" json:"sgl_url,omitempty"`
+
+	// Cloudflare config fields (embedded)
+	CloudflareAccountID *schemas.SecretVar `gorm:"type:text" json:"cloudflare_account_id,omitempty"`
+
+	// Databricks config fields (embedded)
+	DatabricksWorkspaceURL       *schemas.SecretVar `gorm:"type:text" json:"databricks_workspace_url,omitempty"`
+	DatabricksClientID           *schemas.SecretVar `gorm:"type:text" json:"databricks_client_id,omitempty"`
+	DatabricksClientSecret       *schemas.SecretVar `gorm:"type:text" json:"databricks_client_secret,omitempty"`
+	DatabricksAPIFormat          *string            `gorm:"type:varchar(50)" json:"databricks_api_format,omitempty"`
+	DatabricksForwardGatewayTags *bool              `gorm:"column:databricks_forward_gateway_tags" json:"databricks_forward_gateway_tags,omitempty"`
+
+	// Batch API configuration
+	UseForBatchAPI *bool `gorm:"default:false" json:"use_for_batch_api,omitempty"` // Whether this key can be used for batch API operations
+
+	// UseAnthropicEndpoints routes inference through the provider's Anthropic-compatible
+	// endpoints instead of its OpenAI-compatible ones.
+	UseAnthropicEndpoints *bool `gorm:"default:false" json:"use_anthropic_endpoints,omitempty"`
+
+	// UseOpenAIEndpoints routes Bedrock inference through the OpenAI-compatible endpoints
+	// instead of Converse. Column name is pinned: the default naming strategy does not
+	// split OpenAI the way the JSON tag does.
+	UseOpenAIEndpoints *bool `gorm:"column:use_openai_endpoints;default:false" json:"use_openai_endpoints,omitempty"`
+
+	Status      string `gorm:"type:varchar(50);default:'unknown'" json:"status"`
+	Description string `gorm:"type:text" json:"description,omitempty"`
+
+	EncryptionStatus string `gorm:"type:varchar(20);default:'plain_text'" json:"-"`
+
+	// GitHub Copilot config fields (embedded)
+
+	// oauth_key_config: the credential fields get their own encrypted columns; the
+	// non-secret settings (grant, scopes, claims, auth style) travel as one JSON column.
+	OAuthTokenURL     *schemas.SecretVar `gorm:"column:oauth_token_url;type:text" json:"oauth_token_url,omitempty"`
+	OAuthClientID     *schemas.SecretVar `gorm:"column:oauth_client_id;type:text" json:"oauth_client_id,omitempty"`
+	OAuthClientSecret *schemas.SecretVar `gorm:"column:oauth_client_secret;type:text" json:"oauth_client_secret,omitempty"`
+	OAuthPrivateKey   *schemas.SecretVar `gorm:"column:oauth_private_key;type:text" json:"oauth_private_key,omitempty"`
+	OAuthSettingsJSON *schemas.SecretVar `gorm:"column:oauth_settings_json;type:text" json:"-"` // Non-credential settings; still encrypted, since extra_params is free-form
+
+	// Virtual fields for runtime use (not stored in DB)
+	Models                 schemas.WhiteList               `gorm:"-" json:"models"` // ["*"] allows all models; empty denies all (deny-by-default)
+	BlacklistedModels      schemas.BlackList               `gorm:"-" json:"blacklisted_models"`
+	Aliases                schemas.KeyAliases              `gorm:"-" json:"aliases,omitempty"`
+	AzureKeyConfig         *schemas.AzureKeyConfig         `gorm:"-" json:"azure_key_config,omitempty"`
+	VertexKeyConfig        *schemas.VertexKeyConfig        `gorm:"-" json:"vertex_key_config,omitempty"`
+	BedrockKeyConfig       *schemas.BedrockKeyConfig       `gorm:"-" json:"bedrock_key_config,omitempty"`
+	BedrockMantleKeyConfig *schemas.BedrockMantleKeyConfig `gorm:"-" json:"bedrock_mantle_key_config,omitempty"`
+	SageMakerKeyConfig     *schemas.SageMakerKeyConfig     `gorm:"-" json:"sagemaker_key_config,omitempty"`
+	VLLMKeyConfig          *schemas.VLLMKeyConfig          `gorm:"-" json:"vllm_key_config,omitempty"`
+	ReplicateKeyConfig     *schemas.ReplicateKeyConfig     `gorm:"-" json:"replicate_key_config,omitempty"`
+	OllamaKeyConfig        *schemas.OllamaKeyConfig        `gorm:"-" json:"ollama_key_config,omitempty"`
+	SGLKeyConfig           *schemas.SGLKeyConfig           `gorm:"-" json:"sgl_key_config,omitempty"`
+	DatabricksKeyConfig    *schemas.DatabricksKeyConfig    `gorm:"-" json:"databricks_key_config,omitempty"`
+	CloudflareKeyConfig    *schemas.CloudflareKeyConfig    `gorm:"-" json:"cloudflare_key_config,omitempty"`
+	OAuthKeyConfig         *schemas.OAuthKeyConfig         `gorm:"-" json:"oauth_key_config,omitempty"`
+}
+
+// TableName sets the table name for each model
+func (TableKey) TableName() string { return "config_keys" }
+
+// BeforeSave is a GORM hook that serializes runtime config structs into JSON columns and
+// encrypts sensitive fields (API key value, Azure endpoint/client ID/secret/tenant ID/API version,
+// Vertex project ID/project number/region/credentials, Bedrock keys/region/ARN/deployments/
+// batch S3 config) before writing to the database. Encryption runs last to ensure it
+// operates on the final serialized values.
+func (k *TableKey) BeforeSave(tx *gorm.DB) error {
+	if err := k.Models.Validate(); err != nil {
+		return err
+	}
+	data, err := json.Marshal(k.Models)
+	if err != nil {
+		return err
+	}
+	k.ModelsJSON = string(data)
+	if err := k.BlacklistedModels.Validate(); err != nil {
+		return err
+	}
+	data, err = json.Marshal(k.BlacklistedModels)
+	if err != nil {
+		return err
+	}
+	k.BlacklistedModelsJSON = string(data)
+	if k.Enabled == nil {
+		enabled := true // DB default
+		k.Enabled = &enabled
+	}
+	if k.UseForBatchAPI == nil {
+		useForBatchAPI := false // DB default
+		k.UseForBatchAPI = &useForBatchAPI
+	}
+	if k.UseAnthropicEndpoints == nil {
+		useAnthropicEndpoints := false // DB default
+		k.UseAnthropicEndpoints = &useAnthropicEndpoints
+	}
+	if k.UseOpenAIEndpoints == nil {
+		useOpenAIEndpoints := false // DB default
+		k.UseOpenAIEndpoints = &useOpenAIEndpoints
+	}
+	// IMPORTANT: All *SecretVar fields assigned from provider config structs (AzureKeyConfig,
+	// VertexKeyConfig, BedrockKeyConfig) MUST be value-copied before assignment. The caller
+	// may retain the config struct pointer; if BeforeSave (or future encryption) mutates a
+	// shared pointer, the caller's in-memory config is silently corrupted.
+	// See: TestBeforeSave_DoesNotMutateSharedProviderConfigs
+	if k.AzureKeyConfig != nil {
+		if k.AzureKeyConfig.Endpoint.IsSet() {
+			ep := k.AzureKeyConfig.Endpoint
+			k.AzureEndpoint = &ep
+		} else {
+			k.AzureEndpoint = nil
+		}
+		if k.AzureKeyConfig.ClientID != nil {
+			cid := *k.AzureKeyConfig.ClientID
+			k.AzureClientID = &cid
+		} else {
+			k.AzureClientID = nil
+		}
+		if k.AzureKeyConfig.ClientSecret != nil {
+			cs := *k.AzureKeyConfig.ClientSecret
+			k.AzureClientSecret = &cs
+		} else {
+			k.AzureClientSecret = nil
+		}
+		if k.AzureKeyConfig.TenantID != nil {
+			tid := *k.AzureKeyConfig.TenantID
+			k.AzureTenantID = &tid
+		} else {
+			k.AzureTenantID = nil
+		}
+		if len(k.AzureKeyConfig.Scopes) > 0 {
+			data, err := json.Marshal(k.AzureKeyConfig.Scopes)
+			if err != nil {
+				return err
+			}
+			s := string(data)
+			k.AzureScopesJSON = &s
+		} else {
+			k.AzureScopesJSON = nil
+		}
+		useSpeech := k.AzureKeyConfig.UseSpeechEndpoints
+		k.AzureUseSpeechEndpoints = &useSpeech
+		useVoiceLive := k.AzureKeyConfig.UseVoiceLiveEndpoints
+		k.AzureUseVoiceLiveEndpoints = &useVoiceLive
+	} else {
+		k.AzureEndpoint = nil
+		k.AzureClientID = nil
+		k.AzureClientSecret = nil
+		k.AzureTenantID = nil
+		k.AzureScopesJSON = nil
+		k.AzureUseSpeechEndpoints = nil
+		k.AzureUseVoiceLiveEndpoints = nil
+	}
+	if k.VertexKeyConfig != nil {
+		if k.VertexKeyConfig.ProjectID.IsSet() {
+			pid := k.VertexKeyConfig.ProjectID
+			k.VertexProjectID = &pid
+		} else {
+			k.VertexProjectID = nil
+		}
+		if k.VertexKeyConfig.ProjectNumber.IsSet() {
+			pn := k.VertexKeyConfig.ProjectNumber
+			k.VertexProjectNumber = &pn
+		} else {
+			k.VertexProjectNumber = nil
+		}
+		if k.VertexKeyConfig.Region.IsSet() {
+			vr := k.VertexKeyConfig.Region
+			k.VertexRegion = &vr
+		} else {
+			k.VertexRegion = nil
+		}
+		if k.VertexKeyConfig.AuthCredentials.IsSet() {
+			ac := k.VertexKeyConfig.AuthCredentials
+			k.VertexAuthCredentials = &ac
+		} else {
+			k.VertexAuthCredentials = nil
+		}
+		fsr := k.VertexKeyConfig.ForceSingleRegion
+		k.VertexForceSingleRegion = &fsr
+		sr := k.VertexKeyConfig.UseSessionRouting
+		k.VertexUseSessionRouting = &sr
+		wif, err := MarshalVertexAWSWorkloadIdentityJSON(k.VertexKeyConfig.AWSWorkloadIdentity)
+		if err != nil {
+			return err
+		}
+		k.VertexAWSWorkloadIdentityJSON = wif
+	} else {
+		k.VertexProjectID = nil
+		k.VertexProjectNumber = nil
+		k.VertexRegion = nil
+		k.VertexAuthCredentials = nil
+		k.VertexForceSingleRegion = nil
+		k.VertexUseSessionRouting = nil
+		k.VertexAWSWorkloadIdentityJSON = nil
+	}
+	if k.BedrockKeyConfig != nil {
+		if k.BedrockKeyConfig.AccessKey.IsSet() {
+			// Copy to avoid encrypting the shared BedrockKeyConfig through the pointer
+			ak := k.BedrockKeyConfig.AccessKey
+			k.BedrockAccessKey = &ak
+		} else {
+			k.BedrockAccessKey = nil
+		}
+		if k.BedrockKeyConfig.SecretKey.IsSet() {
+			// Copy to avoid encrypting the shared BedrockKeyConfig through the pointer
+			sk := k.BedrockKeyConfig.SecretKey
+			k.BedrockSecretKey = &sk
+		} else {
+			k.BedrockSecretKey = nil
+		}
+		// Copy to avoid encrypting the shared BedrockKeyConfig through the pointer
+		if k.BedrockKeyConfig.SessionToken != nil {
+			st := *k.BedrockKeyConfig.SessionToken
+			k.BedrockSessionToken = &st
+		} else {
+			k.BedrockSessionToken = nil
+		}
+		if k.BedrockKeyConfig.Region != nil {
+			br := *k.BedrockKeyConfig.Region
+			k.BedrockRegion = &br
+		} else {
+			k.BedrockRegion = nil
+		}
+		if k.BedrockKeyConfig.ARN != nil {
+			ba := *k.BedrockKeyConfig.ARN
+			k.BedrockARN = &ba
+		} else {
+			k.BedrockARN = nil
+		}
+		if k.BedrockKeyConfig.RoleARN != nil {
+			bra := *k.BedrockKeyConfig.RoleARN
+			k.BedrockRoleARN = &bra
+		} else {
+			k.BedrockRoleARN = nil
+		}
+		if k.BedrockKeyConfig.ExternalID != nil {
+			ei := *k.BedrockKeyConfig.ExternalID
+			k.BedrockExternalID = &ei
+		} else {
+			k.BedrockExternalID = nil
+		}
+		if k.BedrockKeyConfig.RoleSessionName != nil {
+			rsn := *k.BedrockKeyConfig.RoleSessionName
+			k.BedrockRoleSessionName = &rsn
+		} else {
+			k.BedrockRoleSessionName = nil
+		}
+		if k.BedrockKeyConfig.BatchRoleARN != nil {
+			bra := *k.BedrockKeyConfig.BatchRoleARN
+			k.BedrockBatchRoleARN = &bra
+		} else {
+			k.BedrockBatchRoleARN = nil
+		}
+		if k.BedrockKeyConfig.ProjectID != nil {
+			pid := *k.BedrockKeyConfig.ProjectID
+			k.BedrockProjectID = &pid
+		} else {
+			k.BedrockProjectID = nil
+		}
+		if k.BedrockKeyConfig.BatchS3Config != nil {
+			data, err := sonic.Marshal(k.BedrockKeyConfig.BatchS3Config)
+			if err != nil {
+				return err
+			}
+			s := string(data)
+			k.BedrockBatchS3ConfigJSON = &s
+		} else {
+			k.BedrockBatchS3ConfigJSON = nil
+		}
+		if k.BedrockKeyConfig.Endpoints != nil {
+			data, err := sonic.Marshal(k.BedrockKeyConfig.Endpoints)
+			if err != nil {
+				return err
+			}
+			s := string(data)
+			k.BedrockEndpointsJSON = &s
+		} else {
+			k.BedrockEndpointsJSON = nil
+		}
+	} else {
+		k.BedrockAccessKey = nil
+		k.BedrockSecretKey = nil
+		k.BedrockSessionToken = nil
+		k.BedrockRegion = nil
+		k.BedrockARN = nil
+		k.BedrockRoleARN = nil
+		k.BedrockExternalID = nil
+		k.BedrockRoleSessionName = nil
+		k.BedrockBatchRoleARN = nil
+		k.BedrockProjectID = nil
+		k.BedrockBatchS3ConfigJSON = nil
+		k.BedrockEndpointsJSON = nil
+	}
+
+	if k.BedrockMantleKeyConfig != nil {
+		// Copy to avoid encrypting the shared BedrockMantleKeyConfig through the pointer.
+		if k.BedrockMantleKeyConfig.AccessKey.IsSet() {
+			ak := k.BedrockMantleKeyConfig.AccessKey
+			k.BedrockMantleAccessKey = &ak
+		} else {
+			k.BedrockMantleAccessKey = nil
+		}
+		if k.BedrockMantleKeyConfig.SecretKey.IsSet() {
+			sk := k.BedrockMantleKeyConfig.SecretKey
+			k.BedrockMantleSecretKey = &sk
+		} else {
+			k.BedrockMantleSecretKey = nil
+		}
+		if k.BedrockMantleKeyConfig.SessionToken != nil {
+			st := *k.BedrockMantleKeyConfig.SessionToken
+			k.BedrockMantleSessionToken = &st
+		} else {
+			k.BedrockMantleSessionToken = nil
+		}
+		if k.BedrockMantleKeyConfig.Region != nil {
+			br := *k.BedrockMantleKeyConfig.Region
+			k.BedrockMantleRegion = &br
+		} else {
+			k.BedrockMantleRegion = nil
+		}
+		if k.BedrockMantleKeyConfig.RoleARN != nil {
+			bra := *k.BedrockMantleKeyConfig.RoleARN
+			k.BedrockMantleRoleARN = &bra
+		} else {
+			k.BedrockMantleRoleARN = nil
+		}
+		if k.BedrockMantleKeyConfig.ExternalID != nil {
+			ei := *k.BedrockMantleKeyConfig.ExternalID
+			k.BedrockMantleExternalID = &ei
+		} else {
+			k.BedrockMantleExternalID = nil
+		}
+		if k.BedrockMantleKeyConfig.RoleSessionName != nil {
+			rsn := *k.BedrockMantleKeyConfig.RoleSessionName
+			k.BedrockMantleRoleSessionName = &rsn
+		} else {
+			k.BedrockMantleRoleSessionName = nil
+		}
+		if k.BedrockMantleKeyConfig.ProjectID != nil {
+			pid := *k.BedrockMantleKeyConfig.ProjectID
+			k.BedrockMantleProjectID = &pid
+		} else {
+			k.BedrockMantleProjectID = nil
+		}
+		if k.BedrockMantleKeyConfig.Endpoints != nil {
+			data, err := sonic.Marshal(k.BedrockMantleKeyConfig.Endpoints)
+			if err != nil {
+				return err
+			}
+			s := string(data)
+			k.BedrockMantleEndpointsJSON = &s
+		} else {
+			k.BedrockMantleEndpointsJSON = nil
+		}
+	} else {
+		k.BedrockMantleAccessKey = nil
+		k.BedrockMantleSecretKey = nil
+		k.BedrockMantleSessionToken = nil
+		k.BedrockMantleRegion = nil
+		k.BedrockMantleRoleARN = nil
+		k.BedrockMantleExternalID = nil
+		k.BedrockMantleRoleSessionName = nil
+		k.BedrockMantleProjectID = nil
+		k.BedrockMantleEndpointsJSON = nil
+	}
+
+	// Copy to avoid encrypting the shared SageMakerKeyConfig through the pointer.
+	if k.SageMakerKeyConfig != nil {
+		if k.SageMakerKeyConfig.AccessKey.IsSet() {
+			ak := k.SageMakerKeyConfig.AccessKey
+			k.SageMakerAccessKey = &ak
+		} else {
+			k.SageMakerAccessKey = nil
+		}
+		if k.SageMakerKeyConfig.SecretKey.IsSet() {
+			sk := k.SageMakerKeyConfig.SecretKey
+			k.SageMakerSecretKey = &sk
+		} else {
+			k.SageMakerSecretKey = nil
+		}
+		if k.SageMakerKeyConfig.SessionToken != nil {
+			v := *k.SageMakerKeyConfig.SessionToken
+			k.SageMakerSessionToken = &v
+		} else {
+			k.SageMakerSessionToken = nil
+		}
+		if k.SageMakerKeyConfig.Region != nil {
+			v := *k.SageMakerKeyConfig.Region
+			k.SageMakerRegion = &v
+		} else {
+			k.SageMakerRegion = nil
+		}
+		if k.SageMakerKeyConfig.RoleARN != nil {
+			v := *k.SageMakerKeyConfig.RoleARN
+			k.SageMakerRoleARN = &v
+		} else {
+			k.SageMakerRoleARN = nil
+		}
+		if k.SageMakerKeyConfig.ExternalID != nil {
+			v := *k.SageMakerKeyConfig.ExternalID
+			k.SageMakerExternalID = &v
+		} else {
+			k.SageMakerExternalID = nil
+		}
+		if k.SageMakerKeyConfig.RoleSessionName != nil {
+			v := *k.SageMakerKeyConfig.RoleSessionName
+			k.SageMakerRoleSessionName = &v
+		} else {
+			k.SageMakerRoleSessionName = nil
+		}
+		if k.SageMakerKeyConfig.Endpoints != nil {
+			data, err := sonic.Marshal(k.SageMakerKeyConfig.Endpoints)
+			if err != nil {
+				return err
+			}
+			s := string(data)
+			k.SageMakerEndpointsJSON = &s
+		} else {
+			k.SageMakerEndpointsJSON = nil
+		}
+	} else {
+		k.SageMakerAccessKey = nil
+		k.SageMakerSecretKey = nil
+		k.SageMakerSessionToken = nil
+		k.SageMakerRegion = nil
+		k.SageMakerRoleARN = nil
+		k.SageMakerExternalID = nil
+		k.SageMakerRoleSessionName = nil
+		k.SageMakerEndpointsJSON = nil
+	}
+
+	if k.Aliases != nil {
+		data, err := sonic.Marshal(k.Aliases)
+		if err != nil {
+			return err
+		}
+		s := string(data)
+		k.AliasesJSON = &s
+	} else {
+		k.AliasesJSON = nil
+	}
+
+	if k.VLLMKeyConfig != nil {
+		if k.VLLMKeyConfig.URL.IsSet() {
+			u := k.VLLMKeyConfig.URL // Value-copy to prevent shared pointer mutation
+			k.VLLMUrl = &u
+		} else {
+			k.VLLMUrl = nil
+		}
+		if k.VLLMKeyConfig.ModelName != "" {
+			mn := k.VLLMKeyConfig.ModelName
+			k.VLLMModelName = &mn
+		} else {
+			k.VLLMModelName = nil
+		}
+	} else {
+		k.VLLMUrl = nil
+		k.VLLMModelName = nil
+	}
+
+	if k.ReplicateKeyConfig != nil {
+		v := k.ReplicateKeyConfig.UseDeploymentsEndpoint
+		k.ReplicateUseDeploymentsEndpoint = &v
+	} else {
+		k.ReplicateUseDeploymentsEndpoint = nil
+	}
+
+	if k.OllamaKeyConfig != nil && k.OllamaKeyConfig.URL.IsSet() {
+		u := k.OllamaKeyConfig.URL
+		k.OllamaUrl = &u
+	} else {
+		k.OllamaUrl = nil
+	}
+
+	if k.SGLKeyConfig != nil && k.SGLKeyConfig.URL.IsSet() {
+		u := k.SGLKeyConfig.URL
+		k.SGLUrl = &u
+	} else {
+		k.SGLUrl = nil
+	}
+
+	if k.CloudflareKeyConfig != nil && k.CloudflareKeyConfig.AccountID.IsSet() {
+		a := k.CloudflareKeyConfig.AccountID
+		k.CloudflareAccountID = &a
+	} else {
+		k.CloudflareAccountID = nil
+	}
+
+	if k.DatabricksKeyConfig != nil {
+		if k.DatabricksKeyConfig.WorkspaceURL.IsSet() {
+			u := k.DatabricksKeyConfig.WorkspaceURL // Value-copy to prevent shared pointer mutation
+			k.DatabricksWorkspaceURL = &u
+		} else {
+			k.DatabricksWorkspaceURL = nil
+		}
+		if k.DatabricksKeyConfig.ClientID != nil {
+			cid := *k.DatabricksKeyConfig.ClientID // Value-copy to prevent shared pointer mutation
+			k.DatabricksClientID = &cid
+		} else {
+			k.DatabricksClientID = nil
+		}
+		if k.DatabricksKeyConfig.ClientSecret != nil {
+			cs := *k.DatabricksKeyConfig.ClientSecret
+			k.DatabricksClientSecret = &cs
+		} else {
+			k.DatabricksClientSecret = nil
+		}
+		if k.DatabricksKeyConfig.APIFormat != "" {
+			f := string(k.DatabricksKeyConfig.APIFormat)
+			k.DatabricksAPIFormat = &f
+		} else {
+			k.DatabricksAPIFormat = nil
+		}
+		t := k.DatabricksKeyConfig.ForwardGatewayTags
+		k.DatabricksForwardGatewayTags = &t
+	} else {
+		k.DatabricksWorkspaceURL = nil
+		k.DatabricksClientID = nil
+		k.DatabricksClientSecret = nil
+		k.DatabricksAPIFormat = nil
+		k.DatabricksForwardGatewayTags = nil
+	}
+	// oauth_key_config. The credential fields are value-copied into their own columns, per
+	// the invariant above; the rest is serialised with those fields cleared so no secret
+	// ever lands in the settings column.
+	if k.OAuthKeyConfig != nil {
+		copyPtr := func(v *schemas.SecretVar) *schemas.SecretVar {
+			if v == nil || !v.IsSet() {
+				return nil
+			}
+			c := *v
+			return &c
+		}
+		if k.OAuthKeyConfig.TokenURL.IsSet() {
+			v := k.OAuthKeyConfig.TokenURL
+			k.OAuthTokenURL = &v
+		} else {
+			k.OAuthTokenURL = nil
+		}
+		k.OAuthClientID = copyPtr(k.OAuthKeyConfig.ClientID)
+		k.OAuthClientSecret = copyPtr(k.OAuthKeyConfig.ClientSecret)
+		k.OAuthPrivateKey = copyPtr(k.OAuthKeyConfig.PrivateKey)
+		settings := *k.OAuthKeyConfig
+		settings.TokenURL = schemas.SecretVar{}
+		settings.ClientID, settings.ClientSecret, settings.PrivateKey = nil, nil, nil
+		data, err := json.Marshal(settings)
+		if err != nil {
+			return fmt.Errorf("failed to serialize oauth key config: %w", err)
+		}
+		k.OAuthSettingsJSON = schemas.NewSecretVar(string(data))
+	} else {
+		k.OAuthTokenURL = nil
+		k.OAuthClientID = nil
+		k.OAuthClientSecret = nil
+		k.OAuthPrivateKey = nil
+		k.OAuthSettingsJSON = nil
+	}
+
+	// Store plaintext SecretVar columns into the vault and rewrite them to vault refs.
+	// This must run after the columns are populated (above) and before encryption (below):
+	// encryptSecretVar skips fields that are already vault refs, so vault-owned secrets are
+	// stored as plaintext and never double-protected. The global vault callback skips this
+	// model (see VaultStoreSelfManaged) because that midpoint is only reachable here.
+	if schemas.VaultStoreWriteEnabled() {
+		base := schemas.VaultBasePath(tx.Statement.Table, k.VaultPathKey())
+		if err := schemas.StoreOwnedVaultSecretVars(tx.Statement.Context, base, k); err != nil {
+			return fmt.Errorf("failed to store key secrets to vault: %w", err)
+		}
+	}
+
+	// Encrypt sensitive fields after serialization
+	if encrypt.IsEnabled() {
+		if err := encryptSecretVar(&k.Value); err != nil {
+			return fmt.Errorf("failed to encrypt key value: %w", err)
+		}
+		// Azure
+		if err := encryptSecretVarPtr(&k.AzureEndpoint); err != nil {
+			return fmt.Errorf("failed to encrypt azure endpoint: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.AzureClientID); err != nil {
+			return fmt.Errorf("failed to encrypt azure client id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.AzureClientSecret); err != nil {
+			return fmt.Errorf("failed to encrypt azure client secret: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.AzureTenantID); err != nil {
+			return fmt.Errorf("failed to encrypt azure tenant id: %w", err)
+		}
+		// Vertex
+		if err := encryptSecretVarPtr(&k.VertexProjectID); err != nil {
+			return fmt.Errorf("failed to encrypt vertex project id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.VertexProjectNumber); err != nil {
+			return fmt.Errorf("failed to encrypt vertex project number: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.VertexRegion); err != nil {
+			return fmt.Errorf("failed to encrypt vertex region: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.VertexAuthCredentials); err != nil {
+			return fmt.Errorf("failed to encrypt vertex auth credentials: %w", err)
+		}
+		if err := encryptString(k.VertexAWSWorkloadIdentityJSON); err != nil {
+			return fmt.Errorf("failed to encrypt vertex aws workload identity: %w", err)
+		}
+		// Bedrock
+		if err := encryptSecretVarPtr(&k.BedrockAccessKey); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock access key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockSecretKey); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock secret key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockSessionToken); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock session token: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockRegion); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock region: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockARN); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock arn: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockRoleARN); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock role arn: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockExternalID); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock external id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockRoleSessionName); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock role session name: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockBatchRoleARN); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock batch role arn: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockProjectID); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock project id: %w", err)
+		}
+		if err := encryptString(k.BedrockBatchS3ConfigJSON); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock batch s3 config: %w", err)
+		}
+		if err := encryptString(k.BedrockEndpointsJSON); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock endpoints: %w", err)
+		}
+		// Bedrock Mantle
+		if err := encryptSecretVarPtr(&k.BedrockMantleAccessKey); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle access key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleSecretKey); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle secret key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleSessionToken); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle session token: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleRegion); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle region: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleRoleARN); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle role arn: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleExternalID); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle external id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleRoleSessionName); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle role session name: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.BedrockMantleProjectID); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle project id: %w", err)
+		}
+		if err := encryptString(k.BedrockMantleEndpointsJSON); err != nil {
+			return fmt.Errorf("failed to encrypt bedrock mantle endpoints: %w", err)
+		}
+		// SageMaker
+		if err := encryptSecretVarPtr(&k.SageMakerAccessKey); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker access key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.SageMakerSecretKey); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker secret key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.SageMakerSessionToken); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker session token: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.SageMakerRegion); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker region: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.SageMakerRoleARN); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker role arn: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.SageMakerExternalID); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker external id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.SageMakerRoleSessionName); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker role session name: %w", err)
+		}
+		if err := encryptString(k.SageMakerEndpointsJSON); err != nil {
+			return fmt.Errorf("failed to encrypt sagemaker endpoints: %w", err)
+		}
+		// Aliases
+		if err := encryptString(k.AliasesJSON); err != nil {
+			return fmt.Errorf("failed to encrypt aliases: %w", err)
+		}
+		// VLLM
+		if err := encryptSecretVarPtr(&k.VLLMUrl); err != nil {
+			return fmt.Errorf("failed to encrypt vllm url: %w", err)
+		}
+		// Ollama
+		if err := encryptSecretVarPtr(&k.OllamaUrl); err != nil {
+			return fmt.Errorf("failed to encrypt ollama url: %w", err)
+		}
+		// SGL
+		if err := encryptSecretVarPtr(&k.SGLUrl); err != nil {
+			return fmt.Errorf("failed to encrypt sgl url: %w", err)
+		}
+		// Cloudflare
+		if err := encryptSecretVarPtr(&k.CloudflareAccountID); err != nil {
+			return fmt.Errorf("failed to encrypt cloudflare account id: %w", err)
+		}
+		// Databricks
+		if err := encryptSecretVarPtr(&k.DatabricksWorkspaceURL); err != nil {
+			return fmt.Errorf("failed to encrypt databricks workspace url: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.DatabricksClientID); err != nil {
+			return fmt.Errorf("failed to encrypt databricks client id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.DatabricksClientSecret); err != nil {
+			return fmt.Errorf("failed to encrypt databricks client secret: %w", err)
+		}
+		// oauth_key_config. The client secret or private key is the whole credential.
+		if err := encryptSecretVarPtr(&k.OAuthTokenURL); err != nil {
+			return fmt.Errorf("failed to encrypt oauth token url: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.OAuthClientID); err != nil {
+			return fmt.Errorf("failed to encrypt oauth client id: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.OAuthClientSecret); err != nil {
+			return fmt.Errorf("failed to encrypt oauth client secret: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.OAuthPrivateKey); err != nil {
+			return fmt.Errorf("failed to encrypt oauth private key: %w", err)
+		}
+		if err := encryptSecretVarPtr(&k.OAuthSettingsJSON); err != nil {
+			return fmt.Errorf("failed to encrypt oauth settings: %w", err)
+		}
+		k.EncryptionStatus = EncryptionStatusEncrypted
+	}
+	return nil
+}
+
+// AfterFind is a GORM hook that decrypts sensitive fields and reconstructs runtime config
+// structs after reading from the database. Decryption runs first so that value copies into
+// AzureKeyConfig, VertexKeyConfig, etc. receive plaintext data.
+func (k *TableKey) AfterFind(tx *gorm.DB) error {
+	switch k.EncryptionStatus {
+	case EncryptionStatusEncrypted:
+		if err := decryptSecretVar(&k.Value); err != nil {
+			return fmt.Errorf("failed to decrypt key value: %w", err)
+		}
+		// Azure
+		if err := decryptSecretVarPtr(&k.AzureEndpoint); err != nil {
+			return fmt.Errorf("failed to decrypt azure endpoint: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.AzureClientID); err != nil {
+			return fmt.Errorf("failed to decrypt azure client id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.AzureClientSecret); err != nil {
+			return fmt.Errorf("failed to decrypt azure client secret: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.AzureTenantID); err != nil {
+			return fmt.Errorf("failed to decrypt azure tenant id: %w", err)
+		}
+		// Vertex
+		if err := decryptSecretVarPtr(&k.VertexProjectID); err != nil {
+			return fmt.Errorf("failed to decrypt vertex project id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.VertexProjectNumber); err != nil {
+			return fmt.Errorf("failed to decrypt vertex project number: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.VertexRegion); err != nil {
+			return fmt.Errorf("failed to decrypt vertex region: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.VertexAuthCredentials); err != nil {
+			return fmt.Errorf("failed to decrypt vertex auth credentials: %w", err)
+		}
+		if err := decryptString(k.VertexAWSWorkloadIdentityJSON); err != nil {
+			return fmt.Errorf("failed to decrypt vertex aws workload identity: %w", err)
+		}
+		// Bedrock
+		if err := decryptSecretVarPtr(&k.BedrockAccessKey); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock access key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockSecretKey); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock secret key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockSessionToken); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock session token: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockRegion); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock region: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockARN); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock arn: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockRoleARN); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock role arn: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockExternalID); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock external id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockRoleSessionName); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock role session name: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockBatchRoleARN); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock batch role arn: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockProjectID); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock project id: %w", err)
+		}
+		if err := decryptString(k.BedrockBatchS3ConfigJSON); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock batch s3 config: %w", err)
+		}
+		if err := decryptString(k.BedrockEndpointsJSON); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock endpoints: %w", err)
+		}
+		// Bedrock Mantle
+		if err := decryptSecretVarPtr(&k.BedrockMantleAccessKey); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle access key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleSecretKey); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle secret key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleSessionToken); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle session token: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleRegion); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle region: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleRoleARN); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle role arn: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleExternalID); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle external id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleRoleSessionName); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle role session name: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.BedrockMantleProjectID); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle project id: %w", err)
+		}
+		if err := decryptString(k.BedrockMantleEndpointsJSON); err != nil {
+			return fmt.Errorf("failed to decrypt bedrock mantle endpoints: %w", err)
+		}
+		// SageMaker
+		if err := decryptSecretVarPtr(&k.SageMakerAccessKey); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker access key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.SageMakerSecretKey); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker secret key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.SageMakerSessionToken); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker session token: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.SageMakerRegion); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker region: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.SageMakerRoleARN); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker role arn: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.SageMakerExternalID); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker external id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.SageMakerRoleSessionName); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker role session name: %w", err)
+		}
+		if err := decryptString(k.SageMakerEndpointsJSON); err != nil {
+			return fmt.Errorf("failed to decrypt sagemaker endpoints: %w", err)
+		}
+		// Aliases
+		if err := decryptString(k.AliasesJSON); err != nil {
+			return fmt.Errorf("failed to decrypt aliases: %w", err)
+		}
+		// VLLM
+		if err := decryptSecretVarPtr(&k.VLLMUrl); err != nil {
+			return fmt.Errorf("failed to decrypt vllm url: %w", err)
+		}
+		// Ollama
+		if err := decryptSecretVarPtr(&k.OllamaUrl); err != nil {
+			return fmt.Errorf("failed to decrypt ollama url: %w", err)
+		}
+		// SGL
+		if err := decryptSecretVarPtr(&k.SGLUrl); err != nil {
+			return fmt.Errorf("failed to decrypt sgl url: %w", err)
+		}
+		// Cloudflare
+		if err := decryptSecretVarPtr(&k.CloudflareAccountID); err != nil {
+			return fmt.Errorf("failed to decrypt cloudflare account id: %w", err)
+		}
+
+		// Databricks
+		if err := decryptSecretVarPtr(&k.DatabricksWorkspaceURL); err != nil {
+			return fmt.Errorf("failed to decrypt databricks workspace url: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.DatabricksClientID); err != nil {
+			return fmt.Errorf("failed to decrypt databricks client id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.DatabricksClientSecret); err != nil {
+			return fmt.Errorf("failed to decrypt databricks client secret: %w", err)
+		}
+		// GitHub Copilot
+		// oauth_key_config
+		if err := decryptSecretVarPtr(&k.OAuthTokenURL); err != nil {
+			return fmt.Errorf("failed to decrypt oauth token url: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.OAuthClientID); err != nil {
+			return fmt.Errorf("failed to decrypt oauth client id: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.OAuthClientSecret); err != nil {
+			return fmt.Errorf("failed to decrypt oauth client secret: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.OAuthPrivateKey); err != nil {
+			return fmt.Errorf("failed to decrypt oauth private key: %w", err)
+		}
+		if err := decryptSecretVarPtr(&k.OAuthSettingsJSON); err != nil {
+			return fmt.Errorf("failed to decrypt oauth settings: %w", err)
+		}
+	}
+
+	if k.ModelsJSON != "" {
+		if err := json.Unmarshal([]byte(k.ModelsJSON), &k.Models); err != nil {
+			return err
+		}
+	}
+	if k.BlacklistedModelsJSON != "" {
+		if err := json.Unmarshal([]byte(k.BlacklistedModelsJSON), &k.BlacklistedModels); err != nil {
+			return err
+		}
+	}
+	if k.Enabled == nil {
+		enabled := true // DB default
+		k.Enabled = &enabled
+	}
+	if k.UseForBatchAPI == nil {
+		useForBatchAPI := false // DB default
+		k.UseForBatchAPI = &useForBatchAPI
+	}
+	if k.UseAnthropicEndpoints == nil {
+		useAnthropicEndpoints := false // DB default
+		k.UseAnthropicEndpoints = &useAnthropicEndpoints
+	}
+	if k.UseOpenAIEndpoints == nil {
+		useOpenAIEndpoints := false // DB default
+		k.UseOpenAIEndpoints = &useOpenAIEndpoints
+	}
+	// Reconstruct Azure config if fields are present
+	if k.AzureEndpoint != nil || k.AzureClientID != nil || k.AzureClientSecret != nil || k.AzureTenantID != nil || k.AzureUseSpeechEndpoints != nil || k.AzureUseVoiceLiveEndpoints != nil || (k.AzureScopesJSON != nil && *k.AzureScopesJSON != "") {
+		var scopes []string
+		if k.AzureScopesJSON != nil && *k.AzureScopesJSON != "" {
+			if err := json.Unmarshal([]byte(*k.AzureScopesJSON), &scopes); err != nil {
+				return err
+			}
+		}
+		azureConfig := &schemas.AzureKeyConfig{
+			Endpoint:     *schemas.NewSecretVar(""),
+			ClientID:     k.AzureClientID,
+			ClientSecret: k.AzureClientSecret,
+			TenantID:     k.AzureTenantID,
+			Scopes:       scopes,
+		}
+
+		if k.AzureEndpoint != nil {
+			azureConfig.Endpoint = *k.AzureEndpoint
+		}
+		if k.AzureUseSpeechEndpoints != nil {
+			azureConfig.UseSpeechEndpoints = *k.AzureUseSpeechEndpoints
+		}
+		if k.AzureUseVoiceLiveEndpoints != nil {
+			azureConfig.UseVoiceLiveEndpoints = *k.AzureUseVoiceLiveEndpoints
+		}
+
+		k.AzureKeyConfig = azureConfig
+	}
+	// Reconstruct Vertex config if fields are present
+	if k.VertexProjectID != nil || k.VertexProjectNumber != nil || k.VertexRegion != nil || k.VertexAuthCredentials != nil || k.VertexForceSingleRegion != nil || k.VertexUseSessionRouting != nil || (k.VertexAWSWorkloadIdentityJSON != nil && *k.VertexAWSWorkloadIdentityJSON != "") {
+		config := &schemas.VertexKeyConfig{}
+
+		if k.VertexProjectID != nil {
+			config.ProjectID = *k.VertexProjectID
+		}
+
+		if k.VertexProjectNumber != nil {
+			config.ProjectNumber = *k.VertexProjectNumber
+		}
+
+		if k.VertexRegion != nil {
+			config.Region = *k.VertexRegion
+		}
+		if k.VertexAuthCredentials != nil {
+			config.AuthCredentials = *k.VertexAuthCredentials
+		}
+		if k.VertexForceSingleRegion != nil {
+			config.ForceSingleRegion = *k.VertexForceSingleRegion
+		}
+		if k.VertexUseSessionRouting != nil {
+			config.UseSessionRouting = *k.VertexUseSessionRouting
+		}
+		if k.VertexAWSWorkloadIdentityJSON != nil && *k.VertexAWSWorkloadIdentityJSON != "" {
+			var wif schemas.VertexAWSWorkloadIdentityConfig
+			if err := json.Unmarshal([]byte(*k.VertexAWSWorkloadIdentityJSON), &wif); err != nil {
+				return err
+			}
+			config.AWSWorkloadIdentity = &wif
+		}
+		k.VertexKeyConfig = config
+	}
+	// Reconstruct Bedrock config if fields are present
+	if k.BedrockAccessKey != nil || k.BedrockSecretKey != nil || k.BedrockSessionToken != nil || k.BedrockRegion != nil || k.BedrockARN != nil || k.BedrockRoleARN != nil || k.BedrockExternalID != nil || k.BedrockRoleSessionName != nil || k.BedrockBatchRoleARN != nil || k.BedrockProjectID != nil || (k.BedrockBatchS3ConfigJSON != nil && *k.BedrockBatchS3ConfigJSON != "") || (k.BedrockEndpointsJSON != nil && *k.BedrockEndpointsJSON != "") {
+		bedrockConfig := &schemas.BedrockKeyConfig{}
+
+		if k.BedrockAccessKey != nil {
+			bedrockConfig.AccessKey = *k.BedrockAccessKey
+		}
+
+		bedrockConfig.SessionToken = k.BedrockSessionToken
+		bedrockConfig.Region = k.BedrockRegion
+		bedrockConfig.ARN = k.BedrockARN
+		bedrockConfig.RoleARN = k.BedrockRoleARN
+		bedrockConfig.ExternalID = k.BedrockExternalID
+		bedrockConfig.RoleSessionName = k.BedrockRoleSessionName
+		bedrockConfig.BatchRoleARN = k.BedrockBatchRoleARN
+		bedrockConfig.ProjectID = k.BedrockProjectID
+
+		if k.BedrockSecretKey != nil {
+			bedrockConfig.SecretKey = *k.BedrockSecretKey
+		}
+
+		if k.BedrockBatchS3ConfigJSON != nil && *k.BedrockBatchS3ConfigJSON != "" {
+			var batchS3Config schemas.BatchS3Config
+			if err := json.Unmarshal([]byte(*k.BedrockBatchS3ConfigJSON), &batchS3Config); err != nil {
+				return err
+			}
+			bedrockConfig.BatchS3Config = &batchS3Config
+		}
+
+		if k.BedrockEndpointsJSON != nil && *k.BedrockEndpointsJSON != "" {
+			var endpoints schemas.BedrockEndpoints
+			if err := json.Unmarshal([]byte(*k.BedrockEndpointsJSON), &endpoints); err != nil {
+				return err
+			}
+			bedrockConfig.Endpoints = &endpoints
+		}
+
+		k.BedrockKeyConfig = bedrockConfig
+	}
+	// Reconstruct Bedrock Mantle config if fields are present
+	if k.BedrockMantleAccessKey != nil || k.BedrockMantleSecretKey != nil || k.BedrockMantleSessionToken != nil || k.BedrockMantleRegion != nil || k.BedrockMantleRoleARN != nil || k.BedrockMantleExternalID != nil || k.BedrockMantleRoleSessionName != nil || k.BedrockMantleProjectID != nil || (k.BedrockMantleEndpointsJSON != nil && *k.BedrockMantleEndpointsJSON != "") {
+		mantleConfig := &schemas.BedrockMantleKeyConfig{}
+		if k.BedrockMantleAccessKey != nil {
+			mantleConfig.AccessKey = *k.BedrockMantleAccessKey
+		}
+		if k.BedrockMantleSecretKey != nil {
+			mantleConfig.SecretKey = *k.BedrockMantleSecretKey
+		}
+		mantleConfig.SessionToken = k.BedrockMantleSessionToken
+		mantleConfig.Region = k.BedrockMantleRegion
+		mantleConfig.RoleARN = k.BedrockMantleRoleARN
+		mantleConfig.ExternalID = k.BedrockMantleExternalID
+		mantleConfig.RoleSessionName = k.BedrockMantleRoleSessionName
+		mantleConfig.ProjectID = k.BedrockMantleProjectID
+		if k.BedrockMantleEndpointsJSON != nil && *k.BedrockMantleEndpointsJSON != "" {
+			var endpoints schemas.BedrockEndpoints
+			if err := json.Unmarshal([]byte(*k.BedrockMantleEndpointsJSON), &endpoints); err != nil {
+				return err
+			}
+			mantleConfig.Endpoints = &endpoints
+		}
+		k.BedrockMantleKeyConfig = mantleConfig
+	}
+	// Reconstruct SageMaker config if fields are present
+	if k.SageMakerAccessKey != nil || k.SageMakerSecretKey != nil || k.SageMakerSessionToken != nil || k.SageMakerRegion != nil || k.SageMakerRoleARN != nil || k.SageMakerExternalID != nil || k.SageMakerRoleSessionName != nil || (k.SageMakerEndpointsJSON != nil && *k.SageMakerEndpointsJSON != "") {
+		smConfig := &schemas.SageMakerKeyConfig{}
+		if k.SageMakerAccessKey != nil {
+			smConfig.AccessKey = *k.SageMakerAccessKey
+		}
+		if k.SageMakerSecretKey != nil {
+			smConfig.SecretKey = *k.SageMakerSecretKey
+		}
+		smConfig.SessionToken = k.SageMakerSessionToken
+		smConfig.Region = k.SageMakerRegion
+		smConfig.RoleARN = k.SageMakerRoleARN
+		smConfig.ExternalID = k.SageMakerExternalID
+		smConfig.RoleSessionName = k.SageMakerRoleSessionName
+		if k.SageMakerEndpointsJSON != nil && *k.SageMakerEndpointsJSON != "" {
+			var endpoints schemas.SageMakerEndpoints
+			if err := json.Unmarshal([]byte(*k.SageMakerEndpointsJSON), &endpoints); err != nil {
+				return err
+			}
+			smConfig.Endpoints = &endpoints
+		}
+		k.SageMakerKeyConfig = smConfig
+	}
+	// Reconstruct Aliases
+	if k.AliasesJSON != nil && *k.AliasesJSON != "" {
+		var aliases schemas.KeyAliases
+		if err := sonic.Unmarshal([]byte(*k.AliasesJSON), &aliases); err != nil {
+			return err
+		}
+		k.Aliases = aliases
+	} else {
+		k.Aliases = nil
+	}
+	// Reconstruct VLLM config if fields are present
+	if k.VLLMUrl != nil || (k.VLLMModelName != nil && *k.VLLMModelName != "") {
+		vllmConfig := &schemas.VLLMKeyConfig{}
+		if k.VLLMUrl != nil {
+			vllmConfig.URL = *k.VLLMUrl
+		}
+		if k.VLLMModelName != nil {
+			vllmConfig.ModelName = *k.VLLMModelName
+		}
+		k.VLLMKeyConfig = vllmConfig
+	} else {
+		k.VLLMKeyConfig = nil
+	}
+	// Reconstruct Replicate config if fields are present
+	if k.ReplicateUseDeploymentsEndpoint != nil {
+		k.ReplicateKeyConfig = &schemas.ReplicateKeyConfig{
+			UseDeploymentsEndpoint: *k.ReplicateUseDeploymentsEndpoint,
+		}
+	} else {
+		k.ReplicateKeyConfig = nil
+	}
+	// Reconstruct Ollama config if fields are present
+	if k.OllamaUrl != nil {
+		k.OllamaKeyConfig = &schemas.OllamaKeyConfig{
+			URL: *k.OllamaUrl,
+		}
+	} else {
+		k.OllamaKeyConfig = nil
+	}
+	// Reconstruct SGL config if fields are present
+	if k.SGLUrl != nil {
+		k.SGLKeyConfig = &schemas.SGLKeyConfig{
+			URL: *k.SGLUrl,
+		}
+	} else {
+		k.SGLKeyConfig = nil
+	}
+	// Reconstruct Cloudflare config if fields are present
+	if k.CloudflareAccountID != nil {
+		k.CloudflareKeyConfig = &schemas.CloudflareKeyConfig{
+			AccountID: *k.CloudflareAccountID,
+		}
+	} else {
+		k.CloudflareKeyConfig = nil
+	}
+
+	// Reconstruct Databricks config if fields are present
+	if k.DatabricksWorkspaceURL != nil || k.DatabricksClientID != nil || k.DatabricksClientSecret != nil ||
+		(k.DatabricksAPIFormat != nil && *k.DatabricksAPIFormat != "") || k.DatabricksForwardGatewayTags != nil {
+		databricksConfig := &schemas.DatabricksKeyConfig{
+			ClientID:     k.DatabricksClientID,
+			ClientSecret: k.DatabricksClientSecret,
+		}
+		if k.DatabricksWorkspaceURL != nil {
+			databricksConfig.WorkspaceURL = *k.DatabricksWorkspaceURL
+		}
+		if k.DatabricksAPIFormat != nil {
+			databricksConfig.APIFormat = schemas.DatabricksAPIFormat(*k.DatabricksAPIFormat)
+		}
+		if k.DatabricksForwardGatewayTags != nil {
+			databricksConfig.ForwardGatewayTags = *k.DatabricksForwardGatewayTags
+		}
+		k.DatabricksKeyConfig = databricksConfig
+	} else {
+		k.DatabricksKeyConfig = nil
+	}
+	// Reconstruct oauth_key_config if any part is present
+	settings := ""
+	if k.OAuthSettingsJSON != nil {
+		settings = k.OAuthSettingsJSON.GetValue()
+	}
+	if settings != "" || k.OAuthTokenURL != nil || k.OAuthClientID != nil ||
+		k.OAuthClientSecret != nil || k.OAuthPrivateKey != nil {
+		config := &schemas.OAuthKeyConfig{}
+		if settings != "" {
+			if err := json.Unmarshal([]byte(settings), config); err != nil {
+				return fmt.Errorf("failed to parse oauth key config: %w", err)
+			}
+		}
+		if k.OAuthTokenURL != nil {
+			config.TokenURL = *k.OAuthTokenURL
+		}
+		copyPtr := func(v *schemas.SecretVar) *schemas.SecretVar {
+			if v == nil {
+				return nil
+			}
+			c := *v
+			return &c
+		}
+		config.ClientID = copyPtr(k.OAuthClientID)
+		config.ClientSecret = copyPtr(k.OAuthClientSecret)
+		config.PrivateKey = copyPtr(k.OAuthPrivateKey)
+		k.OAuthKeyConfig = config
+	} else {
+		k.OAuthKeyConfig = nil
+	}
+	return nil
+}
+
+// VaultPathKey implements schemas.VaultPathKeyer so the global GORM vault
+// callback can compute the vault base path for this model automatically.
+func (k *TableKey) VaultPathKey() string { return k.KeyID }
+
+// VaultStoreSelfManaged marks TableKey as storing its own vault secrets from within
+// BeforeSave (see the vault block there), so the global vault callback skips it. The
+// flat *SecretVar columns (AzureClientSecret, BedrockSecretKey, etc.) are populated
+// inside BeforeSave and then encrypted in the same hook; the vault store must run at
+// the midpoint between those two steps, which only BeforeSave itself can reach.
+func (k *TableKey) VaultStoreSelfManaged() {}
+
+// vertexAWSWorkloadIdentityRecord is the storage form of the aws_workload_identity block. Each
+// SecretVar is reduced to the same string the SecretVar-backed columns persist through driver.Valuer:
+// the env./vault. reference when the value comes from a secret, otherwise the plain value. The
+// resolved secret therefore never reaches the database, and SecretVar.UnmarshalJSON re-resolves the
+// bare reference string on load.
+type vertexAWSWorkloadIdentityRecord struct {
+	Audience             string `json:"audience,omitempty"`
+	ServiceAccountEmail  string `json:"service_account_email,omitempty"`
+	TokenLifetimeSeconds int    `json:"token_lifetime_seconds,omitempty"`
+	AWSRegion            string `json:"aws_region,omitempty"`
+	AWSRoleARN           string `json:"aws_role_arn,omitempty"`
+}
+
+// secretVarStorageString mirrors SecretVar.Value: the reference for secret-backed values, else the value.
+func secretVarStorageString(sv *schemas.SecretVar) string {
+	if sv == nil {
+		return ""
+	}
+	if sv.IsFromSecret() {
+		return sv.GetRawRef()
+	}
+	return sv.GetValue()
+}
+
+// MarshalVertexAWSWorkloadIdentityJSON serializes the Vertex AWS workload identity block for the
+// vertex_aws_workload_identity_json column in reference-preserving form, returning nil when the block
+// is absent so the column stays NULL for keys that do not federate.
+func MarshalVertexAWSWorkloadIdentityJSON(cfg *schemas.VertexAWSWorkloadIdentityConfig) (*string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	record := vertexAWSWorkloadIdentityRecord{
+		Audience:             secretVarStorageString(&cfg.Audience),
+		ServiceAccountEmail:  secretVarStorageString(cfg.ServiceAccountEmail),
+		TokenLifetimeSeconds: cfg.TokenLifetimeSeconds,
+		AWSRegion:            secretVarStorageString(cfg.AWSRegion),
+		AWSRoleARN:           secretVarStorageString(cfg.AWSRoleARN),
+	}
+	data, err := sonic.Marshal(record)
+	if err != nil {
+		return nil, err
+	}
+	s := string(data)
+	return &s, nil
+}

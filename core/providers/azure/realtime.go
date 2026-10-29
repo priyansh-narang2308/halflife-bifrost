@@ -1,0 +1,407 @@
+package azure
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"strings"
+
+	openaiProvider "github.com/maximhq/bifrost/core/providers/openai"
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/valyala/fasthttp"
+)
+
+// openAIEventHelper is a zero-value OpenAI provider used solely to delegate
+// event conversion calls. Azure uses the exact same Realtime wire protocol as
+// OpenAI, so all event parsing, serialisation, usage extraction, turn detection,
+// and output extraction can be reused without modification.
+var openAIEventHelper = &openaiProvider.OpenAIProvider{}
+
+// azureVoiceLiveAPIVersion is the Voice Live api-version sent unless the alias sets api_version.
+const azureVoiceLiveAPIVersion = "2026-04-10"
+
+// useVoiceLiveEndpoints reports whether realtime sessions go to Azure Voice Live rather than
+// Azure OpenAI. A per-alias value wins over the key's.
+func useVoiceLiveEndpoints(ctx *schemas.BifrostContext, key schemas.Key) bool {
+	if ra := schemas.GetResolvedAlias(ctx); ra != nil && ra.Config != nil && ra.Config.AzureAliasCfg != nil && ra.Config.AzureAliasCfg.UseVoiceLiveEndpoints != nil {
+		return *ra.Config.AzureAliasCfg.UseVoiceLiveEndpoints
+	}
+	return key.AzureKeyConfig != nil && key.AzureKeyConfig.UseVoiceLiveEndpoints
+}
+
+// newAzureVoiceLiveWebSocketOnlyError rejects the WebRTC and client-secret routes, which Voice Live
+// serves through its own WebSocket signaling and whose usage the gateway would never see.
+func newAzureVoiceLiveWebSocketOnlyError() *schemas.BifrostError {
+	return newAzureRealtimeError(fasthttp.StatusBadRequest, "invalid_request_error", "azure voice live is served over the realtime websocket only", nil)
+}
+
+// ---------------------------------------------------------------------------
+// RealtimeProvider interface
+// ---------------------------------------------------------------------------
+
+func (provider *AzureProvider) SupportsRealtimeAPI() bool {
+	return true
+}
+
+func (provider *AzureProvider) RealtimeWebSocketURL(ctx *schemas.BifrostContext, key schemas.Key, model, intent string) (string, *schemas.BifrostError) {
+	if useVoiceLiveEndpoints(ctx, key) {
+		// A Voice Live alias can name its own resource, so its endpoint wins over the key's.
+		endpoint := strings.TrimRight(strings.TrimSpace(resolveAzureEndpoint(ctx, key)), "/")
+		if endpoint == "" {
+			return "", newAzureRealtimeError(fasthttp.StatusBadRequest, "invalid_request_error", "azure realtime requires a configured endpoint", nil)
+		}
+		endpoint = strings.Replace(endpoint, "https://", "wss://", 1)
+		endpoint = strings.Replace(endpoint, "http://", "ws://", 1)
+		if intent != "" {
+			return "", newAzureRealtimeError(fasthttp.StatusBadRequest, "invalid_request_error", "azure voice live does not take a realtime intent", nil)
+		}
+		// Voice Live turns are priced at the model's _voice_live rates.
+		if ctx != nil {
+			ctx.SetValue(schemas.BifrostContextKeyRealtimePricingSurface, schemas.PricingSurfaceVoiceLive)
+		}
+		return fmt.Sprintf("%s/voice-live/realtime?api-version=%s&model=%s", endpoint, url.QueryEscape(resolveAPIVersion(ctx, azureVoiceLiveAPIVersion)), url.QueryEscape(model)), nil
+	}
+
+	endpoint, endpointErr := azureRealtimeEndpoint(key)
+	if endpointErr != nil {
+		return "", endpointErr
+	}
+	endpoint = strings.Replace(endpoint, "https://", "wss://", 1)
+	endpoint = strings.Replace(endpoint, "http://", "ws://", 1)
+
+	if intent != "" {
+		return fmt.Sprintf("%s/openai/v1/realtime?intent=%s", endpoint, url.QueryEscape(intent)), nil
+	}
+	return fmt.Sprintf("%s/openai/v1/realtime?model=%s", endpoint, url.QueryEscape(model)), nil
+}
+
+func (provider *AzureProvider) RealtimeHeaders(ctx *schemas.BifrostContext, key schemas.Key) (map[string]string, *schemas.BifrostError) {
+	value := key.Value.GetValue()
+
+	// Ephemeral tokens from /client_secrets use Bearer auth.
+	if strings.HasPrefix(value, "ek_") {
+		headers := map[string]string{
+			"Authorization": "Bearer " + value,
+		}
+		for k, v := range provider.networkConfig.ExtraHeaders {
+			headers[k] = v.GetValue()
+		}
+		return headers, nil
+	}
+
+	headers, authErr := provider.getAzureAuthHeaders(ctx, key, false)
+	if authErr != nil {
+		return nil, authErr
+	}
+	for k, v := range provider.networkConfig.ExtraHeaders {
+		headers[k] = v.GetValue()
+	}
+	return headers, nil
+}
+
+func (provider *AzureProvider) SupportsRealtimeWebRTC() bool {
+	return true
+}
+
+func (provider *AzureProvider) ExchangeRealtimeWebRTCSDP(
+	ctx *schemas.BifrostContext,
+	key schemas.Key,
+	model string,
+	sdp string,
+	session json.RawMessage,
+) (string, *schemas.BifrostError) {
+	if useVoiceLiveEndpoints(ctx, key) {
+		return "", newAzureVoiceLiveWebSocketOnlyError()
+	}
+	endpoint, endpointErr := azureRealtimeEndpoint(key)
+	if endpointErr != nil {
+		return "", endpointErr
+	}
+
+	upstreamURL := fmt.Sprintf("%s/openai/v1/realtime?model=%s",
+		endpoint, url.QueryEscape(model))
+	if isRealtimeTranscriptionSession(session) {
+		upstreamURL = endpoint + "/openai/v1/realtime?intent=transcription"
+	}
+
+	// Build multipart body: sdp + optional session
+	bodyBuf := &bytes.Buffer{}
+	writer := multipart.NewWriter(bodyBuf)
+	if err := writer.WriteField("sdp", sdp); err != nil {
+		return "", newAzureRealtimeError(fasthttp.StatusInternalServerError, "server_error", "failed to encode upstream SDP body", err)
+	}
+	if session != nil {
+		if err := writer.WriteField("session", string(session)); err != nil {
+			return "", newAzureRealtimeError(fasthttp.StatusInternalServerError, "server_error", "failed to encode upstream session body", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		return "", newAzureRealtimeError(fasthttp.StatusInternalServerError, "server_error", "failed to finalize upstream SDP body", err)
+	}
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(upstreamURL)
+	req.Header.SetMethod(http.MethodPost)
+	req.Header.SetContentType(writer.FormDataContentType())
+
+	// Ephemeral tokens (ek_*) need Bearer auth; regular API keys use api-key header.
+	value := key.Value.GetValue()
+	if strings.HasPrefix(value, "ek_") {
+		req.Header.Set("Authorization", "Bearer "+value)
+	} else {
+		authHeaders, authErr := provider.getAzureAuthHeaders(ctx, key, false)
+		if authErr != nil {
+			return "", authErr
+		}
+		for k, v := range authHeaders {
+			req.Header.Set(k, v)
+		}
+	}
+
+	for k, v := range provider.networkConfig.ExtraHeaders {
+		req.Header.Set(k, v.GetValue())
+	}
+	req.SetBody(bodyBuf.Bytes())
+
+	latency, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if bifrostErr != nil {
+		return "", bifrostErr
+	}
+
+	answerBody := resp.Body()
+	if resp.StatusCode() < fasthttp.StatusOK || resp.StatusCode() >= fasthttp.StatusMultipleChoices {
+		return "", providerUtils.SetErrorLatency(provider.realtimeWebRTCUpstreamError(ctx, resp), latency)
+	}
+
+	return string(answerBody), nil
+}
+
+// ---------------------------------------------------------------------------
+// Event conversion — delegates to OpenAI (same wire protocol)
+// ---------------------------------------------------------------------------
+
+func (provider *AzureProvider) ToBifrostRealtimeEvent(providerEvent json.RawMessage) (*schemas.BifrostRealtimeEvent, error) {
+	return openAIEventHelper.ToBifrostRealtimeEvent(providerEvent)
+}
+
+func (provider *AzureProvider) ToProviderRealtimeEvent(bifrostEvent *schemas.BifrostRealtimeEvent) (json.RawMessage, error) {
+	return openAIEventHelper.ToProviderRealtimeEvent(bifrostEvent)
+}
+
+// ---------------------------------------------------------------------------
+// Turn lifecycle — delegates to OpenAI
+// ---------------------------------------------------------------------------
+
+func (provider *AzureProvider) ShouldStartRealtimeTurn(event *schemas.BifrostRealtimeEvent) bool {
+	return openAIEventHelper.ShouldStartRealtimeTurn(event)
+}
+
+func (provider *AzureProvider) RealtimeTurnFinalEvent() schemas.RealtimeEventType {
+	return openAIEventHelper.RealtimeTurnFinalEvent()
+}
+
+func (provider *AzureProvider) ShouldForwardRealtimeEvent(event *schemas.BifrostRealtimeEvent) bool {
+	return true
+}
+
+func (provider *AzureProvider) ShouldAccumulateRealtimeOutput(eventType schemas.RealtimeEventType) bool {
+	return openAIEventHelper.ShouldAccumulateRealtimeOutput(eventType)
+}
+
+func (provider *AzureProvider) RealtimeWebRTCDataChannelLabel() string {
+	return "oai-events"
+}
+
+func (provider *AzureProvider) RealtimeWebSocketSubprotocol() string {
+	return "realtime"
+}
+
+// ---------------------------------------------------------------------------
+// RealtimeUsageExtractor — delegates to OpenAI
+// ---------------------------------------------------------------------------
+
+func (provider *AzureProvider) ExtractRealtimeTurnUsage(terminalEventRaw []byte) *schemas.BifrostLLMUsage {
+	return openAIEventHelper.ExtractRealtimeTurnUsage(terminalEventRaw)
+}
+
+func (provider *AzureProvider) ExtractRealtimeTurnOutput(terminalEventRaw []byte) *schemas.ChatMessage {
+	return openAIEventHelper.ExtractRealtimeTurnOutput(terminalEventRaw)
+}
+
+// ---------------------------------------------------------------------------
+// RealtimeSessionProvider — client_secrets only (not legacy /sessions)
+// ---------------------------------------------------------------------------
+
+func (provider *AzureProvider) CreateRealtimeClientSecret(
+	ctx *schemas.BifrostContext,
+	key schemas.Key,
+	rawRequest json.RawMessage,
+) (*schemas.BifrostPassthroughResponse, *schemas.BifrostError) {
+	if useVoiceLiveEndpoints(ctx, key) {
+		return nil, newAzureVoiceLiveWebSocketOnlyError()
+	}
+	normalizedBody, _, bifrostErr := openaiProvider.NormalizeRealtimeClientSecretRequest(rawRequest, schemas.Azure)
+	if bifrostErr != nil {
+		return nil, bifrostErr
+	}
+
+	endpoint := strings.TrimRight(key.AzureKeyConfig.Endpoint.GetValue(), "/")
+	upstreamURL := fmt.Sprintf("%s/openai/v1/realtime/client_secrets", endpoint)
+
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(upstreamURL)
+	req.Header.SetMethod(http.MethodPost)
+	req.Header.SetContentType("application/json")
+
+	authHeaders, authErr := provider.getAzureAuthHeaders(ctx, key, false)
+	if authErr != nil {
+		return nil, authErr
+	}
+	for k, v := range authHeaders {
+		req.Header.Set(k, v)
+	}
+	for k, v := range provider.networkConfig.ExtraHeaders {
+		req.Header.Set(k, v.GetValue())
+	}
+	req.SetBody(normalizedBody)
+
+	latency, bifrostErr, wait := providerUtils.MakeRequestWithContext(ctx, provider.client, req, resp)
+	defer wait()
+	if bifrostErr != nil {
+		return nil, bifrostErr
+	}
+
+	headers := providerUtils.ExtractProviderResponseHeaders(resp)
+	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, headers)
+
+	if resp.StatusCode() < fasthttp.StatusOK || resp.StatusCode() >= fasthttp.StatusMultipleChoices {
+		return nil, providerUtils.SetErrorLatency(provider.parseRealtimeClientSecretError(ctx, resp), latency)
+	}
+
+	body, err := providerUtils.CheckAndDecodeBody(resp)
+	if err != nil {
+		return nil, providerUtils.NewBifrostOperationError("failed to decode response body", err)
+	}
+
+	out := &schemas.BifrostPassthroughResponse{
+		StatusCode: resp.StatusCode(),
+		Headers:    headers,
+		Body:       body,
+		ExtraFields: schemas.BifrostResponseExtraFields{
+			Latency:                 latency.Milliseconds(),
+			ProviderResponseHeaders: headers,
+		},
+	}
+	if providerUtils.ShouldSendBackRawRequest(ctx, provider.sendBackRawRequest) {
+		providerUtils.ParseAndSetRawRequestIfJSON(req, &out.ExtraFields)
+	}
+
+	return out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+func (provider *AzureProvider) realtimeWebRTCUpstreamError(ctx *schemas.BifrostContext, resp *fasthttp.Response) *schemas.BifrostError {
+	bifrostErr := openaiProvider.ParseOpenAIError(resp)
+	bifrostErr.ExtraFields.RequestType = schemas.RealtimeRequest
+	// The WebRTC SDP exchange bypasses the core orchestrator, so nothing later
+	// populates RoutingInfo on this error. Set the supported field here and keep
+	// the deprecated Provider in sync per its backward-compatibility contract.
+	bifrostErr.ExtraFields.RoutingInfo.Provider = provider.GetProviderKey()
+	bifrostErr.ExtraFields.Provider = provider.GetProviderKey()
+	if !providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		bifrostErr.ExtraFields.RawResponse = nil
+	}
+	providerUtils.ApplyRetryAfter(bifrostErr, &resp.Header)
+	return bifrostErr
+}
+
+// azureRealtimeEndpoint returns the key's Azure endpoint without a trailing slash.
+// A realtime session can arrive with a key that carries only a bearer value and no
+// Azure config (an ephemeral token Bifrost has no mapping for), so a missing or
+// empty endpoint is reported as a client error instead of being dereferenced.
+func azureRealtimeEndpoint(key schemas.Key) (string, *schemas.BifrostError) {
+	if key.AzureKeyConfig == nil {
+		return "", newAzureRealtimeError(fasthttp.StatusBadRequest, "invalid_request_error", "azure realtime requires a configured endpoint", nil)
+	}
+	endpoint := strings.TrimRight(strings.TrimSpace(key.AzureKeyConfig.Endpoint.GetValue()), "/")
+	if endpoint == "" {
+		return "", newAzureRealtimeError(fasthttp.StatusBadRequest, "invalid_request_error", "azure realtime requires a configured endpoint", nil)
+	}
+	return endpoint, nil
+}
+
+func isRealtimeTranscriptionSession(session json.RawMessage) bool {
+	var payload struct {
+		Type string `json:"type"`
+	}
+	return json.Unmarshal(session, &payload) == nil && payload.Type == "transcription"
+}
+
+func newAzureRealtimeError(status int, errorType, message string, err error) *schemas.BifrostError {
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     schemas.Ptr(status),
+		Error: &schemas.ErrorField{
+			Type:    schemas.Ptr(errorType),
+			Message: message,
+		},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType: schemas.RealtimeRequest,
+			Provider:    schemas.Azure,
+		},
+	}
+	if err != nil {
+		bifrostErr.Error.Error = err
+	}
+	return bifrostErr
+}
+
+func (provider *AzureProvider) parseRealtimeClientSecretError(ctx *schemas.BifrostContext, resp *fasthttp.Response) *schemas.BifrostError {
+	body, _ := providerUtils.CheckAndDecodeBody(resp)
+	var parsed struct {
+		Error struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	msg := string(body)
+	if json.Unmarshal(body, &parsed) == nil && parsed.Error.Message != "" {
+		msg = parsed.Error.Message
+	}
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: false,
+		StatusCode:     schemas.Ptr(resp.StatusCode()),
+		Error: &schemas.ErrorField{
+			Type:    schemas.Ptr("upstream_error"),
+			Message: msg,
+		},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType: schemas.RealtimeRequest,
+			Provider:    provider.GetProviderKey(),
+		},
+	}
+	if providerUtils.ShouldSendBackRawResponse(ctx, provider.sendBackRawResponse) {
+		bifrostErr.ExtraFields.RawResponse = map[string]any{
+			"status": resp.StatusCode(),
+			"body":   string(body),
+		}
+	}
+	providerUtils.ApplyRetryAfter(bifrostErr, &resp.Header)
+	return bifrostErr
+}

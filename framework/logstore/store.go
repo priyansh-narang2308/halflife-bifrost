@@ -1,0 +1,316 @@
+package logstore
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/objectstore"
+)
+
+// LogStoreType represents the type of log store.
+type LogStoreType string
+
+// LogStoreTypeSQLite is the type of log store for SQLite.
+const (
+	LogStoreTypeSQLite     LogStoreType = "sqlite"
+	LogStoreTypePostgres   LogStoreType = "postgres"
+	LogStoreTypeClickHouse LogStoreType = "clickhouse"
+)
+
+// CostUpdate is the repriced cost for a single log row, applied in bulk by
+// BulkUpdateCost. It carries the per-category split alongside the total so a
+// reprice keeps the denormalized input/output/additional cost columns in sync
+// with the cost column (they otherwise go stale on recompute). Input + Output +
+// Additional == Total, mirroring schemas.BifrostCost.
+type CostUpdate struct {
+	Total      float64
+	Input      float64
+	Output     float64
+	Additional float64
+}
+
+// CostUpdateFromBreakdown builds a CostUpdate from a cost breakdown, falling back
+// to attributing an unsplit total to the input side (mirrors the SerializeFields
+// reconciliation for opaque provider totals).
+func CostUpdateFromBreakdown(bd *schemas.BifrostCost) CostUpdate {
+	if bd == nil {
+		return CostUpdate{}
+	}
+	u := CostUpdate{
+		Total:      bd.TotalCost,
+		Input:      bd.InputCost,
+		Output:     bd.OutputCost,
+		Additional: bd.AdditionalCost,
+	}
+	if u.Input == 0 && u.Output == 0 && u.Additional == 0 && u.Total > 0 {
+		u.Input = u.Total
+	}
+	return u
+}
+
+// LogStore is the interface for the log store.
+type LogStore interface {
+	// WarpConversationStore is Warp's saved-chat surface. Transcripts live here
+	// rather than in the config store because they are user-generated content
+	// that grows with use, not settings an install depends on.
+	WarpConversationStore
+	// WarpTopicStore is where Warp's topics, and each request's place among
+	// them, are kept. See warptopics.go.
+	WarpTopicStore
+
+	Ping(ctx context.Context) error
+	Create(ctx context.Context, entry *Log) error
+	CreateIfNotExists(ctx context.Context, entry *Log) error
+	BatchCreateIfNotExists(ctx context.Context, entries []*Log) error
+	FindByID(ctx context.Context, id string) (*Log, error)
+	IsLogEntryPresent(ctx context.Context, id string) (bool, error)
+	FindFirst(ctx context.Context, query any, fields ...string) (*Log, error)
+	FindAll(ctx context.Context, query any, fields ...string) ([]*Log, error)
+	FindAllDistinct(ctx context.Context, query any, fields ...string) ([]*Log, error)
+	HasLogs(ctx context.Context) (bool, error)
+	SearchLogs(ctx context.Context, filters SearchFilters, pagination PaginationOptions) (*SearchResult, error)
+	// SearchLogsForBilling is SearchLogs projected for cost recomputation: exactly the
+	// columns pricing reads and nothing else, with each modality payload pulled only
+	// for the request types that bill on it.
+	//
+	// It does NOT hydrate offloaded payloads — that would put every row's payload in
+	// memory at once. Callers walk the result in BillingHydrationChunkSize slices,
+	// calling HydrateBillingChunk and then ReleaseBillingPayloads on each.
+	SearchLogsForBilling(ctx context.Context, filters SearchFilters, pagination PaginationOptions) (*SearchResult, error)
+	// HydrateBillingChunk restores offloaded pricing inputs for a small slice of rows.
+	// It skips rows that already carry everything pricing needs, so a store with
+	// nothing offloaded performs no I/O at all.
+	//
+	// BillingHydrationResult.Unpriceable carries the IDs whose inputs could not be
+	// recovered — for example, a missing object or unavailable object storage. Callers
+	// must skip those rather than price them: the
+	// denormalized fallback usage omits the cache breakdown, and pricing it charges
+	// every cached token at the full input rate. Hydrated carries the IDs actually
+	// fetched, which are the only rows worth passing to BulkBackfillBillingPayloads.
+	//
+	// Pass at most BillingHydrationChunkSize rows and release them before requesting
+	// more; the whole point is to bound how many payloads are resident at once.
+	HydrateBillingChunk(ctx context.Context, logs []*Log) (BillingHydrationResult, error)
+	// BulkBackfillBillingPayloads writes pricing inputs recovered from object storage
+	// back into their rows, so a later recompute reads them from the database instead
+	// of fetching the object again.
+	//
+	// This makes recompute self-healing: the first pass over a window pays the object
+	// fetches, and every pass after it is served entirely from the DB. It is
+	// opportunistic by design — only rows that were actually fetched get backfilled, so
+	// there is no table-wide migration and no scan.
+	//
+	// Callers should treat a failure as non-fatal: the cost update is the job's real
+	// output, and a missed backfill only means the next run fetches again.
+	BulkBackfillBillingPayloads(ctx context.Context, updates map[string]BillingPayloadBackfill) error
+	GetSessionLogs(ctx context.Context, sessionID string, pagination PaginationOptions) (*SessionDetailResult, error)
+	GetSessionSummary(ctx context.Context, sessionID string) (*SessionSummaryResult, error)
+	GetStats(ctx context.Context, filters SearchFilters) (*SearchStats, error)
+	GetHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*HistogramResult, error)
+	GetTokenHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*TokenHistogramResult, error)
+	GetCostHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*CostHistogramResult, error)
+	GetModelHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*ModelHistogramResult, error)
+	GetLatencyHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*LatencyHistogramResult, error)
+	GetProviderCostHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*ProviderCostHistogramResult, error)
+	GetProviderTokenHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*ProviderTokenHistogramResult, error)
+	GetProviderLatencyHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*ProviderLatencyHistogramResult, error)
+	// GetThroughputHistogram returns time-bucketed token-generation throughput (tokens/sec).
+	GetThroughputHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*ThroughputHistogramResult, error)
+	// GetProviderThroughputHistogram returns time-bucketed tokens/sec with provider breakdown.
+	GetProviderThroughputHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64) (*ProviderThroughputHistogramResult, error)
+	GetModelRankings(ctx context.Context, filters SearchFilters) (*ModelRankingResult, error)
+	GetUserRankings(ctx context.Context, filters SearchFilters) (*UserRankingResult, error)
+	// GetUserSpend returns each user's total cost inside the filter window in one
+	// query: no previous-period comparison, no ordering, no row limit. It is the cheap
+	// read for jobs that rank every user by spend.
+	GetUserSpend(ctx context.Context, filters SearchFilters) ([]UserSpendEntry, error)
+	GetDimensionRankings(ctx context.Context, filters SearchFilters, dimension RankingDimension) (*DimensionRankingResult, error)
+	// GetDimensionUsage returns each entity's requests, tokens and cost on a rollup
+	// dimension in one read, attributed exactly as GetDimensionRankings attributes
+	// them. It skips what the rankings add for the dashboard (ordering, row limit,
+	// request totals, the "Other" bucket); with compare set, the same read covers
+	// the previous window and fills each entry's Trend.
+	GetDimensionUsage(ctx context.Context, filters SearchFilters, dimension RankingDimension, compare bool) ([]DimensionUsageEntry, error)
+	// GetDimensionModelUsage returns requests and cost per (entity, model,
+	// provider) on a rollup dimension in one read, for callers that need the model
+	// mix of many entities at once.
+	GetDimensionModelUsage(ctx context.Context, filters SearchFilters, dimension RankingDimension) ([]DimensionModelUsageEntry, error)
+	// GetDimensionCostHistogram returns time-bucketed cost data grouped by the specified dimension (e.g., team_id, customer_id).
+	GetDimensionCostHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64, dimension HistogramDimension) (*DimensionCostHistogramResult, error)
+	// GetDimensionTokenHistogram returns time-bucketed token usage grouped by the specified dimension.
+	GetDimensionTokenHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64, dimension HistogramDimension) (*DimensionTokenHistogramResult, error)
+	// GetDimensionLatencyHistogram returns time-bucketed latency percentiles grouped by the specified dimension.
+	GetDimensionLatencyHistogram(ctx context.Context, filters SearchFilters, bucketSizeSeconds int64, dimension HistogramDimension) (*DimensionLatencyHistogramResult, error)
+	// GetNodeUsageAfter returns cumulative usage for rows after the provided stable
+	// cursor. When the cursor has both timestamp and log ID, rows with the same
+	// timestamp but greater log ID are included to avoid skipping same-timestamp rows.
+	GetNodeUsageAfter(ctx context.Context, nodeID string, cursor NodeUsageCursor) (*NodeUsageAggregate, error)
+	Update(ctx context.Context, id string, entry any) error
+	// BatchUpdate applies the non-zero fields of each entry onto the existing row
+	// with that ID; rows that do not exist are skipped, never inserted.
+	// content_hidden is the exception: it is always written from the entry, since
+	// it carries the request's final visibility decision and must be able to
+	// clear a flag saved earlier.
+	BatchUpdate(ctx context.Context, entries []*Log) error
+	BulkUpdateCost(ctx context.Context, updates map[string]CostUpdate) error
+	Flush(ctx context.Context, since time.Time) error
+	Close(ctx context.Context) error
+	DeleteLog(ctx context.Context, id string) error
+	DeleteLogs(ctx context.Context, ids []string) error
+	DeleteLogsBatch(ctx context.Context, cutoff time.Time, batchSize int) (deletedCount int64, err error)
+
+	CreateUserAgentMapping(ctx context.Context, mapping *UserAgentMapping) error
+	UpdateUserAgentMapping(ctx context.Context, id string, mapping *UserAgentMapping) error
+	DeleteUserAgentMapping(ctx context.Context, id string) error
+	ListUserAgentMappings(ctx context.Context, activeOnly bool) ([]UserAgentMapping, error)
+
+	// Distinct value methods for filter data
+	GetDistinctModels(ctx context.Context, limit int, query string) ([]string, error)
+	GetDistinctAliases(ctx context.Context, limit int, query string) ([]string, error)
+	GetDistinctKeyPairs(ctx context.Context, idCol, nameCol string, limit int, query string) ([]KeyPairResult, error)
+	GetDistinctRoutingEngines(ctx context.Context, limit int, query string) ([]string, error)
+	// GetDistinctToolCallNames returns distinct function names that responses called, for the "Tool calls" filter.
+	GetDistinctToolCallNames(ctx context.Context, limit int, query string) ([]string, error)
+	GetDistinctStopReasons(ctx context.Context, limit int, query string) ([]string, error)
+	// GetDistinctUserAgents returns distinct raw User-Agent strings from logs for the "App" filter.
+	GetDistinctUserAgents(ctx context.Context, limit int, query string) ([]string, error)
+	// GetDistinctApps returns distinct backend-detected app labels from logs.
+	GetDistinctApps(ctx context.Context, limit int, query string) ([]string, error)
+	GetDistinctMetadataKeys(ctx context.Context, limit int, query string) (map[string][]string, error)
+
+	// MCP Tool Log histogram methods
+	GetMCPHistogram(ctx context.Context, filters MCPToolLogSearchFilters, bucketSizeSeconds int64) (*MCPHistogramResult, error)
+	GetMCPCostHistogram(ctx context.Context, filters MCPToolLogSearchFilters, bucketSizeSeconds int64) (*MCPCostHistogramResult, error)
+	GetMCPTopTools(ctx context.Context, filters MCPToolLogSearchFilters, limit int) (*MCPTopToolsResult, error)
+	// GetMCPToolCountsByDimension returns how many distinct tools each user,
+	// team, customer or business unit called, in one read.
+	GetMCPToolCountsByDimension(ctx context.Context, filters MCPToolLogSearchFilters, dimension RankingDimension) (map[string]int, error)
+
+	// MCP Tool Log methods
+	CreateMCPToolLog(ctx context.Context, entry *MCPToolLog) error
+	BatchCreateMCPToolLogsIfNotExists(ctx context.Context, entries []*MCPToolLog) error
+	FindMCPToolLog(ctx context.Context, id string) (*MCPToolLog, error)
+	UpdateMCPToolLog(ctx context.Context, id string, entry any) error
+	SearchMCPToolLogs(ctx context.Context, filters MCPToolLogSearchFilters, pagination PaginationOptions) (*MCPToolLogSearchResult, error)
+	GetMCPToolLogStats(ctx context.Context, filters MCPToolLogSearchFilters) (*MCPToolLogStats, error)
+	HasMCPToolLogs(ctx context.Context) (bool, error)
+	DeleteMCPToolLogs(ctx context.Context, ids []string) error
+	// DeleteMCPToolLogsBatch deletes up to batchSize MCP tool logs older than
+	// cutoff, oldest first, for the retention cleaner (see LogsCleaner).
+	DeleteMCPToolLogsBatch(ctx context.Context, cutoff time.Time, batchSize int) (deletedCount int64, err error)
+	FlushMCPToolLogs(ctx context.Context, since time.Time) error
+	GetAvailableToolNames(ctx context.Context, limit int, query string) ([]string, error)
+	GetAvailableServerLabels(ctx context.Context, limit int, query string) ([]string, error)
+	// GetAvailableMCPUserAgents returns distinct raw User-Agent strings from MCP tool logs for the "App" filter.
+	GetAvailableMCPUserAgents(ctx context.Context, limit int, query string) ([]string, error)
+	// GetAvailableMCPApps returns distinct backend-detected app labels from MCP tool logs.
+	GetAvailableMCPApps(ctx context.Context, limit int, query string) ([]string, error)
+	GetAvailableMCPVirtualKeys(ctx context.Context, limit int, query string) ([]MCPToolLog, error)
+
+	// Agent Gateway log methods.
+	BatchCreateAgentLogsIfNotExists(ctx context.Context, entries []*AgentLog) ([]string, error)
+	// ReconcileAgentCorrelation fills missing task and context IDs from persisted
+	// rows related to the inserted entries. Existing values are never changed.
+	ReconcileAgentCorrelation(ctx context.Context, entries []*AgentLog) error
+	FindAgentLog(ctx context.Context, id string) (*AgentLog, error)
+	FindAgentLogsForDeletion(ctx context.Context, ids []string) ([]*AgentLog, error)
+	ListAgentLogHistory(ctx context.Context, filter AgentLogHistoryFilter, pagination PaginationOptions) (*AgentLogHistoryResult, error)
+	ListAgentLogOperations(ctx context.Context, filter AgentLogHistoryFilter, pagination PaginationOptions) (*AgentLogOperationResult, error)
+	FindAgentLogOperation(ctx context.Context, id string) (*AgentLogOperation, error)
+	GetAgentLogStats(ctx context.Context, filter AgentLogHistoryFilter) (*AgentLogStats, error)
+	GetAgentHistogram(ctx context.Context, filter AgentLogHistoryFilter, bucketSizeSeconds int64) (*AgentHistogramResult, error)
+	GetAgentTopAgents(ctx context.Context, filter AgentLogHistoryFilter, limit int) (*AgentTopAgentsResult, error)
+	GetAgentFilterData(ctx context.Context, dimensions []string, limit int, query string) (*AgentFilterData, error)
+	UpdateAgentLog(ctx context.Context, id string, entry any) error
+	// DeleteAgentLogs deletes the identified rows together with every row sharing
+	// their request IDs, so an operation's correlated stream events never
+	// outlive the aggregate request row shown in the UI.
+	DeleteAgentLogs(ctx context.Context, ids []string) error
+	FlushAgentLogs(ctx context.Context, since time.Time) error
+
+	// Relay log methods (Relay Logs).
+	BatchCreateRelayLogsIfNotExists(ctx context.Context, entries []*RelayLog) ([]string, error)
+	FindRelayLog(ctx context.Context, id string) (*RelayLog, error)
+	FindRelayLogsForDeletion(ctx context.Context, ids []string) ([]*RelayLog, error)
+	UpdateRelayLog(ctx context.Context, id string, updates map[string]any) error
+	SearchRelayLogs(ctx context.Context, filters RelayLogFilters, pagination PaginationOptions) (*RelayLogSearchResult, error)
+	GetRelayLogStats(ctx context.Context, filters RelayLogFilters) (*RelayLogStats, error)
+	GetRelayHistogram(ctx context.Context, filters RelayLogFilters, bucketSizeSeconds int64) (*RelayHistogramResult, error)
+	GetRelayTopEndpoints(ctx context.Context, filters RelayLogFilters, limit int) (*RelayTopResults, error)
+	GetRelayFilterData(ctx context.Context, dimensions []string, limit int, search string) (*RelayFilterData, error)
+	HasRelayLogs(ctx context.Context) (bool, error)
+	DeleteRelayLogs(ctx context.Context, ids []string) error
+	DeleteRelayLogsBatch(ctx context.Context, cutoff time.Time, batchSize int) (int64, error)
+
+	// Async Job methods
+	CreateAsyncJob(ctx context.Context, job *AsyncJob) error
+	FindAsyncJobByID(ctx context.Context, id string) (*AsyncJob, error)
+	UpdateAsyncJob(ctx context.Context, id string, updates map[string]interface{}) error
+	DeleteExpiredAsyncJobs(ctx context.Context) (int64, error)
+	DeleteStaleAsyncJobs(ctx context.Context, staleSince time.Time) (int64, error)
+
+	// Webhook Delivery methods
+	CreateWebhookDelivery(ctx context.Context, delivery *WebhookDelivery) error
+	FindWebhookDeliveryByID(ctx context.Context, id string) (*WebhookDelivery, error)
+	SearchWebhookDeliveries(ctx context.Context, filters *WebhookDeliverySearchFilters, pagination PaginationOptions) (*WebhookDeliverySearchResult, error)
+	DeleteExpiredWebhookDeliveries(ctx context.Context) (int64, error)
+}
+
+// NewLogStore creates a new log store based on the configuration.
+// When ObjectStorage is configured, the returned store is wrapped with a
+// HybridLogStore that offloads payloads to S3-compatible object storage.
+func NewLogStore(ctx context.Context, config *Config, logger schemas.Logger) (LogStore, error) {
+	if config == nil {
+		return nil, fmt.Errorf("logstore: config is nil")
+	}
+
+	var inner LogStore
+	var err error
+
+	switch config.Type {
+	case LogStoreTypeSQLite:
+		if sqliteConfig, ok := config.Config.(*SQLiteConfig); ok {
+			inner, err = newSqliteLogStore(ctx, sqliteConfig, logger)
+		} else {
+			return nil, fmt.Errorf("invalid sqlite config: %T", config.Config)
+		}
+	case LogStoreTypePostgres:
+		if postgresConfig, ok := config.Config.(*PostgresConfig); ok {
+			inner, err = newPostgresLogStore(ctx, postgresConfig, logger)
+		} else {
+			return nil, fmt.Errorf("invalid postgres config: %T", config.Config)
+		}
+	case LogStoreTypeClickHouse:
+		if clickhouseConfig, ok := config.Config.(*ClickHouseConfig); ok {
+			inner, err = newClickHouseLogStore(ctx, clickhouseConfig, config.RetentionDays, logger)
+		} else {
+			return nil, fmt.Errorf("invalid clickhouse config: %T", config.Config)
+		}
+	default:
+		return nil, fmt.Errorf("unsupported log store type: %s", config.Type)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Optionally wrap with hybrid decorator for object storage offloading.
+	if config.ObjectStorage != nil {
+		objStore, objErr := objectstore.NewObjectStore(ctx, config.ObjectStorage, logger)
+		if objErr != nil {
+			_ = inner.Close(ctx)
+			return nil, fmt.Errorf("failed to create object store: %w", objErr)
+		}
+		if err := objStore.Ping(ctx); err != nil {
+			_ = objStore.Close()
+			_ = inner.Close(ctx)
+			return nil, fmt.Errorf("failed to ping object store: %w", err)
+		}
+		hybrid := newHybridLogStore(inner, objStore, config.ObjectStorage.GetPrefix(), logger, config.ObjectStorageExcludeFields, config.ObjectStorageExcludeRequestTypes)
+		hybrid.setObjectFormat(config.ObjectStorage.ResolvedFormat(), config.ObjectStorage.ResolvedCompression())
+		hybrid.singleFormat = config.ObjectStorage.Type == objectstore.StoreTypeGCS // gcs rejects parquet, so no object is ever in the other format
+		return hybrid, nil
+	}
+	return inner, nil
+}

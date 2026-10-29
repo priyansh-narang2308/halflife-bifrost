@@ -1,0 +1,1011 @@
+package mcptests
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	mcpgo "github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
+	core "github.com/maximhq/bifrost/core"
+	"github.com/maximhq/bifrost/core/mcp"
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// =============================================================================
+// SHARED HELPERS
+// =============================================================================
+
+// buildInProcessServer creates a fresh mcp-go server with a deterministic set of
+// tools and returns it. The server is independent of the bifrost-internal server
+// so AddClient flows go through the full connect/list_tools gate.
+func buildInProcessServer(t *testing.T) *server.MCPServer {
+	t.Helper()
+	s := server.NewMCPServer("test-inproc", "1.2.3", server.WithToolCapabilities(true))
+
+	// Tool A — echo
+	echoTool := mcpgo.NewTool("echo",
+		mcpgo.WithDescription("Echo tool"),
+		mcpgo.WithString("message", mcpgo.Required(), mcpgo.Description("message")),
+	)
+	s.AddTool(echoTool, func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		msg, _ := req.GetArguments()["message"].(string)
+		return mcpgo.NewToolResultText(msg), nil
+	})
+
+	// Tool B — adder (separate tool so PostHook filtering tests can drop one and keep the other)
+	addTool := mcpgo.NewTool("add",
+		mcpgo.WithDescription("Adds two numbers"),
+		mcpgo.WithNumber("x", mcpgo.Required(), mcpgo.Description("x")),
+		mcpgo.WithNumber("y", mcpgo.Required(), mcpgo.Description("y")),
+	)
+	s.AddTool(addTool, func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		args := req.GetArguments()
+		x, _ := args["x"].(float64)
+		y, _ := args["y"].(float64)
+		return mcpgo.NewToolResultText(fmt.Sprintf("%v", x+y)), nil
+	})
+
+	return s
+}
+
+// inProcessClientConfig builds a Client config wrapping the given server, ready
+// for AddClient. ID embeds clientName for easy identification in test assertions.
+func inProcessClientConfig(clientName string, s *server.MCPServer) *schemas.MCPClientConfig {
+	return &schemas.MCPClientConfig{
+		ID:              clientName + "-id",
+		Name:            clientName,
+		ConnectionType:  schemas.MCPConnectionTypeInProcess,
+		InProcessServer: s,
+		ToolsToExecute:  []string{"*"},
+	}
+}
+
+// legacyHTTPClientConfig serves s over Streamable HTTP pinned to 2025-11-25, the newest revision
+// that still has ping, and returns a Client config for it.
+func legacyHTTPClientConfig(t *testing.T, clientName string, s *server.MCPServer) *schemas.MCPClientConfig {
+	t.Helper()
+	ts := httptest.NewServer(server.NewStreamableHTTPServer(s, server.WithStreamableHTTPProtocolVersions(mcpgo.ProtocolVersion20251125)))
+	// The client keeps a GET stream open to hear tools/list_changed, and the manager may still be
+	// running when this cleanup fires, so its connections are cut first.
+	t.Cleanup(func() {
+		ts.CloseClientConnections()
+		ts.Close()
+	})
+	return &schemas.MCPClientConfig{
+		ID:               clientName + "-id",
+		Name:             clientName,
+		ConnectionType:   schemas.MCPConnectionTypeHTTP,
+		ConnectionString: schemas.NewSecretVar(ts.URL),
+		ToolsToExecute:   []string{"*"},
+	}
+}
+
+// setupBifrostWithPlugins returns a manager + bifrost where the manager's plugin
+// pipeline is wired to a Bifrost instance carrying the given MCP plugins. Plugins
+// fire for any AddClient performed after this returns.
+func setupBifrostWithPlugins(t *testing.T, plugins []schemas.MCPPlugin) (*mcp.MCPManager, *core.Bifrost) {
+	t.Helper()
+	manager := setupMCPManager(t)
+	bf, err := core.Init(context.Background(), schemas.BifrostConfig{
+		Account:    &testAccount{},
+		MCPPlugins: plugins,
+		Logger:     core.NewDefaultLogger(schemas.LogLevelError),
+	})
+	require.NoError(t, err)
+	bf.SetMCPManager(manager)
+	return manager, bf
+}
+
+// =============================================================================
+// CONNECT HOOK TESTS
+// =============================================================================
+
+func TestConnectHook_FiresOnAddClient(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestConnectPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	cfg := inProcessClientConfig("connect_fires", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	pre := plugin.GetPreHookCalls()
+	post := plugin.GetPostHookCalls()
+	require.Len(t, pre, 1, "Connect PreHook should fire exactly once for AddClient")
+	require.Len(t, post, 1, "Connect PostHook should fire exactly once for AddClient")
+
+	// Verify PreHook saw the right typed sub-request.
+	req := pre[0].ConnectRequest
+	require.NotNil(t, req, "typed Connect captures land in ConnectRequest, not the envelope Request field")
+	assert.Equal(t, "connect_fires", req.ClientName)
+	assert.Equal(t, schemas.MCPConnectionTypeInProcess, req.ConnectionType)
+}
+
+func TestConnectHook_PostHookPopulatesServerInfo(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestConnectPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("server_info", buildInProcessServer(t))))
+
+	post := plugin.GetPostHookCalls()
+	require.Len(t, post, 1)
+	resp := post[0].ConnectResponse
+	require.NotNil(t, resp, "typed Connect captures land in ConnectResponse")
+
+	si := resp.ServerInfo
+	require.NotNil(t, si, "ServerInfo must be populated from initialize handshake")
+	assert.Equal(t, "test-inproc", si.Name)
+	assert.Equal(t, "1.2.3", si.Version)
+	assert.NotEmpty(t, resp.ProtocolVersion)
+	require.NotNil(t, resp.ServerCapabilities)
+	assert.True(t, resp.ServerCapabilities.Tools, "server advertises tool capability")
+
+	// ExtraFields on the typed sub-response carries Latency + ClientName backfill.
+	assert.Greater(t, resp.ExtraFields.Latency, int64(-1), "Latency should be non-negative")
+	assert.Equal(t, "server_info", resp.ExtraFields.ClientName, "ClientName backfilled via PopulateExtraFields")
+
+	// Typed plugins also see ClientName on the captured sub-request.
+	pre := plugin.GetPreHookCalls()
+	require.NotEmpty(t, pre)
+	require.NotNil(t, pre[0].ConnectRequest)
+	assert.Equal(t, "server_info", pre[0].ConnectRequest.ClientName)
+}
+
+func TestConnectHook_PreHookShortCircuitError_FailsAddClient(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestConnectPlugin()
+	plugin.SetShortCircuitError(&schemas.BifrostError{
+		IsBifrostError: false,
+		Error:          &schemas.ErrorField{Message: "blocked by governance"},
+	})
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	err := manager.AddClient(context.Background(), inProcessClientConfig("blocked_client", buildInProcessServer(t)))
+	require.Error(t, err, "Plugin error short-circuit should fail AddClient")
+	assert.Contains(t, err.Error(), "blocked by governance")
+
+	// PostHook should still have fired for the executed PreHook plugins.
+	assert.Len(t, plugin.GetPostHookCalls(), 0, "PostHook only fires on success or recovery; raw error short-circuit yields no response")
+	assert.Len(t, plugin.GetPreHookCalls(), 1, "PreHook ran once before short-circuit")
+
+	// Verify no client was registered.
+	clients := manager.GetClients()
+	for _, c := range clients {
+		assert.NotEqual(t, "blocked_client", c.Name, "no client should be registered after error short-circuit")
+	}
+}
+
+func TestConnectHook_PreHookShortCircuitResponse_RegistersWithEmptyTools(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestConnectPlugin()
+	plugin.SetShortCircuitResponse(&schemas.BifrostMCPConnectResponse{
+		ServerInfo: &schemas.MCPServerInfo{Name: "synthetic_client", Version: "0.0.0"},
+		ConnectionInfo: &schemas.MCPClientConnectionInfo{
+			Type: schemas.MCPConnectionTypeInProcess,
+		},
+	})
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	// AddClient should succeed (no wire dial happens) — documented Connect-success
+	// short-circuit gotcha: client registered as connected with no live transport.
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("synthetic_client", buildInProcessServer(t))))
+
+	clients := manager.GetClients()
+	var found *schemas.MCPClientState
+	for i := range clients {
+		if clients[i].Name == "synthetic_client" {
+			found = &clients[i]
+			break
+		}
+	}
+	require.NotNil(t, found, "client should be registered even with synthetic connect")
+	assert.Empty(t, found.ToolMap, "synthetic-connect client has no tools (list_tools is never called)")
+}
+
+func TestConnectHook_AuthorizationHidden_HeadersAuth(t *testing.T) {
+	t.Parallel()
+
+	// SECURITY: PreHook plugins must NOT see the Authorization header. The connect
+	// gate strips Authorization from headers exposed to plugins and re-injects it
+	// only after all PreHooks have run. Test via MCPAuthTypeHeaders so we don't need
+	// a live OAuth provider.
+	//
+	// We short-circuit after capture so the test doesn't wait on the unreachable
+	// transport retry loop. The strip happens before any PreHook runs, so capturing
+	// the request once is sufficient to prove it.
+	plugin := NewTestConnectPlugin()
+	plugin.SetShortCircuitError(&schemas.BifrostError{
+		IsBifrostError: false,
+		Error:          &schemas.ErrorField{Message: "captured, aborting"},
+	})
+
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	url := *schemas.NewSecretVar("http://example.invalid")
+	cfg := &schemas.MCPClientConfig{
+		ID:               "auth_strip-id",
+		Name:             "auth_strip",
+		ConnectionType:   schemas.MCPConnectionTypeHTTP,
+		ConnectionString: &url,
+		AuthType:         schemas.MCPAuthTypeHeaders,
+		Headers: map[string]schemas.SecretVar{
+			"Authorization": *schemas.NewSecretVar("Bearer super-secret-token"),
+			"X-Custom":      *schemas.NewSecretVar("plugin-visible"),
+		},
+		ToolsToExecute: []string{"*"},
+	}
+	// Short-circuit returns an error → AddClient fails. That's expected.
+	_ = manager.AddClient(context.Background(), cfg)
+
+	calls := plugin.GetPreHookCalls()
+	require.NotEmpty(t, calls, "PreHook should have fired before short-circuit")
+
+	req := calls[0].ConnectRequest
+	require.NotNil(t, req)
+	require.NotNil(t, req.Headers, "Headers should be populated (we set X-Custom)")
+
+	// Authorization must NOT be present in the headers plugins see.
+	_, hasAuth := req.Headers["Authorization"]
+	assert.False(t, hasAuth, "Authorization header must be stripped before PreHooks run")
+	// Verify the secret never appeared anywhere in the visible header values.
+	for k, v := range req.Headers {
+		assert.NotContains(t, v, "super-secret-token",
+			"bearer token should not leak via any header (%q)", k)
+	}
+	// Other user-configured headers should still be visible.
+	assert.Equal(t, "plugin-visible", req.Headers["X-Custom"],
+		"Non-Authorization headers should remain visible to plugins")
+}
+
+func TestConnectHook_OnlyFiresForConnectRequestType(t *testing.T) {
+	t.Parallel()
+
+	// TestConnectPlugin filters by RequestType. Verify it ignores execute-tool flows.
+	connectPlugin := NewTestConnectPlugin()
+	logPlugin := NewTestLoggingPlugin() // captures everything for cross-reference
+	manager, bf := setupBifrostWithPlugins(t, []schemas.MCPPlugin{connectPlugin, logPlugin})
+
+	// Trigger execute-tool path (no connect involved on the bifrost-internal client).
+	require.NoError(t, RegisterEchoTool(manager))
+	echoCall := GetSampleEchoToolCall("filter_test", "hello")
+	_, bifrostErr := bf.ExecuteChatMCPTool(createTestContext(), &echoCall)
+	require.Nil(t, bifrostErr)
+
+	// Connect plugin must not have fired.
+	assert.Empty(t, connectPlugin.GetPreHookCalls(), "Connect plugin should ignore execute-tool requests")
+	assert.Empty(t, connectPlugin.GetPostHookCalls(), "Connect plugin should ignore execute-tool responses")
+	// Logging plugin captures the execute-tool flow (as a cross-check that the test ran).
+	assert.GreaterOrEqual(t, logPlugin.GetPreHookCallCount(), 1)
+}
+
+// =============================================================================
+// LISTTOOLS HOOK TESTS
+// =============================================================================
+
+func TestListToolsHook_FiresOnAddClient(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestListToolsPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("list_fires", buildInProcessServer(t))))
+
+	pre := plugin.GetPreHookCalls()
+	post := plugin.GetPostHookCalls()
+	require.Len(t, pre, 1, "ListTools PreHook should fire once during AddClient (post-init tool retrieval)")
+	require.Len(t, post, 1, "ListTools PostHook should fire once")
+
+	// Verify response shape.
+	resp := post[0].Response
+	require.NotNil(t, resp)
+	require.NotNil(t, resp.BifrostMCPListToolsResponse)
+	assert.Equal(t, 2, resp.RawToolCount, "raw count should reflect both tools (echo + add)")
+	assert.Len(t, resp.Tools, 2, "filtered tools should match (no name violations in this set)")
+	// Tools are prefixed with client name.
+	_, hasEcho := resp.Tools["list_fires-echo"]
+	_, hasAdd := resp.Tools["list_fires-add"]
+	assert.True(t, hasEcho, "echo tool should be present with client prefix")
+	assert.True(t, hasAdd, "add tool should be present with client prefix")
+}
+
+func TestListToolsHook_PostHookFilterAppliedToClientState(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestListToolsPlugin()
+	// Drop the "add" tool; keep "echo".
+	plugin.SetPostHookFilter(func(prefixedName string) bool {
+		return prefixedName == "list_filter-echo"
+	})
+
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("list_filter", buildInProcessServer(t))))
+
+	// Verify the filtered set landed in the manager's stored ToolMap (not just the
+	// gate response). The connect path applies the gate result to clientState.ToolMap.
+	clients := manager.GetClients()
+	var target *schemas.MCPClientState
+	for i := range clients {
+		if clients[i].Name == "list_filter" {
+			target = &clients[i]
+			break
+		}
+	}
+	require.NotNil(t, target)
+	assert.Len(t, target.ToolMap, 1, "PostHook filter should have removed 'add' tool")
+	_, hasEcho := target.ToolMap["list_filter-echo"]
+	_, hasAdd := target.ToolMap["list_filter-add"]
+	assert.True(t, hasEcho, "filtered ToolMap should keep echo")
+	assert.False(t, hasAdd, "filtered ToolMap should drop add")
+}
+
+func TestListToolsHook_PreHookShortCircuitWithSyntheticTools(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestListToolsPlugin()
+	synthetic := &schemas.BifrostMCPListToolsResponse{
+		Tools: map[string]schemas.ChatTool{
+			"synthetic-tool": {
+				Type: schemas.ChatToolTypeFunction,
+				Function: &schemas.ChatToolFunction{
+					Name:        "synthetic-tool",
+					Description: schemas.Ptr("Plugin-injected tool"),
+				},
+			},
+		},
+		ToolNameMapping: map[string]string{"synthetic_tool": "synthetic-tool"},
+	}
+	plugin.SetShortCircuitResponse(synthetic)
+
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("list_synth", buildInProcessServer(t))))
+
+	clients := manager.GetClients()
+	var target *schemas.MCPClientState
+	for i := range clients {
+		if clients[i].Name == "list_synth" {
+			target = &clients[i]
+			break
+		}
+	}
+	require.NotNil(t, target)
+	// The synthetic tool list should have replaced the real server's tools.
+	_, hasSynthetic := target.ToolMap["synthetic-tool"]
+	_, hasEcho := target.ToolMap["list_synth-echo"]
+	assert.True(t, hasSynthetic, "synthetic tool should be in ToolMap from short-circuit")
+	assert.False(t, hasEcho, "real server tools should not appear when PreHook short-circuited")
+}
+
+// TestListToolsHook_InitialListToolsFailure_FailsConnect is the regression test for
+// issue #4314. A transport that connects+initializes but whose initial list_tools call
+// fails (here forced via a plugin error short-circuit) must NOT be registered as
+// Connected with an empty ToolMap. Previously the connect path swallowed the failure
+// and left a sticky "connected but serves zero tools" client that /api/mcp/clients
+// reported as healthy while tools/list returned nothing. The fix treats it as a
+// connection failure so the standard Disconnected + health-monitor reconnect path
+// retries a full connect+list.
+func TestListToolsHook_InitialListToolsFailure_FailsConnect(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestListToolsPlugin()
+	plugin.SetShortCircuitError(&schemas.BifrostError{
+		IsBifrostError: false,
+		Error:          &schemas.ErrorField{Message: "list_tools upstream timeout"},
+	})
+
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	err := manager.AddClient(context.Background(), inProcessClientConfig("list_err", buildInProcessServer(t)))
+	require.Error(t, err, "AddClient must fail when initial list_tools errors")
+	assert.Contains(t, err.Error(), "list_tools upstream timeout")
+
+	// AddClient cleans up the failed entry, so the client must not linger as a
+	// Connected-but-empty entry that would lie to /api/mcp/clients.
+	clientNames := make([]string, 0, len(manager.GetClients()))
+	for _, c := range manager.GetClients() {
+		clientNames = append(clientNames, c.Name)
+	}
+	assert.NotContains(t, clientNames, "list_err", "failed list_tools client must be removed")
+
+	// tools/list (served via GetToolPerClient) must not surface this client's tools.
+	served := manager.GetToolPerClient(context.Background())
+	assert.Empty(t, served["list_err"], "no tools should be served for a client that failed list_tools")
+}
+
+func TestListToolsHook_FiresOnConnectAndAgain(t *testing.T) {
+	t.Parallel()
+
+	// Verifies that re-establishing a connection re-fires the list_tools gate.
+	plugin := NewTestListToolsPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	cfg := inProcessClientConfig("list_reconnect", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+	require.Len(t, plugin.GetPreHookCalls(), 1, "first AddClient should fire list_tools once")
+
+	// Reconnect: this tears down and re-establishes the client, firing list_tools again.
+	require.NoError(t, manager.ReconnectClient(cfg.ID))
+	require.GreaterOrEqual(t, len(plugin.GetPreHookCalls()), 2, "ReconnectClient should re-fire list_tools")
+}
+
+// =============================================================================
+// PING HOOK TESTS
+// =============================================================================
+
+func TestPingHook_FiresViaHealthMonitor(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestPingPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	cfg := legacyHTTPClientConfig(t, "ping_fires", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	// AddClient starts its own connection checker at 10s interval — far too slow for
+	// tests. Spin up a dedicated monitor at 10ms instead.
+	monitor := mcp.NewClientConnectionChecker(manager, cfg.ID, 10*time.Millisecond, true, core.NewDefaultLogger(schemas.LogLevelError))
+	monitor.Start()
+	defer monitor.Stop()
+
+	// Wait for at least a couple of complete tick cycles (both PreHook and PostHook).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if plugin.GetPreHookCallCount() >= 2 && plugin.GetPostHookCallCount() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	preCount := plugin.GetPreHookCallCount()
+	postCount := plugin.GetPostHookCallCount()
+	require.GreaterOrEqual(t, preCount, 2, "Ping PreHook should fire on each health-check tick")
+	require.GreaterOrEqual(t, postCount, 2, "Ping PostHook should fire on each successful ping")
+
+	// Verify request shape.
+	pre := plugin.GetPreHookCalls()
+	for _, e := range pre {
+		assert.Equal(t, schemas.MCPRequestTypePing, e.Request.RequestType)
+		assert.Equal(t, "ping_fires", e.Request.ClientName)
+	}
+}
+
+func TestPingHook_PreHookShortCircuitHealthy(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestPingPlugin()
+	plugin.SetShortCircuitHealthy(true)
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	cfg := legacyHTTPClientConfig(t, "ping_healthy", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	monitor := mcp.NewClientConnectionChecker(manager, cfg.ID, 10*time.Millisecond, true, core.NewDefaultLogger(schemas.LogLevelError))
+	monitor.Start()
+	defer monitor.Stop()
+
+	// Wait for at least two complete cycles (both pre and post).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if plugin.GetPreHookCallCount() >= 2 && plugin.GetPostHookCallCount() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	require.GreaterOrEqual(t, plugin.GetPreHookCallCount(), 2, "PreHook fires even when short-circuiting")
+	// Short-circuited healthy → PostHook still runs with the synthetic response.
+	require.GreaterOrEqual(t, plugin.GetPostHookCallCount(), 2, "PostHook fires for short-circuit success path")
+}
+
+func TestPingHook_PreHookShortCircuitError_DoesNotPanic(t *testing.T) {
+	t.Parallel()
+
+	// Short-circuiting with error is treated by the connection checker as a normal
+	// ping failure. We verify the gate plumbing doesn't blow up and the plugin
+	// got invoked.
+	plugin := NewTestPingPlugin()
+	plugin.SetShortCircuitError(&schemas.BifrostError{
+		IsBifrostError: false,
+		Error:          &schemas.ErrorField{Message: "synthetic ping failure"},
+	})
+
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+	cfg := legacyHTTPClientConfig(t, "ping_err", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	monitor := mcp.NewClientConnectionChecker(manager, cfg.ID, 10*time.Millisecond, true, core.NewDefaultLogger(schemas.LogLevelError))
+	monitor.Start()
+	defer monitor.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if plugin.GetPreHookCallCount() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	require.GreaterOrEqual(t, plugin.GetPreHookCallCount(), 2, "ping plugin fires regardless of short-circuit outcome")
+	// PostHook should NOT have captured anything because our plugin filters out
+	// non-healthy responses, and short-circuit-error skips the success path.
+	assert.Equal(t, 0, plugin.GetPostHookCallCount(), "no healthy ping response captured under error short-circuit")
+}
+
+func TestPingHook_DoesNotFireWhenPingUnavailable(t *testing.T) {
+	t.Parallel()
+
+	// When isPingAvailable=false, connection checker falls back to list_tools as the
+	// liveness probe. Ping hook should NEVER fire; list_tools hook fires instead.
+	pingPlugin := NewTestPingPlugin()
+	listPlugin := NewTestListToolsPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{pingPlugin, listPlugin})
+
+	cfg := inProcessClientConfig("ping_unavailable", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	// Reset the list-tools plugin so we ignore the AddClient-time invocation.
+	listPlugin.Reset()
+
+	monitor := mcp.NewClientConnectionChecker(manager, cfg.ID, 10*time.Millisecond, false, core.NewDefaultLogger(schemas.LogLevelError))
+	monitor.Start()
+	defer monitor.Stop()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if listPlugin.GetPreHookCallCount() >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	assert.Equal(t, 0, pingPlugin.GetPreHookCallCount(), "Ping hook MUST NOT fire when isPingAvailable=false")
+	assert.GreaterOrEqual(t, listPlugin.GetPreHookCallCount(), 2, "list_tools hook fires as liveness fallback")
+}
+
+// TestPingHook_DoesNotFireOnModernUpstream pins that a 2026-07-28 upstream, whose protocol has no
+// ping, is health checked by list_tools alone: no ping runs through the plugin pipeline.
+func TestPingHook_DoesNotFireOnModernUpstream(t *testing.T) {
+	t.Parallel()
+
+	pingPlugin := NewTestPingPlugin()
+	listPlugin := NewTestListToolsPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{pingPlugin, listPlugin})
+
+	cfg := inProcessClientConfig("ping_modern", buildInProcessServer(t))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+	listPlugin.Reset()
+
+	monitor := mcp.NewClientConnectionChecker(manager, cfg.ID, 10*time.Millisecond, true, core.NewDefaultLogger(schemas.LogLevelError))
+	monitor.Start()
+	defer monitor.Stop()
+
+	require.Eventually(t, func() bool { return listPlugin.GetPreHookCallCount() >= 2 }, 2*time.Second, 10*time.Millisecond,
+		"list_tools hook fires as the liveness check")
+	assert.Equal(t, 0, pingPlugin.GetPreHookCallCount(), "no ping for an upstream whose protocol has none")
+}
+
+// =============================================================================
+// CROSS-CUTTING TESTS
+// =============================================================================
+
+func TestMCPGate_AllRequestTypesCarryClientName(t *testing.T) {
+	t.Parallel()
+
+	// Verify ClientName is populated on requests handed to PreMCPHook for all
+	// three op types. Use the generic logging plugin so we see them all.
+	logPlugin := NewTestLoggingPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{logPlugin})
+
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("client_name_test", buildInProcessServer(t))))
+
+	// Force a list_tools via reconnect to make sure we see at least one of each kind.
+	require.NoError(t, manager.ReconnectClient("client_name_test-id"))
+
+	calls := logPlugin.GetPreHookCalls()
+	sawConnect := false
+	sawListTools := false
+	for _, c := range calls {
+		if c.ConnectRequest != nil {
+			// Typed Connect capture
+			assert.Equal(t, "client_name_test", c.ConnectRequest.ClientName,
+				"ClientName must be set on Connect sub-request")
+			sawConnect = true
+			continue
+		}
+		// Envelope capture (Ping / ListTools / ExecuteTool)
+		require.NotNil(t, c.Request)
+		assert.Equal(t, "client_name_test", c.Request.ClientName,
+			"ClientName must be set for %s requests", c.Request.RequestType)
+		if c.Request.RequestType == schemas.MCPRequestTypeListTools {
+			sawListTools = true
+		}
+	}
+	assert.True(t, sawConnect, "should have seen Connect requests via typed pipeline")
+	assert.True(t, sawListTools, "should have seen ListTools requests via envelope pipeline")
+}
+
+func TestMCPGate_NoPluginsConfigured_OpStillRuns(t *testing.T) {
+	t.Parallel()
+
+	// Even with no MCP plugins, the gate must transparently pass through.
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{})
+
+	require.NoError(t, manager.AddClient(context.Background(), inProcessClientConfig("no_plugins", buildInProcessServer(t))))
+
+	clients := manager.GetClients()
+	var found bool
+	for _, c := range clients {
+		if c.Name == "no_plugins" {
+			found = true
+			assert.NotEmpty(t, c.ToolMap, "tools should have been discovered through the gate even without plugins")
+			break
+		}
+	}
+	assert.True(t, found, "client should be registered")
+}
+
+// =============================================================================
+// SERVER INSTRUCTIONS
+// =============================================================================
+//
+// These drive a real MCP initialize handshake rather than a stub, which is the
+// point: the unit tests in core/mcp assert the aggregation given a list of
+// instructions, but they hand that list to the aggregator directly. Nothing
+// there proves the string actually survives the handshake, lands on the client
+// state, and is scoped by the same rules that narrow tools.
+
+// buildInProcessServerWithInstructions mirrors buildInProcessServer but returns
+// the server's own usage guidance from initialize. Empty instructions is a case
+// worth building too: a server that advertises none must contribute no heading.
+func buildInProcessServerWithInstructions(t *testing.T, name, instructions string) *server.MCPServer {
+	t.Helper()
+	s := server.NewMCPServer(name, "1.0.0",
+		server.WithToolCapabilities(true),
+		server.WithInstructions(instructions),
+	)
+	echoTool := mcpgo.NewTool("echo",
+		mcpgo.WithDescription("Echo tool"),
+		mcpgo.WithString("message", mcpgo.Required(), mcpgo.Description("message")),
+	)
+	s.AddTool(echoTool, func(ctx context.Context, req mcpgo.CallToolRequest) (*mcpgo.CallToolResult, error) {
+		msg, _ := req.GetArguments()["message"].(string)
+		return mcpgo.NewToolResultText(msg), nil
+	})
+	return s
+}
+
+// addInstructionsClient registers one in-process client advertising the given
+// instructions and returns nothing — assertions read back through the manager.
+func addInstructionsClient(t *testing.T, manager *mcp.MCPManager, clientName, instructions string) {
+	t.Helper()
+	cfg := inProcessClientConfig(clientName, buildInProcessServerWithInstructions(t, clientName+"-srv", instructions))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+}
+
+func TestConnectHook_PostHookCarriesServerInstructions(t *testing.T) {
+	t.Parallel()
+
+	plugin := NewTestConnectPlugin()
+	manager, _ := setupBifrostWithPlugins(t, []schemas.MCPPlugin{plugin})
+
+	cfg := inProcessClientConfig("instructions_gate",
+		buildInProcessServerWithInstructions(t, "instructions-srv", "Call describe_policy first."))
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	post := plugin.GetPostHookCalls()
+	require.Len(t, post, 1)
+	resp := post[0].ConnectResponse
+	require.NotNil(t, resp)
+	// Sibling of ServerInfo on the wire, not nested inside it.
+	assert.Equal(t, "Call describe_policy first.", resp.Instructions,
+		"PostConnectionHook must observe what the upstream advertised at initialize")
+}
+
+func TestServerInstructions_AggregatedAcrossClientsInNameOrder(t *testing.T) {
+	t.Parallel()
+
+	manager := setupMCPManager(t)
+	// Registered out of order on purpose: the aggregate is sorted by client name,
+	// not by registration or map iteration order.
+	addInstructionsClient(t, manager, "zeta_client", "Zeta rule: never echo secrets.")
+	addInstructionsClient(t, manager, "alpha_client", "Alpha rule: check permissions first.")
+
+	got := manager.GetAggregatedServerInstructions(context.Background())
+
+	assert.Equal(t,
+		"<mcp_server name=\"alpha_client\">\nAlpha rule: check permissions first.\n</mcp_server>\n\n"+
+			"<mcp_server name=\"zeta_client\">\nZeta rule: never echo secrets.\n</mcp_server>",
+		got)
+}
+
+// The security-relevant case, end to end: a caller narrowed to one client must
+// not be handed another client's guidance. Scoping rides on GetToolPerClient, so
+// this pins that the real include-clients path reaches the instructions too.
+func TestServerInstructions_WithheldForClientsTheCallerCannotSee(t *testing.T) {
+	t.Parallel()
+
+	manager := setupMCPManager(t)
+	addInstructionsClient(t, manager, "alpha_client", "Alpha rule: check permissions first.")
+	addInstructionsClient(t, manager, "zeta_client", "Zeta rule: never echo secrets.")
+
+	ctx := context.WithValue(context.Background(), schemas.MCPContextKeyIncludeClients, []string{"alpha_client"})
+	got := manager.GetAggregatedServerInstructions(ctx)
+
+	assert.Contains(t, got, "Alpha rule")
+	assert.NotContains(t, got, "Zeta rule", "a narrowed caller must not read an ungranted server's instructions")
+	assert.NotContains(t, got, "zeta_client", "not even the block tag may leak the server's existence")
+}
+
+// A server advertising none contributes nothing — not a bare heading, and not an
+// empty section that a client would have to special-case.
+func TestServerInstructions_ServerAdvertisingNoneContributesNoHeading(t *testing.T) {
+	t.Parallel()
+
+	manager := setupMCPManager(t)
+	addInstructionsClient(t, manager, "quiet_client", "")
+	addInstructionsClient(t, manager, "loud_client", "Loud rule: say something.")
+
+	got := manager.GetAggregatedServerInstructions(context.Background())
+
+	assert.Equal(t, "<mcp_server name=\"loud_client\">\nLoud rule: say something.\n</mcp_server>", got)
+	assert.NotContains(t, got, "quiet_client")
+}
+
+func TestServerInstructions_EmptyWhenNoClientAdvertisesAny(t *testing.T) {
+	t.Parallel()
+
+	manager := setupMCPManager(t)
+	addInstructionsClient(t, manager, "quiet_one", "")
+	addInstructionsClient(t, manager, "quiet_two", "")
+
+	// Empty, so the gateway renders an absent field rather than an empty one.
+	assert.Equal(t, "", manager.GetAggregatedServerInstructions(context.Background()))
+}
+
+// An edit to any field must not quietly drop the client's own instruction cap:
+// UpdateClient rebuilds ExecutionConfig field by field, so a field missing from
+// that literal reverts to the global default in memory while the DB row keeps
+// the override.
+func TestServerInstructions_PerClientCapSurvivesClientUpdate(t *testing.T) {
+	t.Parallel()
+
+	manager := setupMCPManager(t)
+
+	// Longer than the cap below, shorter than the global default, so only the
+	// per-client override can produce a truncation.
+	instructions := strings.Repeat("Rule: check permissions first. ", 8)
+	cfg := inProcessClientConfig("capped_client", buildInProcessServerWithInstructions(t, "capped-srv", instructions))
+	cfg.MaxInstructionsLength = 40
+	require.NoError(t, manager.AddClient(context.Background(), cfg))
+
+	require.Contains(t, manager.GetAggregatedServerInstructions(context.Background()), "[truncated:",
+		"per-client cap should apply before any update")
+
+	// Mirrors the update handler, which resends the cap alongside the edit.
+	updated := *cfg
+	updated.ToolsToExecute = []string{"echo"}
+	require.NoError(t, manager.UpdateClient(cfg.ID, &updated))
+
+	assert.Contains(t, manager.GetAggregatedServerInstructions(context.Background()), "[truncated:",
+		"per-client cap must survive an unrelated edit")
+}
+
+// startInstructionsServer launches one examples/mcps/instructions-test-server
+// process advertising the given name and instructions, and returns its /mcp URL.
+// Skips the calling test when the fixture has not been built, matching how the
+// other binary-backed fixtures here behave (see remoteserver_test.go).
+func startInstructionsServer(t *testing.T, name, instructions string) string {
+	t.Helper()
+
+	root, err := bifrostRootDir()
+	require.NoError(t, err)
+	bin := filepath.Join(root, "..", "examples", "mcps", "instructions-test-server", "bin", "instructions-test-server")
+	if _, statErr := os.Stat(bin); statErr != nil {
+		t.Skip("instructions-test-server not built (run `make setup-mcp-tests`)")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	port, err := freePort(ctx)
+	if err != nil {
+		cancel()
+		t.Fatalf("allocate port: %v", err)
+	}
+
+	cmd := exec.CommandContext(ctx, bin)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("MCP_HTTP_PORT=%d", port),
+		fmt.Sprintf("MCP_SERVER_NAME=%s", name),
+		// Set explicitly even when empty: the fixture treats an unset variable as
+		// "use the default text" and an empty one as "advertise nothing".
+		fmt.Sprintf("MCP_INSTRUCTIONS=%s", instructions),
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		cancel()
+		t.Fatalf("start instructions-test-server: %v", err)
+	}
+	t.Cleanup(func() {
+		cancel()
+		_ = cmd.Process.Kill()
+		_, _ = cmd.Process.Wait()
+	})
+
+	if err := waitForPort(ctx, port, 10*time.Second); err != nil {
+		t.Fatalf("instructions-test-server port %d never came up: %v", port, err)
+	}
+	return fmt.Sprintf("http://localhost:%d/mcp", port)
+}
+
+// TestServerInstructions_OverHTTPTransport is the one case here that crosses a
+// real network transport and a real server process, rather than an in-process
+// handshake. It is also what keeps examples/mcps/instructions-test-server honest:
+// without it that fixture is only ever run by hand.
+func TestServerInstructions_OverHTTPTransport(t *testing.T) {
+	t.Parallel()
+
+	alphaURL := startInstructionsServer(t, "alpha", "Alpha rule: check permissions first.")
+	betaURL := startInstructionsServer(t, "beta", "Beta rule: never echo secrets.")
+
+	alphaCfg := GetSampleHTTPClientConfig(alphaURL)
+	alphaCfg.ID, alphaCfg.Name = "http_alpha_id", "http_alpha"
+	betaCfg := GetSampleHTTPClientConfig(betaURL)
+	betaCfg.ID, betaCfg.Name = "http_beta_id", "http_beta"
+
+	manager := setupMCPManager(t, alphaCfg, betaCfg)
+
+	got := manager.GetAggregatedServerInstructions(context.Background())
+	assert.Equal(t,
+		"<mcp_server name=\"http_alpha\">\nAlpha rule: check permissions first.\n</mcp_server>\n\n"+
+			"<mcp_server name=\"http_beta\">\nBeta rule: never echo secrets.\n</mcp_server>",
+		got, "instructions must survive the HTTP initialize handshake and aggregate in name order")
+
+	// Same scoping guarantee as the in-process case, across the real transport.
+	scoped := manager.GetAggregatedServerInstructions(
+		context.WithValue(context.Background(), schemas.MCPContextKeyIncludeClients, []string{"http_alpha"}))
+	assert.Contains(t, scoped, "Alpha rule")
+	assert.NotContains(t, scoped, "Beta rule")
+}
+
+// Instructions ride alongside tools from the same handshake, so a server that advertises them
+// must still list and execute its tools normally. This pins that the capture path did not
+// disturb discovery or execution — the failure mode would be a server whose guidance arrives
+// but whose tools do not.
+func TestServerInstructions_DoNotDisturbToolDiscoveryOrExecution(t *testing.T) {
+	t.Parallel()
+
+	manager := setupMCPManager(t)
+	addInstructionsClient(t, manager, "talkative", "Talkative rule: echo politely.")
+
+	bf := setupBifrost(t)
+	bf.SetMCPManager(manager)
+	ctx := createTestContext()
+
+	// The instructions are captured...
+	require.Contains(t, manager.GetAggregatedServerInstructions(ctx), "Talkative rule")
+
+	// ...and the same client's tool is still discoverable...
+	var found bool
+	for _, tool := range manager.GetAvailableTools(ctx) {
+		if tool.Function != nil && tool.Function.Name == "talkative-echo" {
+			found = true
+		}
+	}
+	require.True(t, found, "a client advertising instructions must still publish its tools")
+
+	// ...and still executes.
+	name := "talkative-echo"
+	id := "call-1"
+	typ := "function"
+	result, bifrostErr := bf.ExecuteChatMCPTool(ctx, &schemas.ChatAssistantMessageToolCall{
+		ID: &id, Type: &typ,
+		Function: schemas.ChatAssistantMessageToolCallFunction{
+			Name: &name, Arguments: `{"message":"LOOPCHECK"}`,
+		},
+	})
+	require.Nil(t, bifrostErr, "tool execution should succeed alongside instructions")
+	require.NotNil(t, result)
+	require.NotNil(t, result.Content)
+	require.NotNil(t, result.Content.ContentStr)
+	assert.Contains(t, *result.Content.ContentStr, "LOOPCHECK")
+}
+
+// setUpstreamInstructions changes what the fixture's next handshake returns.
+func setUpstreamInstructions(t *testing.T, mcpURL, text string) {
+	t.Helper()
+	controlURL := strings.TrimSuffix(mcpURL, "/mcp") + "/set-instructions"
+	// Bounded so a stalled fixture handler fails this one test instead of hanging the
+	// package until the outer go test timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, controlURL, strings.NewReader(text))
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+}
+
+// The regression test for the bug this path exists to fix: RefreshClientTools is the
+// operator's "pick up what I changed upstream", and for a sticky client it re-lists
+// tools over the live connection — which cannot carry `instructions`. Before the fix
+// it refreshed only half of what it had rediscovered, silently.
+func TestRefreshClientTools_PicksUpChangedInstructions(t *testing.T) {
+	t.Parallel()
+
+	url := startInstructionsServer(t, "sticky", "Original rule: check permissions first.")
+	cfg := GetSampleHTTPClientConfig(url)
+	cfg.ID, cfg.Name = "sticky_id", "sticky"
+	manager := setupMCPManager(t, cfg)
+	ctx := createTestContext()
+
+	require.Contains(t, manager.GetAggregatedServerInstructions(ctx), "Original rule")
+
+	// The upstream edits its instructions in place — no restart, so Bifrost's
+	// connection survives and nothing tells it anything changed.
+	setUpstreamInstructions(t, url, "Revised rule: never echo secrets.")
+
+	// Tools are unchanged, so a tools-only refresh would report success and leave the
+	// stale text in place. That is exactly the failure this pins.
+	_, err := manager.RefreshClientTools(ctx, cfg.ID)
+	require.NoError(t, err)
+
+	got := manager.GetAggregatedServerInstructions(ctx)
+	assert.Contains(t, got, "Revised rule: never echo secrets.")
+	assert.NotContains(t, got, "Original rule")
+}
+
+// The same refresh must leave a client whose upstream did not change untouched, so
+// the persist seam and the hosted /mcp resync are not re-triggered on every press.
+func TestRefreshClientTools_UnchangedInstructionsStayPut(t *testing.T) {
+	t.Parallel()
+
+	url := startInstructionsServer(t, "steady", "Steady rule: nothing changes.")
+	cfg := GetSampleHTTPClientConfig(url)
+	cfg.ID, cfg.Name = "steady_id", "steady"
+	manager := setupMCPManager(t, cfg)
+	ctx := createTestContext()
+
+	before := manager.GetAggregatedServerInstructions(ctx)
+	_, err := manager.RefreshClientTools(ctx, cfg.ID)
+	require.NoError(t, err)
+
+	assert.Equal(t, before, manager.GetAggregatedServerInstructions(ctx))
+}
+
+// RefreshMCPClientTools is advertised as working across every client type, but the
+// refresh tests above all run over HTTP. STDIO takes a different path — a child process
+// and a pipe rather than a socket — so it is worth pinning that an on-demand refresh
+// there returns the tool set rather than erroring or emptying it.
+func TestRefreshClientTools_WorksOverSTDIO(t *testing.T) {
+	t.Parallel()
+
+	InitMCPServerPaths(t)
+	cfg := GetGoTestServerConfig(GetBifrostRoot(t))
+	manager := setupMCPManager(t, cfg)
+	ctx := createTestContext()
+
+	before := manager.GetToolPerClient(ctx)[cfg.Name]
+	require.NotEmpty(t, before, "STDIO client should expose tools before the refresh")
+
+	count, err := manager.RefreshClientTools(ctx, cfg.ID)
+	require.NoError(t, err, "refresh must work for a STDIO client")
+	assert.Positive(t, count, "refresh should report the rediscovered tools")
+
+	// An upstream that did not change must come back with the same tool set: a refresh
+	// that quietly emptied it would leave the client connected but useless.
+	assert.Len(t, manager.GetToolPerClient(ctx)[cfg.Name], len(before),
+		"refresh must not drop tools for an unchanged STDIO upstream")
+}

@@ -1,0 +1,340 @@
+import { APIRequestContext, APIResponse } from '@playwright/test'
+
+/**
+ * API helper functions for test setup and cleanup
+ */
+
+const API_BASE = '/api'
+
+/**
+ * Handle API response with error checking
+ */
+async function handleResponse<T>(response: APIResponse, operation: string): Promise<T> {
+  if (!response.ok()) {
+    throw new Error(`${operation} failed: ${response.status()} ${response.statusText()}`)
+  }
+  return response.json() as Promise<T>
+}
+
+/**
+ * Provider API helpers
+ */
+export const providersApi = {
+  /**
+   * Get all providers
+   */
+  async getAll(request: APIRequestContext) {
+    const response = await request.get(`${API_BASE}/providers`)
+    return handleResponse(response, 'Get all providers')
+  },
+
+  /**
+   * Get a specific provider
+   */
+  async get(request: APIRequestContext, name: string) {
+    const response = await request.get(`${API_BASE}/providers/${name}`)
+    return handleResponse(response, `Get provider ${name}`)
+  },
+
+  /**
+   * Create a provider
+   */
+  async create(request: APIRequestContext, data: unknown) {
+    const response = await request.post(`${API_BASE}/providers`, {
+      data,
+    })
+    return handleResponse(response, 'Create provider')
+  },
+
+  /**
+   * Update a provider
+   */
+  async update(request: APIRequestContext, name: string, data: unknown) {
+    const response = await request.put(`${API_BASE}/providers/${name}`, {
+      data,
+    })
+    return handleResponse(response, `Update provider ${name}`)
+  },
+
+  /**
+   * Delete a provider
+   */
+  async delete(request: APIRequestContext, name: string) {
+    const response = await request.delete(`${API_BASE}/providers/${name}`)
+    return response.ok()
+  },
+}
+
+/**
+ * Virtual Keys API helpers
+ */
+export const virtualKeysApi = {
+  /**
+   * Get all virtual keys
+   */
+  async getAll(request: APIRequestContext) {
+    const response = await request.get(`${API_BASE}/governance/virtual-keys`)
+    return handleResponse(response, 'Get all virtual keys')
+  },
+
+  /**
+   * Get a specific virtual key
+   */
+  async get(request: APIRequestContext, id: string) {
+    const response = await request.get(`${API_BASE}/governance/virtual-keys/${id}`)
+    return handleResponse(response, `Get virtual key ${id}`)
+  },
+
+  /**
+   * Create a virtual key
+   */
+  async create(request: APIRequestContext, data: unknown) {
+    const response = await request.post(`${API_BASE}/governance/virtual-keys`, {
+      data,
+    })
+    return handleResponse(response, 'Create virtual key')
+  },
+
+  /**
+   * Update a virtual key
+   */
+  async update(request: APIRequestContext, id: string, data: unknown) {
+    const response = await request.put(`${API_BASE}/governance/virtual-keys/${id}`, {
+      data,
+    })
+    return handleResponse(response, `Update virtual key ${id}`)
+  },
+
+  /**
+   * Rotate a virtual key value
+   */
+  async rotate(request: APIRequestContext, id: string) {
+    const response = await request.post(`${API_BASE}/governance/virtual-keys/${id}/rotate`)
+    return handleResponse(response, `Rotate virtual key ${id}`)
+  },
+
+  /**
+   * Rotate multiple virtual key values
+   */
+  async bulkRotate(request: APIRequestContext, ids: string[]) {
+    const response = await request.post(`${API_BASE}/governance/virtual-keys/rotate`, {
+      data: { ids },
+    })
+    return handleResponse(response, 'Bulk rotate virtual keys')
+  },
+
+  /**
+   * Delete a virtual key
+   */
+  async delete(request: APIRequestContext, id: string) {
+    const response = await request.delete(`${API_BASE}/governance/virtual-keys/${id}`)
+    return response.ok()
+  },
+}
+
+/**
+ * Dashboard admin credentials as GET /api/config returns them. The password comes back
+ * redacted; sending that placeholder back in a PUT keeps the stored password.
+ */
+export interface DashboardAuthConfig {
+  admin_username: { value?: string; ref?: string; type?: string }
+  admin_password: { value?: string; ref?: string; type?: string }
+  is_enabled: boolean
+}
+
+/**
+ * Core config API helpers
+ */
+export const coreConfigApi = {
+  /**
+   * Get the core config as stored in the DB. auth_config is absent until the first admin
+   * account has been created.
+   */
+  async get(request: APIRequestContext) {
+    const response = await request.get(`${API_BASE}/config?from_db=true`)
+    return handleResponse<{ client_config: Record<string, unknown>; auth_config?: DashboardAuthConfig }>(
+      response,
+      'Get core config'
+    )
+  },
+
+  /**
+   * Switch dashboard auth on or off while keeping the stored admin credentials.
+   *
+   * The whole current config is sent back because PUT /api/config treats a missing
+   * client_config as all-zero values. While auth is off the request is not
+   * authenticated, so turning auth back on (or changing the credentials) must carry
+   * `currentPassword` (the stored admin password) or a setup token; the server answers
+   * 403 otherwise.
+   */
+  async setDashboardAuthEnabled(
+    request: APIRequestContext,
+    enabled: boolean,
+    proof: { currentPassword?: string; setupToken?: string } = {}
+  ) {
+    const current = await coreConfigApi.get(request)
+    if (!current.auth_config) {
+      throw new Error('Set dashboard auth failed: no admin account is stored on this instance')
+    }
+    const response = await request.put(`${API_BASE}/config`, {
+      data: {
+        ...current,
+        auth_config: {
+          admin_username: current.auth_config.admin_username,
+          admin_password: current.auth_config.admin_password,
+          is_enabled: enabled,
+          ...(proof.currentPassword ? { current_password: proof.currentPassword } : {}),
+          ...(proof.setupToken ? { setup_token: proof.setupToken } : {}),
+        },
+      },
+    })
+    return handleResponse(response, `Set dashboard auth ${enabled ? 'on' : 'off'}`)
+  },
+
+  /**
+   * Update client config fields, sending the current config back with the changes applied
+   */
+  async updateClientConfig(request: APIRequestContext, changes: Record<string, unknown>) {
+    const current = await coreConfigApi.get(request)
+    const response = await request.put(`${API_BASE}/config`, {
+      data: { client_config: { ...current.client_config, ...changes } },
+    })
+    return handleResponse(response, 'Update core config')
+  },
+}
+
+/**
+ * Teams API helpers
+ */
+export const teamsApi = {
+  /**
+   * Get all teams
+   */
+  async getAll(request: APIRequestContext) {
+    const response = await request.get(`${API_BASE}/governance/teams`)
+    return handleResponse(response, 'Get all teams')
+  },
+
+  /**
+   * Create a team
+   */
+  async create(request: APIRequestContext, data: unknown) {
+    const response = await request.post(`${API_BASE}/governance/teams`, {
+      data,
+    })
+    return handleResponse(response, 'Create team')
+  },
+
+  /**
+   * Delete a team
+   */
+  async delete(request: APIRequestContext, id: string) {
+    const response = await request.delete(`${API_BASE}/governance/teams/${id}`)
+    return response.ok()
+  },
+}
+
+/**
+ * Customers API helpers
+ */
+export const customersApi = {
+  /**
+   * Get all customers
+   */
+  async getAll(request: APIRequestContext) {
+    const response = await request.get(`${API_BASE}/governance/customers`)
+    return handleResponse(response, 'Get all customers')
+  },
+
+  /**
+   * Create a customer
+   */
+  async create(request: APIRequestContext, data: unknown) {
+    const response = await request.post(`${API_BASE}/governance/customers`, {
+      data,
+    })
+    return handleResponse(response, 'Create customer')
+  },
+
+  /**
+   * Delete a customer
+   */
+  async delete(request: APIRequestContext, id: string) {
+    const response = await request.delete(`${API_BASE}/governance/customers/${id}`)
+    return response.ok()
+  },
+}
+
+/**
+ * Feature flag API helpers
+ */
+export const featureFlagsApi = {
+  /**
+   * Get all feature flags
+   */
+  async getAll(request: APIRequestContext) {
+    const response = await request.get(`${API_BASE}/feature-flags`)
+    return handleResponse<{ flags: { id: string; enabled: boolean }[] }>(response, 'Get feature flags')
+  },
+
+  /**
+   * Turn a feature flag on or off
+   */
+  async set(request: APIRequestContext, id: string, enabled: boolean) {
+    const response = await request.put(`${API_BASE}/feature-flags/${id}`, {
+      data: { enabled },
+    })
+    return handleResponse(response, `Set feature flag ${id}`)
+  },
+}
+
+/**
+ * Cleanup helper - delete all test data
+ */
+export async function cleanupTestData(
+  request: APIRequestContext,
+  options: {
+    virtualKeyIds?: string[]
+    teamIds?: string[]
+    customerIds?: string[]
+    providerNames?: string[]
+  }
+): Promise<void> {
+  const { virtualKeyIds = [], teamIds = [], customerIds = [], providerNames = [] } = options
+
+  // Delete virtual keys first (they may depend on teams/customers)
+  for (const id of virtualKeyIds) {
+    try {
+      await virtualKeysApi.delete(request, id)
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+  }
+
+  // Delete teams
+  for (const id of teamIds) {
+    try {
+      await teamsApi.delete(request, id)
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+  }
+
+  // Delete customers
+  for (const id of customerIds) {
+    try {
+      await customersApi.delete(request, id)
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+  }
+
+  // Delete custom providers
+  for (const name of providerNames) {
+    try {
+      await providersApi.delete(request, name)
+    } catch (e) {
+      // Ignore errors during cleanup
+    }
+  }
+}

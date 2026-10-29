@@ -1,0 +1,145 @@
+import { describe, expect, it } from "vitest";
+import { renderToStaticMarkup } from "react-dom/server";
+import { createTable, flexRender, getCoreRowModel } from "@tanstack/react-table";
+
+import type { LogEntry } from "@/lib/types/logs";
+
+import { createColumns, getMessage } from "./columns";
+
+describe("metadata cells", () => {
+	it.each([
+		[[{ id: "item_audio", index: 0 }], "item_audio"],
+		[{ nested: { id: "item_audio" } }, "nested"],
+		[false, "false"],
+		[0, "0"],
+		["custom value", "custom value"],
+		[null, "-"],
+		[undefined, "-"],
+	])("renders JSON metadata safely: %j", (value, expected) => {
+		const log = { id: "log", metadata: { realtime_input_items: value } } as unknown as LogEntry;
+		const table = createTable({
+			data: [log],
+			columns: createColumns(() => {}, false, ["realtime_input_items"]),
+			getCoreRowModel: getCoreRowModel(),
+			state: {},
+			onStateChange: () => {},
+			renderFallbackValue: null,
+		});
+		const cell = table
+			.getRowModel()
+			.rows[0].getAllCells()
+			.find((cell) => cell.column.id === "metadata_realtime_input_items")!;
+		expect(renderToStaticMarkup(flexRender(cell.column.columnDef.cell, cell.getContext()))).toContain(expected);
+	});
+});
+
+describe("getMessage", () => {
+	it("shows N/A for a successful model retrieve, which has no message body", () => {
+		const log = { object: "model_retrieve", status: "success" } as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe("N/A");
+	});
+
+	it("keeps the error summary for a failed model retrieve", () => {
+		const log = {
+			object: "model_retrieve",
+			status: "error",
+			content_summary: "invalid model: path delimiters and percent-encoding are not allowed",
+		} as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe("invalid model: path delimiters and percent-encoding are not allowed");
+	});
+
+	it("returns EI realtime text from input history", () => {
+		const log = {
+			object: "realtime.turn",
+			input_history: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "hello from the browser" }],
+				},
+			],
+		} as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe("User: hello from the browser");
+	});
+
+	it("returns LM realtime text from output message", () => {
+		const log = {
+			object: "realtime.turn",
+			input_history: [],
+			responses_input_history: [],
+			output_message: {
+				role: "assistant",
+				content: [{ type: "text", text: "hello from the model" }],
+			},
+		} as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe("Assistant: hello from the model");
+	});
+
+	it("returns split realtime text when both user and assistant are present", () => {
+		const log = {
+			object: "realtime.turn",
+			input_history: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "who are you?" }],
+				},
+			],
+			output_message: {
+				role: "assistant",
+				content: [{ type: "text", text: "I am the assistant." }],
+			},
+		} as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe("User: who are you?\nAssistant: I am the assistant.");
+	});
+
+	it("returns split realtime text including tool output", () => {
+		const log = {
+			object: "realtime.turn",
+			input_history: [
+				{
+					role: "tool",
+					content: [{ type: "text", text: '{"nextResponse":"tool result"}' }],
+				},
+				{
+					role: "user",
+					content: [{ type: "text", text: "who are you?" }],
+				},
+			],
+			output_message: {
+				role: "assistant",
+				content: [{ type: "text", text: "I am the assistant." }],
+			},
+		} as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe('Tool Result: {"nextResponse":"tool result"}\nUser: who are you?\nAssistant: I am the assistant.');
+	});
+
+	it("returns realtime assistant tool calls from output message", () => {
+		const log = {
+			object: "realtime.turn",
+			input_history: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "show me a pastel palette" }],
+				},
+			],
+			output_message: {
+				role: "assistant",
+				tool_calls: [
+					{
+						function: {
+							name: "display_color_palette",
+							arguments: '{"theme":"pastel"}',
+						},
+					},
+				],
+			},
+		} as unknown as LogEntry;
+
+		expect(getMessage(log)).toBe('User: show me a pastel palette\nAssistant Tool Call: display_color_palette({"theme":"pastel"})');
+	});
+});

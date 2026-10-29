@@ -1,0 +1,73 @@
+name: Workflow Lint
+
+# Guards on the workflow definitions themselves. These run on pull requests because
+# that is the only point they CAN run: release-pipeline.yml triggers on push to main,
+# so a job added there with a broken egress allowlist would first execute during a
+# real release, with the release riding on it.
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/**"
+      - "**/go.mod"
+      - "**/version"
+
+permissions:
+  contents: read
+
+jobs:
+  check-egress-allowlist:
+    name: Egress allowlist covers apt + provider-harness hosts
+    # Pull requests from outside contributors (forks, or authors who are not members
+    # or owners of maximhq) cannot get a runner until @maximhq/bifrost-admin approves
+    # the run through Review deployments. Everyone else lands on ci-trusted-branch,
+    # an environment with no protection rules that only gives the job a name.
+    environment: ${{ github.event_name == 'pull_request' && (github.event.pull_request.head.repo.fork || !contains(fromJSON('["OWNER","MEMBER"]'), github.event.pull_request.author_association)) && 'pr-testing' || 'ci-trusted-branch' }}
+    runs-on: builder-8-32
+    timeout-minutes: 5
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@fe104658747b27e96e4f7e80cd0a94068e53901d # v2.16.1
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            pypi.org:443
+            release-assets.githubusercontent.com:443
+
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # PyYAML only - deliberately no apt-get here, so this job needs no Ubuntu
+      # mirror access and stays outside the very rule it enforces.
+      #
+      # --require-hashes against a checked-in pin: an unpinned `pip install pyyaml`
+      # takes whatever the index serves at run time, which is what Scorecard's
+      # Pinned-Dependencies check flags. pip verifies every downloaded artifact
+      # against requirements/pyyaml.txt and fails closed on a mismatch.
+      - name: Install PyYAML
+        run: |
+          python3 -m pip install --user --disable-pip-version-check \
+            --require-hashes -r .github/workflows/requirements/pyyaml.txt
+
+      - name: Check egress allowlists
+        run: ./.github/workflows/scripts/check-egress-allowlist.sh
+
+      - name: Check version-format guard
+        run: ./.github/workflows/scripts/version-format.test.sh
+
+      - name: Check module path major versions
+        run: ./.github/workflows/scripts/module-major.test.sh
+
+      - name: Check test-ref resolver
+        run: ./.github/workflows/scripts/resolve-test-ref.test.sh
+
+      - name: Check Docker Compose installer
+        run: bash ./.github/workflows/scripts/install-docker-compose.test.sh
+
+      - name: Check arm64 runner dependency installer
+        run: bash ./.github/workflows/scripts/install-arm64-runner-deps.test.sh
+
+      - name: Check apt HTTPS source rewriter
+        run: bash ./.github/workflows/scripts/apt-sources-https.test.sh

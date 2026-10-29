@@ -1,0 +1,190 @@
+package huggingface
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/bytedance/sonic"
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+	"github.com/maximhq/bifrost/core/schemas"
+)
+
+// ToHuggingFaceEmbeddingRequest converts a Bifrost embedding request to HuggingFace format
+func ToHuggingFaceEmbeddingRequest(bifrostReq *schemas.BifrostEmbeddingRequest) (*HuggingFaceEmbeddingRequest, error) {
+	if bifrostReq == nil {
+		return nil, nil
+	}
+
+	inferenceProvider, modelName, nameErr := splitIntoModelProvider(bifrostReq.Model)
+	if nameErr != nil {
+		return nil, nameErr
+	}
+
+	var hfReq *HuggingFaceEmbeddingRequest
+	if inferenceProvider != hfInference {
+		hfReq = &HuggingFaceEmbeddingRequest{
+			Model:    schemas.Ptr(modelName),
+			Provider: schemas.Ptr(string(inferenceProvider)),
+		}
+	} else {
+		hfReq = &HuggingFaceEmbeddingRequest{}
+	}
+
+	if err := schemas.EmbeddingInput(bifrostReq.Input).RejectPerItemParams(); err != nil {
+		return nil, providerUtils.InvalidRequestErrorf("%s", err)
+	}
+
+	if len(bifrostReq.Input) > 0 {
+		contents := schemas.EmbeddingInput(bifrostReq.Input).Contents()
+		var input InputsCustomType
+
+		if len(contents) == 1 {
+			// Single content: extract text from the single entry
+			text, err := extractTextFromContent(contents[0])
+			if err != nil {
+				return nil, err
+			}
+			input = InputsCustomType{Text: &text}
+		} else {
+			// Batch: extract text from each content entry
+			texts := make([]string, 0, len(contents))
+			for _, content := range contents {
+				text, err := extractTextFromContent(content)
+				if err != nil {
+					return nil, err
+				}
+				texts = append(texts, text)
+			}
+			input = InputsCustomType{Texts: texts}
+		}
+
+		if inferenceProvider == hfInference {
+			hfReq.Inputs = &input
+		} else {
+			hfReq.Input = &input
+		}
+	}
+
+	if bifrostReq.Params != nil {
+		params := bifrostReq.Params
+
+		if params.EncodingFormat != nil {
+			encodingType := EncodingType(*params.EncodingFormat)
+			hfReq.EncodingFormat = &encodingType
+		}
+		if params.Dimensions != nil {
+			hfReq.Dimensions = params.Dimensions
+		}
+
+		if params.ExtraParams != nil {
+			if normalize, ok := params.ExtraParams["normalize"].(bool); ok {
+				delete(params.ExtraParams, "normalize")
+				hfReq.Normalize = &normalize
+			}
+			if promptName, ok := params.ExtraParams["prompt_name"].(string); ok {
+				delete(params.ExtraParams, "prompt_name")
+				hfReq.PromptName = &promptName
+			}
+			if truncate, ok := params.ExtraParams["truncate"].(bool); ok {
+				delete(params.ExtraParams, "truncate")
+				hfReq.Truncate = &truncate
+			}
+			if truncationDirection, ok := params.ExtraParams["truncation_direction"].(string); ok {
+				delete(params.ExtraParams, "truncation_direction")
+				hfReq.TruncationDirection = &truncationDirection
+			}
+		}
+		hfReq.ExtraParams = params.ExtraParams
+	}
+
+	return hfReq, nil
+}
+
+// extractTextFromContent extracts a single text string from a content entry.
+// All parts must be text-only; multiple text parts are stitched together.
+func extractTextFromContent(content schemas.EmbeddingContent) (string, error) {
+	var sb strings.Builder
+	for _, part := range content {
+		if part.Type != schemas.EmbeddingContentPartTypeText || part.Text == nil {
+			return "", providerUtils.InvalidRequestErrorf("huggingface embedding only supports text input")
+		}
+		if sb.Len() > 0 {
+			sb.WriteString(" \n")
+		}
+		sb.WriteString(*part.Text)
+	}
+	if sb.Len() == 0 {
+		return "", providerUtils.InvalidRequestErrorf("huggingface embedding content has no text")
+	}
+	return sb.String(), nil
+}
+
+// UnmarshalHuggingFaceEmbeddingResponse unmarshals HuggingFace API response directly into BifrostEmbeddingResponse
+// Handles multiple formats: standard object, 2D array, or 1D array
+func UnmarshalHuggingFaceEmbeddingResponse(data []byte, model string) (*schemas.BifrostEmbeddingResponse, error) {
+	if data == nil {
+		return nil, fmt.Errorf("response data is nil")
+	}
+
+	// Try standard object format first
+	type tempResponse struct {
+		Data  []schemas.EmbeddingData  `json:"data,omitempty"`
+		Model *string                  `json:"model,omitempty"`
+		Usage *schemas.BifrostLLMUsage `json:"usage,omitempty"`
+	}
+	var obj tempResponse
+	if err := sonic.Unmarshal(data, &obj); err == nil {
+		if obj.Data != nil || obj.Model != nil || obj.Usage != nil {
+			bifrostResponse := &schemas.BifrostEmbeddingResponse{
+				Data:   obj.Data,
+				Model:  model,
+				Object: "list",
+			}
+			if obj.Model != nil {
+				bifrostResponse.Model = *obj.Model
+			}
+			if obj.Usage != nil {
+				bifrostResponse.Usage = obj.Usage
+			} else {
+				bifrostResponse.Usage = &schemas.BifrostLLMUsage{}
+			}
+			return bifrostResponse, nil
+		}
+	}
+
+	// Try 2D array: [[num, ...], ...]
+	var arr2D [][]float64
+	if err := sonic.Unmarshal(data, &arr2D); err == nil {
+		embeddings := make([]schemas.EmbeddingData, len(arr2D))
+		for idx, embedding := range arr2D {
+			embeddings[idx] = schemas.EmbeddingData{
+				Embedding: schemas.EmbeddingStruct{EmbeddingArray: append([]float64(nil), embedding...)},
+				Index:     idx,
+				Object:    "embedding",
+			}
+		}
+		return &schemas.BifrostEmbeddingResponse{
+			Data:   embeddings,
+			Model:  model,
+			Object: "list",
+			Usage:  &schemas.BifrostLLMUsage{},
+		}, nil
+	}
+
+	// Try 1D array: [num, ...]
+	var arr1D []float64
+	if err := sonic.Unmarshal(data, &arr1D); err == nil {
+		return &schemas.BifrostEmbeddingResponse{
+			Data: []schemas.EmbeddingData{{
+				Embedding: schemas.EmbeddingStruct{EmbeddingArray: append([]float64(nil), arr1D...)},
+				Index:     0,
+				Object:    "embedding",
+			}},
+			Model:  model,
+			Object: "list",
+			Usage:  &schemas.BifrostLLMUsage{},
+		}, nil
+	}
+
+	return nil, fmt.Errorf("failed to unmarshal HuggingFace embedding response: unexpected structure")
+}

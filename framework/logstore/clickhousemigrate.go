@@ -1,0 +1,700 @@
+package logstore
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/maximhq/bifrost/core/schemas"
+	"gorm.io/gorm"
+	"gorm.io/gorm/schema"
+)
+
+// clickhouseColumnType maps a GORM-parsed field to a ClickHouse column type.
+// Pointer fields become Nullable(...). This keeps the ClickHouse DDL in lockstep
+// with the shared Log/MCPToolLog/AsyncJob structs so the reused read path (which
+// references DB column names) never drifts from the physical schema.
+func clickhouseColumnType(f *schema.Field) string {
+	ft := f.FieldType
+	nullable := false
+	for ft.Kind() == reflect.Ptr {
+		nullable = true
+		ft = ft.Elem()
+	}
+
+	base := "String"
+	switch ft.Kind() {
+	case reflect.String:
+		base = "String"
+	case reflect.Bool:
+		base = "Bool"
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		base = "Int64"
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		base = "UInt64"
+	case reflect.Float32, reflect.Float64:
+		base = "Float64"
+	case reflect.Struct:
+		if ft == reflect.TypeFor[time.Time]() {
+			base = "DateTime64(3)"
+		}
+	}
+
+	if nullable {
+		return "Nullable(" + base + ")"
+	}
+	return base
+}
+
+// chColumnOverrides maps column names to full ClickHouse column definitions
+// that replace the default type derived from the Go struct. Used for columns
+// that need DEFAULT expressions computed by ClickHouse at INSERT time.
+var chColumnOverrides = map[string]string{
+	// inc_number: monotonically increasing per-row insert-order number.
+	// generateSnowflakeID() produces a unique UInt64 for every row in a batch
+	// (12-bit counter = 4096/ms), cast to Int64 for Go compatibility.
+	// The DEFAULT fires on fresh inserts (where the column is omitted) and is
+	// preserved on re-inserts (updates) because the existing value is carried
+	// through the read-modify-write cycle.
+	"inc_number": "`inc_number` Int64 DEFAULT CAST(generateSnowflakeID() AS Int64)",
+}
+
+func clickhouseModelColumnOverride(model any, column string) (string, bool) {
+	if _, ok := model.(*AgentLog); ok && column == "created_at" {
+		return "`created_at` DateTime64(3) DEFAULT now64(3)", true
+	}
+	override, ok := chColumnOverrides[column]
+	return override, ok
+}
+
+// clickhouseColumnDefs parses the GORM schema for model and returns column
+// definitions ("`name` Type") for every persisted field, in struct order.
+func clickhouseColumnDefs(db *gorm.DB, model any) ([]string, error) {
+	st, err := schema.Parse(model, &chSchemaCache, db.NamingStrategy)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse schema for clickhouse DDL: %w", err)
+	}
+	var cols []string
+	for _, f := range st.Fields {
+		if f.DBName == "" || f.IgnoreMigration {
+			continue
+		}
+		if override, ok := clickhouseModelColumnOverride(model, f.DBName); ok {
+			cols = append(cols, override)
+			continue
+		}
+		cols = append(cols, fmt.Sprintf("`%s` %s", f.DBName, clickhouseColumnType(f)))
+	}
+	return cols, nil
+}
+
+// chEscapeIdentifier escapes a value for embedding inside a backtick-quoted
+// ClickHouse identifier (backticks are escaped by doubling). Used for the
+// config-supplied cluster name, which reaches DDL via fmt.Sprintf.
+func chEscapeIdentifier(s string) string {
+	return strings.ReplaceAll(s, "`", "``")
+}
+
+// chTableOpts describes the engine-level options for a ClickHouse table.
+type chTableOpts struct {
+	table       string
+	partitionBy string   // empty = no PARTITION BY
+	orderBy     string   // e.g. "(timestamp, id)"
+	ttl         string   // empty = no TTL
+	skipIndexes []string // full "INDEX ..." clauses
+}
+
+type clickHouseSchemaStore interface {
+	EnsureClickHouseTable(ctx context.Context, model any, table, partitionBy, orderBy, ttl string, skipIndexes []string) error
+}
+
+// clickhouseCreateTable derives the column list from the GORM model, appends the
+// ReplacingMergeTree version column (`ver`, defaulted to now64() so every INSERT
+// is auto-versioned), and runs an idempotent CREATE TABLE IF NOT EXISTS.
+func clickhouseCreateTable(ctx context.Context, db *gorm.DB, model any, opts chTableOpts, cluster string) error {
+	cols, err := clickhouseColumnDefs(db, model)
+	if err != nil {
+		return err
+	}
+	// Version column for ReplacingMergeTree dedup. Not part of the Go struct, so
+	// INSERTs omit it and ClickHouse fills now64(); a later re-insert (cost
+	// backfill, has_object flip, idempotent retry) gets a higher ver and wins.
+	// Nanosecond precision: with now64()'s default millisecond resolution, a
+	// create + immediate update landing in the same millisecond would tie on
+	// `ver` and leave the winner to merge order instead of latest-write-wins.
+	cols = append(cols, "`ver` DateTime64(9) DEFAULT now64(9)")
+	cols = append(cols, opts.skipIndexes...)
+
+	engine := "ReplacingMergeTree(ver)"
+	onCluster := ""
+	if cluster != "" {
+		onCluster = fmt.Sprintf(" ON CLUSTER `%s`", chEscapeIdentifier(cluster))
+		engine = fmt.Sprintf("ReplicatedReplacingMergeTree('/clickhouse/tables/{shard}/%s', '{replica}', ver)", opts.table)
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "CREATE TABLE IF NOT EXISTS `%s`%s (\n  %s\n) ENGINE = %s\n", opts.table, onCluster, strings.Join(cols, ",\n  "), engine)
+	if opts.partitionBy != "" {
+		fmt.Fprintf(&b, "PARTITION BY %s\n", opts.partitionBy)
+	}
+	fmt.Fprintf(&b, "ORDER BY %s\n", opts.orderBy)
+	if opts.ttl != "" {
+		fmt.Fprintf(&b, "TTL %s\n", opts.ttl)
+	}
+	b.WriteString("SETTINGS index_granularity = 8192")
+
+	return db.WithContext(ctx).Exec(b.String()).Error
+}
+
+// EnsureClickHouseTable creates an extension-owned table and reconciles model
+// columns while preserving the configured cluster and replication settings.
+func (s *ClickHouseLogStore) EnsureClickHouseTable(ctx context.Context, model any, table, partitionBy, orderBy, ttl string, skipIndexes []string) error {
+	opts := chTableOpts{
+		table:       table,
+		partitionBy: partitionBy,
+		orderBy:     orderBy,
+		ttl:         ttl,
+		skipIndexes: skipIndexes,
+	}
+	if err := clickhouseCreateTable(ctx, s.db, model, opts, s.cluster); err != nil {
+		return fmt.Errorf("clickhouse: create extension table %s: %w", opts.table, err)
+	}
+	return clickhouseReconcileColumns(ctx, s.db, model, opts.table, s.cluster, s.logger)
+}
+
+// ReconcileClickHouseTTL sets an extension-owned table's TTL to ttl when the
+// table was created with a different one, because CREATE TABLE IF NOT EXISTS
+// never changes an existing table. ttl must be written the way ClickHouse
+// stores it in system.tables.engine_full (for example `+ toIntervalHour(24)`),
+// or the metadata-only ALTER is repeated on every call.
+func (s *ClickHouseLogStore) ReconcileClickHouseTTL(ctx context.Context, table, ttl string) error {
+	var engineFull string
+	if err := s.db.WithContext(ctx).
+		Raw("SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = ?", table).
+		Scan(&engineFull).Error; err != nil {
+		return fmt.Errorf("clickhouse: read %s engine definition: %w", table, err)
+	}
+	if clause := "TTL " + ttl; strings.Contains(engineFull, clause+" SETTINGS") || strings.HasSuffix(engineFull, clause) {
+		return nil
+	}
+	onCluster := ""
+	if s.cluster != "" {
+		onCluster = fmt.Sprintf(" ON CLUSTER `%s`", chEscapeIdentifier(s.cluster))
+	}
+	stmt := fmt.Sprintf("ALTER TABLE `%s`%s MODIFY TTL %s SETTINGS materialize_ttl_after_modify = 0", table, onCluster, ttl)
+	if err := s.db.WithContext(ctx).Exec(stmt).Error; err != nil {
+		return fmt.Errorf("clickhouse: modify %s TTL: %w", table, err)
+	}
+	return nil
+}
+
+// EnsureClickHouseTable delegates extension-table schema management to the
+// ClickHouse logstore wrapped by hybrid object storage.
+func (h *HybridLogStore) EnsureClickHouseTable(ctx context.Context, model any, table, partitionBy, orderBy, ttl string, skipIndexes []string) error {
+	schemaStore, ok := h.inner.(clickHouseSchemaStore)
+	if !ok {
+		return fmt.Errorf("logstore does not support ClickHouse extension tables")
+	}
+	return schemaStore.EnsureClickHouseTable(ctx, model, table, partitionBy, orderBy, ttl, skipIndexes)
+}
+
+// ReconcileClickHouseTTL delegates to the ClickHouse logstore wrapped by
+// hybrid object storage.
+func (h *HybridLogStore) ReconcileClickHouseTTL(ctx context.Context, table, ttl string) error {
+	schemaStore, ok := h.inner.(interface {
+		ReconcileClickHouseTTL(ctx context.Context, table, ttl string) error
+	})
+	if !ok {
+		return fmt.Errorf("logstore does not support ClickHouse extension tables")
+	}
+	return schemaStore.ReconcileClickHouseTTL(ctx, table, ttl)
+}
+
+// clickhouseExistingColumns returns the set of column names already present on a
+// ClickHouse table.
+func clickhouseExistingColumns(ctx context.Context, db *gorm.DB, table string) (map[string]struct{}, error) {
+	var names []string
+	if err := db.WithContext(ctx).
+		Raw("SELECT name FROM system.columns WHERE database = currentDatabase() AND table = ?", table).
+		Scan(&names).Error; err != nil {
+		return nil, err
+	}
+	set := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		set[n] = struct{}{}
+	}
+	return set, nil
+}
+
+// clickhouseReconcileColumns adds any model columns missing from the live table
+// via ALTER TABLE ... ADD COLUMN IF NOT EXISTS. This is the forward-evolution
+// path: the shared Log/MCPToolLog structs gain fields over time, and CREATE
+// TABLE IF NOT EXISTS only ever runs once. We do this ourselves (rather than the
+// gorm driver's AutoMigrate) because AutoMigrate maps the structs' Postgres/
+// SQLite tags (type:varchar(255) -> FixedString(255), etc.) incorrectly for
+// ClickHouse; clickhouseColumnType maps Go kinds to clean String/Nullable types.
+func clickhouseReconcileColumns(ctx context.Context, db *gorm.DB, model any, table, cluster string, logger schemas.Logger) error {
+	existing, err := clickhouseExistingColumns(ctx, db, table)
+	if err != nil {
+		return fmt.Errorf("clickhouse: read columns for %s: %w", table, err)
+	}
+	st, err := schema.Parse(model, &chSchemaCache, db.NamingStrategy)
+	if err != nil {
+		return fmt.Errorf("clickhouse: parse schema for %s: %w", table, err)
+	}
+	onCluster := ""
+	if cluster != "" {
+		onCluster = fmt.Sprintf(" ON CLUSTER `%s`", chEscapeIdentifier(cluster))
+	}
+	for _, f := range st.Fields {
+		if f.DBName == "" || f.IgnoreMigration {
+			continue
+		}
+		if _, ok := existing[f.DBName]; ok {
+			continue
+		}
+		columnDef := fmt.Sprintf("`%s` %s", f.DBName, clickhouseColumnType(f))
+		if override, ok := clickhouseModelColumnOverride(model, f.DBName); ok {
+			columnDef = override
+		}
+		stmt := fmt.Sprintf("ALTER TABLE `%s`%s ADD COLUMN IF NOT EXISTS %s", table, onCluster, columnDef)
+		logger.Info("[logstore] clickhouse: adding column %s.%s", table, f.DBName)
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+			return fmt.Errorf("clickhouse: add column %s.%s: %w", table, f.DBName, err)
+		}
+	}
+	return nil
+}
+
+// clickhouseReconcileSkipIndexes ensures skip indexes exist on an already
+// created table. CREATE TABLE IF NOT EXISTS never adds indexes to an existing
+// table, so indexes introduced after a table shipped need this ALTER path.
+func clickhouseReconcileSkipIndexes(ctx context.Context, db *gorm.DB, table, cluster string, skipIndexes []string, logger schemas.Logger) error {
+	onCluster := ""
+	if cluster != "" {
+		onCluster = fmt.Sprintf(" ON CLUSTER `%s`", chEscapeIdentifier(cluster))
+	}
+	for _, index := range skipIndexes {
+		stmt := fmt.Sprintf("ALTER TABLE `%s`%s ADD INDEX IF NOT EXISTS %s", table, onCluster, strings.TrimPrefix(index, "INDEX "))
+		logger.Info("[logstore] clickhouse: ensuring skip index on %s", table)
+		if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+			return fmt.Errorf("clickhouse: add skip index on %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+// chLogsTTL derives the logs/mcp_tool_logs TTL clause from the configured
+// retention. Values < 1 return "" which means the TTL is not managed by
+// Bifrost: new tables get none and existing tables keep whatever they have
+// (the LogsCleaner still prunes with one lightweight delete per run).
+func chLogsTTL(retentionDays int) string {
+	if retentionDays < 1 {
+		return ""
+	}
+	return fmt.Sprintf("toDateTime(created_at) + INTERVAL %d DAY", retentionDays)
+}
+
+// chTTLClauseDaysRe matches the clause form chLogsTTL and the fixed backstops
+// emit for CREATE TABLE / MODIFY TTL.
+var chTTLClauseDaysRe = regexp.MustCompile(`^toDateTime\(created_at\) \+ INTERVAL (\d+) DAY$`)
+
+// chTTLEngineFullDaysRe matches the normalized form ClickHouse stores in
+// system.tables.engine_full: `INTERVAL n DAY` becomes `toIntervalDay(n)`.
+var chTTLEngineFullDaysRe = regexp.MustCompile(`TTL toDateTime\(created_at\) \+ toIntervalDay\((\d+)\)`)
+
+func chTTLDaysFromMatch(re *regexp.Regexp, s string) (int, bool) {
+	m := re.FindStringSubmatch(s)
+	if m == nil {
+		return 0, false
+	}
+	days, err := strconv.Atoi(m[1])
+	if err != nil {
+		return 0, false
+	}
+	return days, true
+}
+
+// chTTLDaysFromClause returns the retention days a TTL clause built by
+// chLogsTTL (or a fixed backstop) encodes. ok is false for "" and for any
+// expression Bifrost does not manage.
+func chTTLDaysFromClause(ttl string) (days int, ok bool) {
+	return chTTLDaysFromMatch(chTTLClauseDaysRe, ttl)
+}
+
+// chTTLDaysFromEngineFull returns the retention days currently applied to a
+// table, read from system.tables.engine_full. ok is false when the table has
+// no TTL or one Bifrost did not write.
+func chTTLDaysFromEngineFull(engineFull string) (days int, ok bool) {
+	return chTTLDaysFromMatch(chTTLEngineFullDaysRe, engineFull)
+}
+
+// clickhouseReconcileTTL brings an existing table's TTL in line with wantTTL.
+// CREATE TABLE IF NOT EXISTS never updates the TTL of a table that already
+// exists, so before this a changed logs_store.retention_days silently did
+// nothing (#7098). An empty wantTTL means "unmanaged" and leaves the table
+// alone, so a TTL an operator applied by hand survives restarts.
+//
+// materialize_ttl_after_modify = 0 keeps the ALTER metadata-only. The default
+// would submit a MATERIALIZE TTL mutation that rewrites every part holding
+// expired rows, on every pod's first boot, which is the exact heavyweight
+// rewrite this code path exists to avoid. Expired rows are dropped by the
+// regular TTL merges instead.
+func clickhouseReconcileTTL(ctx context.Context, db *gorm.DB, table, cluster, wantTTL string, logger schemas.Logger) error {
+	wantDays, managed := chTTLDaysFromClause(wantTTL)
+	if !managed {
+		return nil
+	}
+	var engineFull string
+	if err := db.WithContext(ctx).
+		Raw("SELECT engine_full FROM system.tables WHERE database = currentDatabase() AND name = ?", table).
+		Scan(&engineFull).Error; err != nil {
+		return fmt.Errorf("clickhouse: read %s engine definition: %w", table, err)
+	}
+	if haveDays, ok := chTTLDaysFromEngineFull(engineFull); ok && haveDays == wantDays {
+		return nil
+	}
+	onCluster := ""
+	if cluster != "" {
+		onCluster = fmt.Sprintf(" ON CLUSTER `%s`", chEscapeIdentifier(cluster))
+	}
+	stmt := fmt.Sprintf("ALTER TABLE `%s`%s MODIFY TTL %s SETTINGS materialize_ttl_after_modify = 0", table, onCluster, wantTTL)
+	logger.Info("[logstore] clickhouse: setting %s TTL to %d days", table, wantDays)
+	if err := db.WithContext(ctx).Exec(stmt).Error; err != nil {
+		return fmt.Errorf("clickhouse: modify %s TTL: %w", table, err)
+	}
+	return nil
+}
+
+// clickhouseMigrationStep is one per-table migration: create the table if
+// missing, then reconcile any columns added to its model since.
+type clickhouseMigrationStep func(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error
+
+// migrationClickHouseLogsTable creates the logs table and reconciles it with
+// the Log struct.
+func migrationClickHouseLogsTable(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table logs")
+	opts := chTableOpts{
+		table:       "logs",
+		partitionBy: "toYYYYMM(timestamp)",
+		orderBy:     "(timestamp, id)",
+		ttl:         chLogsTTL(retentionDays),
+		skipIndexes: []string{
+			"INDEX idx_logs_provider provider TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_model model TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_status status TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_team_id team_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_virtual_key_id virtual_key_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_user_id user_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_selected_key_id selected_key_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_logs_agent_correlation_id agent_correlation_id TYPE bloom_filter GRANULARITY 1",
+		},
+	}
+	if err := clickhouseCreateTable(ctx, db, &Log{}, opts, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create logs table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &Log{}, "logs", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseReconcileSkipIndexes(ctx, db, "logs", cluster, opts.skipIndexes, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "logs", cluster, chLogsTTL(retentionDays), logger)
+}
+
+// migrationClickHouseAgentLogsTable creates the append-only Agent observability table.
+func migrationClickHouseAgentLogsTable(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table agent_logs")
+	opts := chTableOpts{
+		table:       "agent_logs",
+		partitionBy: "toYYYYMM(timestamp)",
+		orderBy:     "(timestamp, id)",
+		ttl:         chLogsTTL(retentionDays),
+		skipIndexes: []string{
+			"INDEX idx_agent_logs_agent_name agent_name TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_virtual_key_id virtual_key_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_request_id request_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_task_id task_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_context_id context_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_request_message_id request_message_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_response_message_id response_message_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_operation operation TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_status status TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_agent_logs_record_kind record_kind TYPE bloom_filter GRANULARITY 1",
+		},
+	}
+	if err := clickhouseCreateTable(ctx, db, &AgentLog{}, opts, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create agent_logs table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &AgentLog{}, "agent_logs", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseReconcileSkipIndexes(ctx, db, "agent_logs", cluster, opts.skipIndexes, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "agent_logs", cluster, chLogsTTL(retentionDays), logger)
+}
+
+// migrationClickHouseRelayLogsTable creates the append-only Relay Logs table.
+func migrationClickHouseRelayLogsTable(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table relay_logs")
+	opts := chTableOpts{
+		table:       "relay_logs",
+		partitionBy: "toYYYYMM(timestamp)",
+		orderBy:     "(timestamp, id)",
+		ttl:         chLogsTTL(retentionDays),
+		skipIndexes: []string{
+			"INDEX idx_relay_logs_relay_name relay_name TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_relay_logs_virtual_key_id virtual_key_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_relay_logs_request_id request_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_relay_logs_job_id job_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_relay_logs_status status TYPE bloom_filter GRANULARITY 1",
+		},
+	}
+	if err := clickhouseCreateTable(ctx, db, &RelayLog{}, opts, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create relay_logs table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &RelayLog{}, "relay_logs", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseReconcileSkipIndexes(ctx, db, "relay_logs", cluster, opts.skipIndexes, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "relay_logs", cluster, chLogsTTL(retentionDays), logger)
+}
+
+// migrationClickHouseMCPToolLogsTable creates the mcp_tool_logs table and
+// reconciles it with the MCPToolLog struct.
+func migrationClickHouseMCPToolLogsTable(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table mcp_tool_logs")
+	opts := chTableOpts{
+		table:       "mcp_tool_logs",
+		partitionBy: "toYYYYMM(timestamp)",
+		orderBy:     "(timestamp, id)",
+		ttl:         chLogsTTL(retentionDays),
+		skipIndexes: []string{
+			"INDEX idx_mcp_logs_status status TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_mcp_logs_virtual_key_id virtual_key_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_mcp_logs_tool_name tool_name TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_mcp_logs_session_id session_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_mcp_logs_agent_correlation_id agent_correlation_id TYPE bloom_filter GRANULARITY 1",
+		},
+	}
+	if err := clickhouseCreateTable(ctx, db, &MCPToolLog{}, opts, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create mcp_tool_logs table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &MCPToolLog{}, "mcp_tool_logs", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseReconcileSkipIndexes(ctx, db, "mcp_tool_logs", cluster, opts.skipIndexes, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "mcp_tool_logs", cluster, chLogsTTL(retentionDays), logger)
+}
+
+// migrationClickHouseAsyncJobsTable creates the async_jobs table and reconciles
+// it with the AsyncJob struct. async_jobs is a small queue: a hard 7-day TTL on
+// created_at is a safety backstop (independent of the logs retention setting);
+// the AsyncJobCleaner's DeleteExpired/DeleteStale handle normal (sub-hour)
+// expiry.
+func migrationClickHouseAsyncJobsTable(ctx context.Context, db *gorm.DB, cluster string, _ int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table async_jobs")
+	if err := clickhouseCreateTable(ctx, db, &AsyncJob{}, chTableOpts{
+		table:   "async_jobs",
+		orderBy: "id",
+		ttl:     "toDateTime(created_at) + INTERVAL 7 DAY",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create async_jobs table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &AsyncJob{}, "async_jobs", cluster, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "async_jobs", cluster, "toDateTime(created_at) + INTERVAL 7 DAY", logger)
+}
+
+// migrationClickHouseWebhookDeliveriesTable creates the webhook_deliveries
+// table and reconciles it with the WebhookDelivery struct. Delivery history
+// is insert-only metadata, so it follows the logs retention setting for its
+// TTL backstop; DeleteExpiredWebhookDeliveries handles normal expiry from
+// each row's expires_at.
+func migrationClickHouseWebhookDeliveriesTable(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table webhook_deliveries")
+	if err := clickhouseCreateTable(ctx, db, &WebhookDelivery{}, chTableOpts{
+		table:   "webhook_deliveries",
+		orderBy: "id",
+		ttl:     chLogsTTL(retentionDays),
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create webhook_deliveries table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &WebhookDelivery{}, "webhook_deliveries", cluster, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "webhook_deliveries", cluster, chLogsTTL(retentionDays), logger)
+}
+
+// migrationClickHouseWarpConversationTables creates Warp's saved-chat tables.
+//
+// No TTL clause, and that is deliberate rather than an omission. Every other
+// table here expires on logs_store.retention_days, which is the wrong number
+// for this content: Warp history has its own warp.history_retention_days, and
+// that setting is not reachable from a log-store migration. Borrowing the logs
+// figure would silently delete somebody's saved chats on a schedule nobody
+// chose, so age-based expiry runs from the application instead, through
+// DeleteWarpConversationsOlderThan.
+//
+// warp_conversations orders by (owner_id, id). id alone is not enough: every
+// read filters on owner_id, and with id leading, the primary key could prune
+// nothing - the list and prune queries scanned across all owners, and grew with
+// the number of owners rather than with any one owner's history.
+// PruneWarpConversations caps rows per owner, which bounds nothing in total.
+//
+// owner_id can lead safely because it never changes. It is server-derived, no
+// reachable Warp write path alters it, and the whole row is re-inserted on every
+// edit (ClickHouse has no cheap UPDATE) - so (owner_id, id) is still the dedup
+// identity ReplacingMergeTree collapses onto, exactly as id alone was. What
+// would break the identity is putting a mutable column such as updated_at
+// ahead of id, which would leave every edit behind as a distinct row.
+//
+// warp_messages can afford the leading conversation_id because it never
+// changes, so (conversation_id, id) is still unique per message - and it is the
+// predicate every read uses.
+func migrationClickHouseWarpConversationTables(ctx context.Context, db *gorm.DB, cluster string, _ int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating tables warp_conversations, warp_messages")
+	if err := clickhouseCreateTable(ctx, db, &WarpConversation{}, chTableOpts{
+		table:   "warp_conversations",
+		orderBy: "(owner_id, id)",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_conversations table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &WarpConversation{}, "warp_conversations", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseCreateTable(ctx, db, &WarpMessage{}, chTableOpts{
+		table:   "warp_messages",
+		orderBy: "(conversation_id, id)",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_messages table: %w", err)
+	}
+	return clickhouseReconcileColumns(ctx, db, &WarpMessage{}, "warp_messages", cluster, logger)
+}
+
+// migrationClickHouseUserAgentMappingsTable creates user_agent_mappings, which the SQL stores
+// create in migrationRecreateMatViewsWithUserAgentColumn.
+func migrationClickHouseUserAgentMappingsTable(ctx context.Context, db *gorm.DB, cluster string, _ int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table user_agent_mappings")
+	if err := clickhouseCreateTable(ctx, db, &UserAgentMapping{}, chTableOpts{
+		table:   "user_agent_mappings",
+		orderBy: "(id)",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create user_agent_mappings table: %w", err)
+	}
+	return clickhouseReconcileColumns(ctx, db, &UserAgentMapping{}, "user_agent_mappings", cluster, logger)
+}
+
+// migrationClickHouseWarpTopicTables creates the storage for Warp's topics.
+//
+// warp_topic_assignments is shaped like logs, because it is read like logs: by
+// time range first, then by whatever the question filters on. It is ordered by
+// (timestamp, log_id) and partitioned by month so a time-bounded count reads
+// only the parts it covers, and it expires on the logs TTL, keyed on the log's
+// own created_at which each row carries. (timestamp, log_id) is also the dedup
+// identity: neither changes for a request, so writing a request's assignment
+// again replaces the earlier row.
+//
+// warp_topics has no TTL: topics outlive the requests they were built from.
+// warp_topic_unmatched is bounded from the application, by count and by age,
+// and carries the logs TTL only so a pool nobody is draining still empties.
+func migrationClickHouseWarpTopicTables(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating tables warp_topics, warp_topic_assignments, warp_topic_unmatched")
+	if err := clickhouseCreateTable(ctx, db, &WarpTopic{}, chTableOpts{
+		table:   "warp_topics",
+		orderBy: "id",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_topics table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &WarpTopic{}, "warp_topics", cluster, logger); err != nil {
+		return err
+	}
+
+	assignments := chTableOpts{
+		table:       "warp_topic_assignments",
+		partitionBy: "toYYYYMM(timestamp)",
+		orderBy:     "(timestamp, log_id)",
+		ttl:         chLogsTTL(retentionDays),
+		skipIndexes: []string{
+			"INDEX idx_warp_topic_assignments_topic_id topic_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_warp_topic_assignments_log_id log_id TYPE bloom_filter GRANULARITY 1",
+			"INDEX idx_warp_topic_assignments_session_id session_id TYPE bloom_filter GRANULARITY 1",
+		},
+	}
+	if err := clickhouseCreateTable(ctx, db, &WarpTopicAssignment{}, assignments, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_topic_assignments table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &WarpTopicAssignment{}, "warp_topic_assignments", cluster, logger); err != nil {
+		return err
+	}
+	if err := clickhouseReconcileSkipIndexes(ctx, db, "warp_topic_assignments", cluster, assignments.skipIndexes, logger); err != nil {
+		return err
+	}
+	if err := clickhouseReconcileTTL(ctx, db, "warp_topic_assignments", cluster, chLogsTTL(retentionDays), logger); err != nil {
+		return err
+	}
+
+	if err := clickhouseCreateTable(ctx, db, &WarpTopicUnmatched{}, chTableOpts{
+		table:   "warp_topic_unmatched",
+		orderBy: "log_id",
+		ttl:     chLogsTTL(retentionDays),
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_topic_unmatched table: %w", err)
+	}
+	if err := clickhouseReconcileColumns(ctx, db, &WarpTopicUnmatched{}, "warp_topic_unmatched", cluster, logger); err != nil {
+		return err
+	}
+	return clickhouseReconcileTTL(ctx, db, "warp_topic_unmatched", cluster, chLogsTTL(retentionDays), logger)
+}
+
+// migrationClickHouseWarpVectorDeletesTable creates the record of deleted logs
+// whose Warp vector could not be removed. It has no TTL: a row goes when its
+// retry succeeds, and expiring it would leave the vector behind.
+func migrationClickHouseWarpVectorDeletesTable(ctx context.Context, db *gorm.DB, cluster string, _ int, logger schemas.Logger) error {
+	logger.Info("[logstore] clickhouse: creating table warp_vector_deletes")
+	if err := clickhouseCreateTable(ctx, db, &WarpVectorDelete{}, chTableOpts{
+		table:   "warp_vector_deletes",
+		orderBy: "log_id",
+	}, cluster); err != nil {
+		return fmt.Errorf("clickhouse: create warp_vector_deletes table: %w", err)
+	}
+	return clickhouseReconcileColumns(ctx, db, &WarpVectorDelete{}, "warp_vector_deletes", cluster, logger)
+}
+
+// clickhouseMigrationSteps lists the per-table migrations in execution order,
+// mirroring logstoreMigrationSteps for the SQL stores.
+var clickhouseMigrationSteps = []clickhouseMigrationStep{
+	migrationClickHouseLogsTable,
+	migrationClickHouseAgentLogsTable,
+	migrationClickHouseMCPToolLogsTable,
+	migrationClickHouseAsyncJobsTable,
+	migrationClickHouseWebhookDeliveriesTable,
+	migrationClickHouseWarpConversationTables,
+	migrationClickHouseUserAgentMappingsTable,
+	migrationClickHouseWarpTopicTables,
+	migrationClickHouseWarpVectorDeletesTable,
+	migrationClickHouseRelayLogsTable,
+}
+
+// triggerClickHouseMigrations runs all registered ClickHouse table migrations
+// in order. Analogous to triggerMigrations for Postgres/SQLite, but with no
+// migration ledger or advisory lock: CREATE TABLE IF NOT EXISTS and ADD COLUMN
+// IF NOT EXISTS are inherently idempotent and concurrency-safe across pods.
+func triggerClickHouseMigrations(ctx context.Context, db *gorm.DB, cluster string, retentionDays int, logger schemas.Logger) error {
+	for _, step := range clickhouseMigrationSteps {
+		if err := step(ctx, db, cluster, retentionDays, logger); err != nil {
+			return err
+		}
+	}
+	return nil
+}

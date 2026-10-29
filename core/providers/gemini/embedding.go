@@ -1,0 +1,583 @@
+package gemini
+
+import (
+	"fmt"
+	"maps"
+	"strings"
+
+	providerUtils "github.com/maximhq/bifrost/core/providers/utils"
+	"github.com/maximhq/bifrost/core/schemas"
+)
+
+func mediaPartToGeminiPart(partType schemas.EmbeddingContentPartType, media *schemas.EmbeddingMediaPart, allowedURLSchemes ...string) (*Part, error) {
+	if err := media.Validate(); err != nil {
+		return nil, providerUtils.InvalidRequestErrorf("%s", err)
+	}
+	if len(allowedURLSchemes) == 0 {
+		allowedURLSchemes = defaultGeminiImageURLSchemes
+	}
+
+	defaultMime := map[schemas.EmbeddingContentPartType]string{
+		schemas.EmbeddingContentPartTypeImage: "image/jpeg",
+		schemas.EmbeddingContentPartTypeAudio: "audio/mpeg",
+		schemas.EmbeddingContentPartTypeFile:  "application/pdf",
+		schemas.EmbeddingContentPartTypeVideo: "video/mp4",
+	}[partType]
+
+	if media.Data != nil {
+		dataBytes, extractedMime := convertFileDataToBytes(*media.Data)
+		if len(dataBytes) == 0 {
+			return nil, providerUtils.InvalidRequestErrorf("empty media data for %s part", partType)
+		}
+		mimeType := defaultMime
+		if media.MIMEType != nil && strings.TrimSpace(*media.MIMEType) != "" {
+			mimeType = *media.MIMEType
+		} else if extractedMime != "" {
+			mimeType = extractedMime
+		}
+		return &Part{
+			InlineData: &Blob{
+				MIMEType: mimeType,
+				Data:     encodeBytesToBase64String(dataBytes),
+			},
+		}, nil
+	}
+
+	mimeType := defaultMime
+	if media.MIMEType != nil && strings.TrimSpace(*media.MIMEType) != "" {
+		mimeType = *media.MIMEType
+	}
+	url := *media.URL
+	if partType == schemas.EmbeddingContentPartTypeImage {
+		sanitizedURL, err := schemas.SanitizeImageURLWithAllowedSchemes(url, allowedURLSchemes...)
+		if err != nil {
+			return nil, providerUtils.InvalidRequestErrorf("%s", err)
+		}
+		urlInfo := schemas.ExtractURLTypeInfo(sanitizedURL)
+		if urlInfo.Type == schemas.ImageContentTypeBase64 {
+			data := ""
+			if urlInfo.DataURLWithoutPrefix != nil {
+				data = *urlInfo.DataURLWithoutPrefix
+			}
+			decoded, err := decodeBase64StringToBytes(data)
+			if err != nil {
+				return nil, providerUtils.InvalidRequestErrorf("%s", err)
+			}
+			if urlInfo.MediaType != nil && (media.MIMEType == nil || *media.MIMEType == "") {
+				mimeType = *urlInfo.MediaType
+			}
+			return &Part{
+				InlineData: &Blob{
+					MIMEType: mimeType,
+					Data:     encodeBytesToBase64String(decoded),
+				},
+			}, nil
+		}
+		url = sanitizedURL
+	}
+
+	return &Part{
+		FileData: &FileData{
+			FileURI:  url,
+			MIMEType: mimeType,
+			DisplayName: func() string {
+				if media.Filename != nil {
+					return *media.Filename
+				}
+				return ""
+			}(),
+		},
+	}, nil
+}
+
+func embeddingContentPartToGeminiPart(part schemas.EmbeddingContentPart, allowedURLSchemes ...string) (*Part, error) {
+	if err := part.Validate(); err != nil {
+		return nil, providerUtils.InvalidRequestErrorf("%s", err)
+	}
+
+	switch part.Type {
+	case schemas.EmbeddingContentPartTypeText:
+		return &Part{Text: *part.Text}, nil
+	case schemas.EmbeddingContentPartTypeImage:
+		return mediaPartToGeminiPart(part.Type, part.Image, allowedURLSchemes...)
+	case schemas.EmbeddingContentPartTypeAudio:
+		return mediaPartToGeminiPart(part.Type, part.Audio, allowedURLSchemes...)
+	case schemas.EmbeddingContentPartTypeFile:
+		return mediaPartToGeminiPart(part.Type, part.File, allowedURLSchemes...)
+	case schemas.EmbeddingContentPartTypeVideo:
+		return mediaPartToGeminiPart(part.Type, part.Video, allowedURLSchemes...)
+	default:
+		return nil, providerUtils.InvalidRequestErrorf("unsupported embedding content part type %q", part.Type)
+	}
+}
+
+// EmbeddingContentToGeminiContent converts a Bifrost EmbeddingContent (a slice
+// of typed parts) into the Gemini Content struct used by both the embedContent
+// and batchEmbedContents endpoints. Callers that accept image URLs beyond
+// http/https - Vertex resolves gs:// - pass their own scheme allowlist.
+func EmbeddingContentToGeminiContent(content schemas.EmbeddingContent, allowedURLSchemes ...string) (*Content, error) {
+	if err := content.Validate(); err != nil {
+		return nil, providerUtils.InvalidRequestErrorf("%s", err)
+	}
+	parts := make([]*Part, 0, len(content))
+	for _, contentPart := range content {
+		part, err := embeddingContentPartToGeminiPart(contentPart, allowedURLSchemes...)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, part)
+	}
+	return &Content{Parts: parts}, nil
+}
+
+// geminiPerEntryEmbeddingExtraKeys are Gemini-native extra params that belong on an
+// individual requests[] entry of :batchEmbedContents. applyGeminiEmbeddingParams lifts
+// them onto the entry, and ToGeminiEmbeddingRequest strips them from the batch-level
+// extra params so they are never merged at the top level, where Gemini rejects them.
+var geminiPerEntryEmbeddingExtraKeys = []string{"taskType", "title", "embedContentConfig"}
+
+// ReadEmbedContentConfig returns the documentOcr / audioTrackExtraction a caller nested under
+// embedContentConfig, the only place Gemini and Vertex accept them.
+func ReadEmbedContentConfig(extra map[string]interface{}) *GeminiEmbedContentConfig {
+	nested, ok := extra["embedContentConfig"].(map[string]interface{})
+	if !ok {
+		return nil
+	}
+	cfg := &GeminiEmbedContentConfig{}
+	cfg.DocumentOCR, _ = schemas.SafeExtractBoolPointer(nested["documentOcr"])
+	cfg.AudioTrackExtraction, _ = schemas.SafeExtractBoolPointer(nested["audioTrackExtraction"])
+	if cfg.DocumentOCR == nil && cfg.AudioTrackExtraction == nil {
+		return nil
+	}
+	return cfg
+}
+
+// applyGeminiEmbeddingParams copies the embedding parameters onto one requests[] entry.
+// The first-class task_type/title fields win; the Gemini-native "taskType"/"title"
+// extra params are honoured as aliases so a request-level value fans out to every entry
+// (issue #7812).
+func applyGeminiEmbeddingParams(req *GeminiEmbeddingRequest, params *schemas.EmbeddingParameters) {
+	if params == nil {
+		return
+	}
+	req.OutputDimensionality = params.Dimensions
+	req.TaskType = params.TaskType
+	req.Title = params.Title
+
+	if params.ExtraParams != nil {
+		req.ExtraParams = params.ExtraParams
+		if taskType, ok := schemas.SafeExtractStringPointer(params.ExtraParams["taskType"]); ok {
+			delete(req.ExtraParams, "taskType")
+			if req.TaskType == nil {
+				req.TaskType = taskType
+			}
+		}
+		if title, ok := schemas.SafeExtractStringPointer(params.ExtraParams["title"]); ok {
+			delete(req.ExtraParams, "title")
+			if req.Title == nil {
+				req.Title = title
+			}
+		}
+		req.EmbedContentConfig = ReadEmbedContentConfig(req.ExtraParams)
+	}
+}
+
+// ToGeminiEmbeddingRequest converts a Bifrost embedding request to Gemini request format.
+// Each element in Contents maps to one GeminiEmbeddingRequest (one output embedding).
+// Parts within a single content are aggregated into one embedding by Gemini.
+func ToGeminiEmbeddingRequest(bifrostReq *schemas.BifrostEmbeddingRequest) (*GeminiBatchEmbeddingRequest, error) {
+	if bifrostReq == nil || len(bifrostReq.Input) == 0 {
+		return nil, providerUtils.InvalidRequestErrorf("bifrost request is nil or input is nil")
+	}
+
+	batchRequest := &GeminiBatchEmbeddingRequest{
+		Requests: make([]GeminiEmbeddingRequest, 0, len(bifrostReq.Input)),
+	}
+	if bifrostReq.Params != nil && bifrostReq.Params.ExtraParams != nil {
+		// Clone so per-entry keys can be stripped without mutating the caller's map;
+		// they are applied per entry below and must not surface at the batch top level.
+		batchRequest.ExtraParams = maps.Clone(bifrostReq.Params.ExtraParams)
+		for _, key := range geminiPerEntryEmbeddingExtraKeys {
+			delete(batchRequest.ExtraParams, key)
+		}
+	}
+	for _, item := range bifrostReq.Input {
+		content, err := EmbeddingContentToGeminiContent(item.Content)
+		if err != nil {
+			return nil, fmt.Errorf("error converting embedding content to gemini content: %w", err)
+		}
+		req := GeminiEmbeddingRequest{
+			Model:   "models/" + bifrostReq.Model,
+			Content: content,
+		}
+		applyGeminiEmbeddingParams(&req, item.EffectiveParams(bifrostReq.Params))
+		batchRequest.Requests = append(batchRequest.Requests, req)
+	}
+	return batchRequest, nil
+}
+
+// ToGeminiEmbedContentResponse converts a BifrostEmbeddingResponse to the single :embedContent wire format.
+func ToGeminiEmbedContentResponse(bifrostResp *schemas.BifrostEmbeddingResponse) *GeminiEmbedContentResponse {
+	if bifrostResp == nil || len(bifrostResp.Data) == 0 {
+		return nil
+	}
+	values := bifrostResp.Data[0].Embedding.EmbeddingArray
+	if values == nil && len(bifrostResp.Data[0].Embedding.Embedding2DArray) > 0 {
+		values = bifrostResp.Data[0].Embedding.Embedding2DArray[0]
+	}
+	embedding := GeminiEmbedding{
+		Values: append([]float64(nil), values...),
+	}
+	if bifrostResp.Usage != nil {
+		embedding.Statistics = &ContentEmbeddingStatistics{
+			TokenCount: int32(bifrostResp.Usage.PromptTokens),
+		}
+	}
+	return &GeminiEmbedContentResponse{Embedding: embedding}
+}
+
+// ToGeminiEmbeddingResponse converts a BifrostResponse with embedding data to Gemini's embedding response format
+func ToGeminiEmbeddingResponse(bifrostResp *schemas.BifrostEmbeddingResponse) *GeminiEmbeddingResponse {
+	if bifrostResp == nil || len(bifrostResp.Data) == 0 {
+		return nil
+	}
+
+	geminiResp := &GeminiEmbeddingResponse{
+		Embeddings: make([]GeminiEmbedding, len(bifrostResp.Data)),
+	}
+
+	for i, embedding := range bifrostResp.Data {
+		geminiEmbedding := GeminiEmbedding{Values: append([]float64(nil), embedding.Embedding.EmbeddingArray...)}
+		if bifrostResp.Usage != nil && len(bifrostResp.Data) == 1 {
+			geminiEmbedding.Statistics = &ContentEmbeddingStatistics{
+				TokenCount: int32(bifrostResp.Usage.PromptTokens),
+			}
+		}
+		geminiResp.Embeddings[i] = geminiEmbedding
+	}
+
+	if len(geminiResp.Embeddings) == 1 {
+		geminiResp.Embedding = &geminiResp.Embeddings[0]
+	}
+	if bifrostResp.Usage != nil {
+		geminiResp.Metadata = &EmbedContentMetadata{
+			BillableCharacterCount: int32(bifrostResp.Usage.PromptTokens),
+		}
+	}
+	return geminiResp
+}
+
+func geminiResponseEmbeddings(resp *GeminiEmbeddingResponse) []GeminiEmbedding {
+	if resp == nil {
+		return nil
+	}
+	if len(resp.Embeddings) > 0 {
+		return resp.Embeddings
+	}
+	if resp.Embedding != nil {
+		return []GeminiEmbedding{*resp.Embedding}
+	}
+	return nil
+}
+
+// ToBifrostEmbeddingResponse converts a Gemini embedding response to BifrostEmbeddingResponse format
+func ToBifrostEmbeddingResponse(geminiResp *GeminiEmbeddingResponse, model string) *schemas.BifrostEmbeddingResponse {
+	embeddings := geminiResponseEmbeddings(geminiResp)
+	if len(embeddings) == 0 {
+		return nil
+	}
+
+	bifrostResp := &schemas.BifrostEmbeddingResponse{
+		Data:   make([]schemas.EmbeddingData, len(embeddings)),
+		Model:  model,
+		Object: "list",
+	}
+
+	for i, geminiEmbedding := range embeddings {
+		bifrostResp.Data[i] = schemas.EmbeddingData{
+			Index:  i,
+			Object: "embedding",
+			Embedding: schemas.EmbeddingStruct{
+				EmbeddingArray: geminiEmbedding.Values,
+			},
+		}
+	}
+
+	hasStats := false
+	for _, emb := range embeddings {
+		if emb.Statistics != nil {
+			hasStats = true
+			break
+		}
+	}
+	if um := geminiResp.UsageMetadata; um != nil && (um.PromptTokenCount > 0 || um.TotalTokenCount > 0) {
+		prompt := int(um.PromptTokenCount)
+		total := int(um.TotalTokenCount)
+		if prompt == 0 {
+			for _, emb := range embeddings {
+				if emb.Statistics != nil {
+					prompt += int(emb.Statistics.TokenCount)
+				}
+			}
+			if prompt == 0 {
+				prompt = total
+			}
+		}
+		if total == 0 {
+			total = prompt
+		}
+		bifrostResp.Usage = &schemas.BifrostLLMUsage{PromptTokens: prompt, TotalTokens: total}
+	} else if geminiResp.Metadata != nil || hasStats {
+		bifrostResp.Usage = &schemas.BifrostLLMUsage{}
+		var totalTokens int
+		for _, emb := range embeddings {
+			if emb.Statistics != nil {
+				totalTokens += int(emb.Statistics.TokenCount)
+			}
+		}
+		if totalTokens > 0 {
+			bifrostResp.Usage.PromptTokens = totalTokens
+		} else if geminiResp.Metadata != nil {
+			bifrostResp.Usage.PromptTokens = int(geminiResp.Metadata.BillableCharacterCount)
+		}
+		bifrostResp.Usage.TotalTokens = bifrostResp.Usage.PromptTokens
+	}
+
+	return bifrostResp
+}
+
+func geminiPartToEmbeddingContentPart(part *Part) (*schemas.EmbeddingContentPart, error) {
+	if part == nil {
+		return nil, fmt.Errorf("gemini part is nil")
+	}
+	switch {
+	case part.Text != "":
+		text := part.Text
+		return &schemas.EmbeddingContentPart{
+			Type: schemas.EmbeddingContentPartTypeText,
+			Text: &text,
+		}, nil
+	case part.InlineData != nil:
+		mimeType := strings.ToLower(strings.TrimSpace(part.InlineData.MIMEType))
+		data := fmt.Sprintf("data:%s;base64,%s", part.InlineData.MIMEType, part.InlineData.Data)
+		mime := part.InlineData.MIMEType
+		media := &schemas.EmbeddingMediaPart{
+			Data:     &data,
+			MIMEType: &mime,
+		}
+		switch {
+		case strings.HasPrefix(mimeType, "image/"):
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeImage, Image: media}, nil
+		case strings.HasPrefix(mimeType, "audio/"):
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeAudio, Audio: media}, nil
+		case strings.HasPrefix(mimeType, "video/"):
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeVideo, Video: media}, nil
+		default:
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeFile, File: media}, nil
+		}
+	case part.FileData != nil:
+		uri := part.FileData.FileURI
+		mime := part.FileData.MIMEType
+		media := &schemas.EmbeddingMediaPart{
+			URL:      &uri,
+			MIMEType: &mime,
+		}
+		if part.FileData.DisplayName != "" {
+			name := part.FileData.DisplayName
+			media.Filename = &name
+		}
+		mimeType := strings.ToLower(strings.TrimSpace(part.FileData.MIMEType))
+		switch {
+		case strings.HasPrefix(mimeType, "image/"):
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeImage, Image: media}, nil
+		case strings.HasPrefix(mimeType, "audio/"):
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeAudio, Audio: media}, nil
+		case strings.HasPrefix(mimeType, "video/"):
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeVideo, Video: media}, nil
+		default:
+			return &schemas.EmbeddingContentPart{Type: schemas.EmbeddingContentPartTypeFile, File: media}, nil
+		}
+	default:
+		return nil, fmt.Errorf("unsupported gemini embedding part")
+	}
+}
+
+func geminiContentToEmbeddingContent(content *Content) (schemas.EmbeddingContent, error) {
+	if content == nil {
+		return nil, fmt.Errorf("gemini embedding content is nil")
+	}
+	result := make(schemas.EmbeddingContent, 0, len(content.Parts))
+	for _, part := range content.Parts {
+		converted, err := geminiPartToEmbeddingContentPart(part)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, *converted)
+	}
+	return result, nil
+}
+
+func applyBifrostEmbeddingParams(params *schemas.EmbeddingParameters, req GeminiEmbeddingRequest) *schemas.EmbeddingParameters {
+	if params == nil {
+		params = &schemas.EmbeddingParameters{}
+	}
+	changed := false
+	if req.OutputDimensionality != nil {
+		params.Dimensions = req.OutputDimensionality
+		changed = true
+	}
+	if req.TaskType != nil {
+		params.TaskType = req.TaskType
+		changed = true
+	}
+	if req.Title != nil {
+		params.Title = req.Title
+		changed = true
+	}
+	if cfg := req.EmbedContentConfig; cfg != nil && (cfg.DocumentOCR != nil || cfg.AudioTrackExtraction != nil) {
+		nested := map[string]interface{}{}
+		if cfg.DocumentOCR != nil {
+			nested["documentOcr"] = *cfg.DocumentOCR
+		}
+		if cfg.AudioTrackExtraction != nil {
+			nested["audioTrackExtraction"] = *cfg.AudioTrackExtraction
+		}
+		if params.ExtraParams == nil {
+			params.ExtraParams = map[string]interface{}{}
+		}
+		params.ExtraParams["embedContentConfig"] = nested
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return params
+}
+
+// sameGeminiEmbeddingParams reports whether two requests[] entries carry identical params.
+func sameGeminiEmbeddingParams(a, b GeminiEmbeddingRequest) bool {
+	cfgA, cfgB := a.EmbedContentConfig, b.EmbedContentConfig
+	if cfgA == nil {
+		cfgA = &GeminiEmbedContentConfig{}
+	}
+	if cfgB == nil {
+		cfgB = &GeminiEmbedContentConfig{}
+	}
+	return ptrEqual(a.TaskType, b.TaskType) &&
+		ptrEqual(a.Title, b.Title) &&
+		ptrEqual(a.OutputDimensionality, b.OutputDimensionality) &&
+		ptrEqual(cfgA.DocumentOCR, cfgB.DocumentOCR) &&
+		ptrEqual(cfgA.AudioTrackExtraction, cfgB.AudioTrackExtraction)
+}
+
+// geminiEmbeddingEntriesToBifrost converts requests[] entries to input items. Params shared by
+// every entry go request-level so any provider accepts them; differing ones stay on each item.
+func geminiEmbeddingEntriesToBifrost(entries []GeminiEmbeddingRequest) ([]schemas.EmbeddingInputItem, *schemas.EmbeddingParameters, error) {
+	perItem := false
+	for _, entry := range entries[1:] {
+		if !sameGeminiEmbeddingParams(entries[0], entry) {
+			perItem = true
+			break
+		}
+	}
+	items := make([]schemas.EmbeddingInputItem, 0, len(entries))
+	for _, entry := range entries {
+		content, err := geminiContentToEmbeddingContent(entry.Content)
+		if err != nil {
+			return nil, nil, err
+		}
+		item := schemas.EmbeddingInputItem{Content: content}
+		if perItem {
+			item.Params = applyBifrostEmbeddingParams(nil, entry)
+		}
+		items = append(items, item)
+	}
+	if perItem {
+		return items, nil, nil
+	}
+	return items, applyBifrostEmbeddingParams(nil, entries[0]), nil
+}
+
+// ToBifrostEmbeddingRequest converts a single :embedContent request; its params are request-level.
+func (r *GeminiEmbeddingRequest) ToBifrostEmbeddingRequest(ctx *schemas.BifrostContext) (*schemas.BifrostEmbeddingRequest, error) {
+	if r == nil {
+		return nil, providerUtils.InvalidRequestErrorf("embedding request is empty")
+	}
+	content, err := geminiContentToEmbeddingContent(r.Content)
+	if err != nil {
+		return nil, fmt.Errorf("error converting embedding content: %w", err)
+	}
+	provider, model := schemas.ParseModelString(r.Model, "")
+	return &schemas.BifrostEmbeddingRequest{
+		Provider:  provider,
+		Model:     model,
+		Fallbacks: schemas.ParseFallbacks(r.Fallbacks),
+		Input:     []schemas.EmbeddingInputItem{{Content: content}},
+		Params:    applyBifrostEmbeddingParams(nil, *r),
+	}, nil
+}
+
+// ToBifrostEmbeddingRequest converts a GeminiBatchEmbeddingRequest (the :batchEmbedContents
+// wire format) to a Bifrost embedding request.
+func (r *GeminiBatchEmbeddingRequest) ToBifrostEmbeddingRequest(ctx *schemas.BifrostContext) (*schemas.BifrostEmbeddingRequest, error) {
+	if r == nil || len(r.Requests) == 0 {
+		return nil, providerUtils.InvalidRequestErrorf("batch embedding request is empty")
+	}
+
+	provider, model := schemas.ParseModelString(r.Model, "")
+
+	items, params, err := geminiEmbeddingEntriesToBifrost(r.Requests)
+	if err != nil {
+		return nil, fmt.Errorf("error converting embedding content: %w", err)
+	}
+
+	return &schemas.BifrostEmbeddingRequest{
+		Provider:  provider,
+		Model:     model,
+		Fallbacks: schemas.ParseFallbacks(nil),
+		Input:     items,
+		Params:    params,
+	}, nil
+}
+
+// ToBifrostEmbeddingRequest converts a GeminiGenerationRequest to BifrostEmbeddingRequest format.
+// Each request entry maps to one element in Contents (one output embedding).
+func (request *GeminiGenerationRequest) ToBifrostEmbeddingRequest(ctx *schemas.BifrostContext) *schemas.BifrostEmbeddingRequest {
+	if request == nil {
+		return nil
+	}
+
+	provider, model := schemas.ParseModelString(request.Model, "")
+
+	// Create the embedding request
+	bifrostReq := &schemas.BifrostEmbeddingRequest{
+		Provider: provider,
+		Model:    model,
+
+		Fallbacks: schemas.ParseFallbacks(request.Fallbacks),
+	}
+
+	if len(request.Requests) > 0 {
+		items, params, err := geminiEmbeddingEntriesToBifrost(request.Requests)
+		if err != nil {
+			return nil
+		}
+		bifrostReq.Input = items
+		bifrostReq.Params = params
+		return bifrostReq
+	}
+
+	if len(request.Contents) > 0 {
+		items := make([]schemas.EmbeddingInputItem, 0, len(request.Contents))
+		for _, content := range request.Contents {
+			converted, err := geminiContentToEmbeddingContent(&content)
+			if err != nil {
+				return nil
+			}
+			items = append(items, schemas.EmbeddingInputItem{Content: converted})
+		}
+		bifrostReq.Input = items
+	}
+
+	return bifrostReq
+}

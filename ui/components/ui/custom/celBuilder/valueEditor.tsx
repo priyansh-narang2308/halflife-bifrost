@@ -1,0 +1,299 @@
+/**
+ * Value Editor Component for CEL Rule Builder
+ * Smart input component that adapts based on operator and field type
+ */
+
+import { ComboboxSelect, ComboboxSelectOption } from "@/components/ui/combobox";
+import { Input } from "@/components/ui/input";
+import { ModelSelector } from "@/components/ui/modelSelector";
+import { ProviderSelector } from "@/components/ui/providerSelector";
+import { Textarea } from "@/components/ui/textarea";
+import { useEffect, useState } from "react";
+import { ValueEditorProps, ValueEditorType } from "react-querybuilder";
+
+type CELValueEditorContext = {
+	validateRegex?: (pattern: string) => string | null;
+};
+
+export function ValueEditor({
+	value,
+	handleOnChange,
+	operator,
+	fieldData,
+	type,
+	context,
+}: ValueEditorProps & { context?: CELValueEditorContext }) {
+	// Compute all conditions upfront before any early returns
+	const isArrayOperator = operator === "in" || operator === "notIn";
+	const isRegexOperator = operator === "matches";
+	const isNullOperator = operator === "null" || operator === "notNull";
+
+	const validateRegex = context?.validateRegex;
+
+	// Get valueEditorType, handling both string and function types
+	const valueEditorType =
+		typeof fieldData?.valueEditorType === "function" ? fieldData.valueEditorType(operator) : fieldData?.valueEditorType;
+	const isKeyValueType = valueEditorType === ("keyValue" as ValueEditorType);
+	const isSelectType = valueEditorType === ("select" as ValueEditorType);
+
+	// Parse keyValue format: "key:value" or just "key" for null/notNull operators
+	const [keyValuePair, setKeyValuePair] = useState(() => {
+		if (!isKeyValueType) return { key: "", value: "" };
+		if (typeof value === "string" && value) {
+			if (value.includes(":")) {
+				const parts = value.split(":");
+				const key = parts[0] || "";
+				const valuePart = parts.slice(1).join(":") || "";
+				return { key: key.trim(), value: valuePart.trim() };
+			}
+			// Key-only value (for null/notNull operators)
+			return { key: value.trim(), value: "" };
+		}
+		return { key: "", value: "" };
+	});
+
+	useEffect(() => {
+		if (isKeyValueType && typeof value === "string" && value) {
+			if (value.includes(":")) {
+				const parts = value.split(":");
+				const key = parts[0] || "";
+				const valuePart = parts.slice(1).join(":") || "";
+				setKeyValuePair({ key: key.trim(), value: valuePart.trim() });
+			} else {
+				// Key-only value (for null/notNull operators)
+				setKeyValuePair({ key: value.trim(), value: "" });
+			}
+		} else {
+			setKeyValuePair({ key: "", value: "" });
+		}
+	}, [value, isKeyValueType]);
+
+	// For null/notNull operators, no value input needed
+	// (keyValue fields show key input in FieldSelector)
+	if (isNullOperator) {
+		return null;
+	}
+
+	// For keyValue fields, the key input is in FieldSelector.
+	// Here we handle updating the value part while preserving the key.
+	const handleKeyValueValueChange = (newValue: string) => {
+		const key = keyValuePair.key;
+		setKeyValuePair({ ...keyValuePair, value: newValue });
+		if (key && newValue) {
+			handleOnChange(`${key}:${newValue}`);
+		} else if (key) {
+			handleOnChange(key);
+		} else {
+			handleOnChange("");
+		}
+	};
+
+	// Handle model field with ModelSelector
+	const isModelField = fieldData?.name === "model";
+	if (isModelField && isSelectType) {
+		// For array operators (in, notIn), use multi-select
+		if (isArrayOperator) {
+			let selectedModels: string[] = [];
+			if (typeof value === "string" && value) {
+				try {
+					selectedModels = JSON.parse(value);
+					if (!Array.isArray(selectedModels)) {
+						selectedModels = [value];
+					}
+				} catch {
+					selectedModels = value
+						.split(",")
+						.map((v) => v.trim())
+						.filter((v) => v);
+				}
+			}
+
+			const handleMultiModelChange = (selected: string[]) => {
+				handleOnChange(selected.length > 0 ? JSON.stringify(selected) : "");
+			};
+
+			return (
+				<ModelSelector
+					multiple
+					value={selectedModels}
+					onChange={handleMultiModelChange}
+					placeholder="Select models..."
+					allowCustomModel
+					unfiltered
+					className="!min-h-9 w-[360px]"
+				/>
+			);
+		}
+
+		let valueToUse = value;
+		if (typeof value === "string" && value) {
+			try {
+				const parsedValue = JSON.parse(value);
+
+				if (Array.isArray(parsedValue)) {
+					valueToUse = parsedValue[0];
+				} else if (typeof parsedValue === "string") {
+					valueToUse = parsedValue;
+				}
+			} catch (error) { }
+		}
+
+		// For single operators (=, !=), use single select
+		return (
+			<ModelSelector
+				value={valueToUse || ""}
+				onChange={handleOnChange}
+				placeholder="Search for a model..."
+				allowCustomModel
+				unfiltered
+				className="border-input w-[360px]"
+			/>
+		);
+	}
+
+	// Handle select type (for provider dropdown)
+	if (isSelectType && fieldData?.values) {
+		const isProviderField = fieldData?.name === "provider";
+		const options: ComboboxSelectOption[] = (fieldData.values as any[])
+			.filter((option) => !("options" in option) && (option as any).name)
+			.map((option) => {
+				const optName = (option as any).name || "";
+				return {
+					value: optName,
+					label: (option as any).label || optName,
+					disabled: (option as any).disabled || false,
+				};
+			});
+
+		// For array operators with provider, use multi-select dropdown
+		if (isArrayOperator) {
+			// Parse comma-separated or JSON array value
+			let selectedValues: string[] = [];
+			if (typeof value === "string" && value) {
+				try {
+					// Try parsing as JSON array first
+					selectedValues = JSON.parse(value);
+					if (!Array.isArray(selectedValues)) {
+						selectedValues = [value];
+					}
+				} catch {
+					// Fall back to comma-separated
+					selectedValues = value
+						.split(",")
+						.map((v) => v.trim())
+						.filter((v) => v);
+				}
+			}
+
+			const handleMultiselectChange = (values: string[]) => {
+				handleOnChange(values.length > 0 ? JSON.stringify(values) : "");
+			};
+
+			return isProviderField ? (
+				<ProviderSelector
+					multiple
+					source="values"
+					values={options}
+					value={selectedValues}
+					onChange={handleMultiselectChange}
+					placeholder="Select providers..."
+					className="w-[360px]"
+					noPortal
+				/>
+			) : (
+				<ComboboxSelect
+					multiple
+					value={selectedValues}
+					onValueChange={handleMultiselectChange}
+					options={options}
+					placeholder="Select providers..."
+					className="h-9 w-[360px]"
+					noPortal
+				/>
+			);
+		}
+
+		return isProviderField ? (
+			<ProviderSelector
+				source="values"
+				values={options}
+				value={value || ""}
+				onChange={(newValue: string) => handleOnChange(newValue)}
+				placeholder={fieldData.placeholder || "Select..."}
+				className="w-[360px]"
+				noPortal
+			/>
+		) : (
+			<ComboboxSelect
+				value={value || null}
+				onValueChange={(newValue) => handleOnChange(newValue ?? "")}
+				options={options}
+				placeholder={fieldData.placeholder || "Select..."}
+				className="h-9 w-[360px]"
+				noPortal
+			/>
+		);
+	}
+
+	// Handle keyValue type (for header and parameter)
+	// Key input is rendered in FieldSelector, only show value input here
+	if (isKeyValueType) {
+		return (
+			<Input
+				type="text"
+				value={keyValuePair.value}
+				onChange={(e) => handleKeyValueValueChange(e.target.value)}
+				placeholder="Value"
+				className="w-[180px]"
+				data-testid="cel-builder-keyvalue-value-input"
+			/>
+		);
+	}
+
+	const placeholder = isArrayOperator
+		? "Enter comma-separated values or JSON array"
+		: isRegexOperator
+			? "e.g., .* (any), openai|anthropic (multiple), ^gpt.* (prefix)"
+			: fieldData?.placeholder || "Enter value...";
+
+	// Use textarea for array inputs
+	if (isArrayOperator) {
+		return (
+			<Textarea
+				value={value || ""}
+				onChange={(e) => handleOnChange(e.target.value)}
+				placeholder={placeholder}
+				className="min-h-[80px] w-[360px] font-mono text-sm"
+			/>
+		);
+	}
+
+	// Use text input with validation for regex
+	if (isRegexOperator) {
+		const regexError = validateRegex && value ? validateRegex(String(value)) : null;
+
+		return (
+			<div className="flex flex-col gap-1">
+				<Input
+					type="text"
+					value={value || ""}
+					onChange={(e) => handleOnChange(e.target.value)}
+					placeholder={placeholder}
+					className={`w-[360px] font-mono text-sm ${regexError ? "border-red-500 bg-red-50 dark:bg-red-950" : ""}`}
+				/>
+				{regexError && <p className="text-xs text-red-600 dark:text-red-400">{regexError}</p>}
+			</div>
+		);
+	}
+
+	// Use regular input for single values
+	return (
+		<Input
+			type={type === ("number" as ValueEditorType) ? "number" : "text"}
+			value={value || ""}
+			onChange={(e) => handleOnChange(e.target.value)}
+			placeholder={placeholder}
+			className="w-[360px]"
+		/>
+	);
+}

@@ -1,0 +1,971 @@
+package bifrost
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math/rand"
+	"net"
+	"net/url"
+	"slices"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/maximhq/bifrost/core/mcp"
+	"github.com/maximhq/bifrost/core/network"
+	"github.com/maximhq/bifrost/core/schemas"
+)
+
+// Aliases; canonical definitions live in schemas so EffectiveHTTPStatus can match them.
+const (
+	ProviderAutoResolveErrorMessage = schemas.ProviderAutoResolveErrorMessage
+	ModelAutoResolveErrorMessage    = schemas.ModelAutoResolveErrorMessage
+)
+
+// dynamicallyConfigurableProviders is the list of providers that can be dynamically configured.
+// Excluding providers that require extra configuration (e.g. Ollama, SGL, vLLM).
+var dynamicallyConfigurableProviders = []schemas.ModelProvider{
+	schemas.Anthropic,
+	schemas.Azure,
+	schemas.Bedrock,
+	schemas.BedrockMantle,
+	schemas.SageMaker,
+	schemas.BytePlus,
+	schemas.Cerebras,
+	schemas.Cohere,
+	schemas.Databricks,
+	schemas.DeepSeek,
+	schemas.Elevenlabs,
+	schemas.Gemini,
+	schemas.Groq,
+	schemas.HuggingFace,
+	schemas.MiniMax,
+	schemas.Mistral,
+	schemas.Nebius,
+	schemas.OpenAI,
+	schemas.OpenRouter,
+	schemas.Parasail,
+	schemas.Perplexity,
+	schemas.Sarvam,
+	schemas.Vertex,
+	schemas.Wafer,
+	schemas.XAI,
+}
+
+// isModelRequired returns true if the request type requires a model
+func isModelRequired(reqType schemas.RequestType) bool {
+	return reqType == schemas.TextCompletionRequest || reqType == schemas.TextCompletionStreamRequest || reqType == schemas.ChatCompletionRequest || reqType == schemas.ChatCompletionStreamRequest || reqType == schemas.ResponsesRequest || reqType == schemas.ResponsesStreamRequest || reqType == schemas.SpeechRequest || reqType == schemas.SpeechStreamRequest || reqType == schemas.TranscriptionRequest || reqType == schemas.TranscriptionStreamRequest || reqType == schemas.EmbeddingRequest || reqType == schemas.ImageGenerationRequest || reqType == schemas.ImageGenerationStreamRequest || reqType == schemas.VideoGenerationRequest
+}
+
+// Ptr returns a pointer to the given value.
+func Ptr[T any](v T) *T {
+	return &v
+}
+
+// providerRequiresKey returns true if the given provider requires an API key for authentication.
+func providerRequiresKey(customConfig *schemas.CustomProviderConfig) bool {
+	// Keyless custom providers are not allowed for Bedrock.
+	if customConfig != nil && customConfig.IsKeyLess && customConfig.BaseProviderType != schemas.Bedrock {
+		return false
+	}
+	return true
+}
+
+// CanProviderKeyValueBeEmpty returns true if the given provider allows the API key to be empty.
+// Some providers like Vertex and Bedrock have their credentials in additional key configs.
+// Ollama and SGL are keyless (API Key is optional) but use per-key server URLs.
+func CanProviderKeyValueBeEmpty(providerKey schemas.ModelProvider) bool {
+	return providerKey == schemas.Vertex || providerKey == schemas.Bedrock || providerKey == schemas.BedrockMantle || providerKey == schemas.SageMaker || providerKey == schemas.VLLM || providerKey == schemas.Azure || providerKey == schemas.Ollama || providerKey == schemas.SGL || providerKey == schemas.Databricks
+}
+
+// isKeySkippingAllowed gates SkipKeySelection on the provider this attempt resolved to. The flag
+// is set where the caller's OAuth token is the upstream credential: Claude Code on Anthropic, and
+// ChatGPT/Codex tokens on OpenAI passthrough, which pins its provider so no fallback inherits it.
+func isKeySkippingAllowed(baseProvider schemas.ModelProvider, requestType schemas.RequestType) bool {
+	if baseProvider == schemas.Anthropic {
+		return true
+	}
+	return baseProvider == schemas.OpenAI && (requestType == schemas.PassthroughRequest || requestType == schemas.PassthroughStreamRequest)
+}
+
+// calculateBackoff implements exponential backoff with jitter for retry attempts.
+func calculateBackoff(attempt int, config *schemas.ProviderConfig) time.Duration {
+	// Calculate an exponential backoff: initial * 2^attempt
+	backoff := min(config.NetworkConfig.RetryBackoffInitial*time.Duration(1<<uint(attempt)), config.NetworkConfig.RetryBackoffMax)
+	// Add jitter (20%)
+	jitter := float64(backoff) * (0.8 + 0.4*rand.Float64())
+	result := time.Duration(jitter)
+	// Ensure we never exceed the configured maximum
+	return min(result, config.NetworkConfig.RetryBackoffMax)
+}
+
+// waitRetryBackoff sleeps for backoff unless ctx ends first. It reports true when
+// the request was cancelled, in which case the caller must not run another attempt.
+// select picks uniformly among ready cases, so a cancel that lands together with
+// the timer expiry could otherwise be reported as a completed wait; ctx.Err() is
+// the authority after the select.
+func waitRetryBackoff(ctx context.Context, backoff time.Duration) (cancelled bool) {
+	backoffTimer := time.NewTimer(backoff)
+	select {
+	case <-backoffTimer.C:
+	case <-ctx.Done():
+		backoffTimer.Stop()
+	}
+	return ctx.Err() != nil
+}
+
+// validateRequestAfterPreRequestHooks validates the provider and model fields of the given request.
+func validateRequestAfterPreRequestHooks(req *schemas.BifrostRequest) *schemas.BifrostError {
+	if req == nil {
+		return newBifrostErrorFromMsg("bifrost request cannot be nil")
+	}
+	provider, model, _ := req.GetRequestFields()
+	if provider == "" {
+		return newBifrostErrorFromMsg(ProviderAutoResolveErrorMessage)
+	}
+	if isModelRequired(req.RequestType) && model == "" {
+		return newBifrostErrorFromMsg(ModelAutoResolveErrorMessage)
+	}
+	return nil
+}
+
+// validateKey validates the given key.
+func validateKey(providerKey schemas.ModelProvider, key *schemas.Key) error {
+	// Validate the key for the provider
+	switch providerKey {
+	case schemas.Azure:
+		if key.AzureKeyConfig == nil {
+			return fmt.Errorf("azure_key_config is required")
+		}
+		if key.AzureKeyConfig.Endpoint.GetValue() == "" {
+			return fmt.Errorf("azure_key_config.endpoint is required")
+		}
+	case schemas.Bedrock:
+		// BedrockKeyConfig is optional — an empty config is valid for IRSA / ambient credential auth.
+		if key.BedrockKeyConfig == nil {
+			key.BedrockKeyConfig = &schemas.BedrockKeyConfig{}
+		}
+	case schemas.BedrockMantle:
+		// BedrockMantleKeyConfig is optional — an empty config is valid for IRSA / ambient credential auth.
+		if key.BedrockMantleKeyConfig == nil {
+			key.BedrockMantleKeyConfig = &schemas.BedrockMantleKeyConfig{}
+		}
+	case schemas.SageMaker:
+		// SageMakerKeyConfig is optional — an empty config is valid for IRSA / ambient credential auth.
+		if key.SageMakerKeyConfig == nil {
+			key.SageMakerKeyConfig = &schemas.SageMakerKeyConfig{}
+		}
+	case schemas.Vertex:
+		if key.VertexKeyConfig == nil {
+			return fmt.Errorf("vertex_key_config is required")
+		}
+	case schemas.VLLM:
+		if key.VLLMKeyConfig == nil {
+			return fmt.Errorf("vllm_key_config is required")
+		}
+		if key.VLLMKeyConfig.URL.GetValue() == "" {
+			return fmt.Errorf("vllm_key_config.url is required")
+		}
+	case schemas.Ollama:
+		if key.OllamaKeyConfig == nil {
+			return fmt.Errorf("ollama_key_config is required")
+		}
+		if key.OllamaKeyConfig.URL.GetValue() == "" {
+			return fmt.Errorf("ollama_key_config.url is required")
+		}
+	case schemas.SGL:
+		if key.SGLKeyConfig == nil {
+			return fmt.Errorf("sgl_key_config is required")
+		}
+		if key.SGLKeyConfig.URL.GetValue() == "" {
+			return fmt.Errorf("sgl_key_config.url is required")
+		}
+	case schemas.Cloudflare:
+		if key.CloudflareKeyConfig == nil {
+			return fmt.Errorf("cloudflare_key_config is required")
+		}
+		if key.CloudflareKeyConfig.AccountID.GetValue() == "" {
+			return fmt.Errorf("cloudflare_key_config.account_id is required")
+		}
+	case schemas.Databricks:
+		// The workspace URL is not required here: an SDK caller may set it once as the
+		// provider base_url instead of per key. The provider raises a configuration error at
+		// request time when neither is set. What is checked here is that the OAuth M2M
+		// service principal is whole, since a half-configured pair can never authenticate.
+		if key.DatabricksKeyConfig != nil {
+			hasClientID := key.DatabricksKeyConfig.ClientID != nil && key.DatabricksKeyConfig.ClientID.GetValue() != ""
+			hasClientSecret := key.DatabricksKeyConfig.ClientSecret != nil && key.DatabricksKeyConfig.ClientSecret.GetValue() != ""
+			if hasClientID != hasClientSecret {
+				return fmt.Errorf("databricks_key_config.client_id and databricks_key_config.client_secret must be set together")
+			}
+		}
+	}
+	// oauth_key_config lets a key mint its bearer instead of carrying a static value. Only the
+	// OpenAI provider resolves it, so it is honoured on openai and on every custom provider
+	// built on that base; elsewhere it would be silently ignored, which reads as a working
+	// key that 401s, so it is refused instead. When the key has no static value the config is
+	// what authenticates, so it must be whole. A static value always wins over the config, so
+	// an incomplete config does not take a usable key out of rotation here; the management API
+	// still refuses to save one.
+	if key.OAuthKeyConfig != nil {
+		if !ProviderSupportsOAuthKeyConfig(providerKey) {
+			return fmt.Errorf("oauth_key_config is only supported on openai and on custom providers whose base_provider_type is openai")
+		}
+		if strings.TrimSpace(key.Value.GetValue()) == "" {
+			if err := key.OAuthKeyConfig.Validate(); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ProviderSupportsOAuthKeyConfig reports whether a provider (the base provider for a custom
+// one) resolves oauth_key_config into a bearer token.
+func ProviderSupportsOAuthKeyConfig(providerKey schemas.ModelProvider) bool {
+	return providerKey == schemas.OpenAI
+}
+
+// keyValueMayBeEmpty reports whether a key with no value is still usable: either the provider
+// carries its credentials in its own key config (CanProviderKeyValueBeEmpty), or the key
+// mints its bearer from oauth_key_config on a provider that honours it.
+func keyValueMayBeEmpty(providerKey schemas.ModelProvider, key *schemas.Key) bool {
+	return CanProviderKeyValueBeEmpty(providerKey) || (key.OAuthKeyConfig != nil && ProviderSupportsOAuthKeyConfig(providerKey))
+}
+
+// routingErrorSummary produces a sanitized, audit-safe one-line summary of a
+// BifrostError for emission to the per-request routing engine log trail.
+// It deliberately omits the upstream provider message — which can echo back
+// API keys, tokens, or user input — and surfaces only the error type and HTTP
+// status code. Used by the core fallback orchestrator so the routing log
+// records *why* a fallback was triggered without leaking secrets into log
+// storage or the UI.
+func routingErrorSummary(e *schemas.BifrostError) string {
+	if e == nil {
+		return "unknown error"
+	}
+	parts := make([]string, 0, 2)
+	if e.Error != nil && e.Error.Type != nil && *e.Error.Type != "" {
+		parts = append(parts, *e.Error.Type)
+	} else if e.Type != nil && *e.Type != "" {
+		parts = append(parts, *e.Type)
+	}
+	if e.StatusCode != nil {
+		parts = append(parts, fmt.Sprintf("HTTP %d", *e.StatusCode))
+	}
+	if len(parts) == 0 {
+		return "request failed"
+	}
+	return strings.Join(parts, " ")
+}
+
+// newBifrostError wraps a standard error into a BifrostError with IsBifrostError set to false.
+// This helper function reduces code duplication when handling non-Bifrost errors.
+func newBifrostError(err error) *schemas.BifrostError {
+	return &schemas.BifrostError{
+		IsBifrostError: false,
+		Error: &schemas.ErrorField{
+			Message: err.Error(),
+			Error:   err,
+		},
+	}
+}
+
+// newBifrostErrorFromMsg creates a BifrostError with a custom message.
+// This helper function is used for static error messages.
+func newBifrostErrorFromMsg(message string) *schemas.BifrostError {
+	return &schemas.BifrostError{
+		IsBifrostError: false,
+		Error: &schemas.ErrorField{
+			Message: message,
+		},
+	}
+}
+
+// newBifrostCtxDoneError creates a BifrostError from a cancelled/expired context.
+// It distinguishes DeadlineExceeded (504 RequestTimedOut) from Canceled (499 RequestCancelled).
+func newBifrostCtxDoneError(ctx *schemas.BifrostContext, stage string) *schemas.BifrostError {
+	var statusCode int
+	var errorType string
+	var message string
+
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		statusCode = 504
+		errorType = schemas.RequestTimedOut
+		message = fmt.Sprintf("request timed out %s: %v", stage, ctx.Err())
+	} else {
+		statusCode = 499
+		errorType = schemas.RequestCancelled
+		message = fmt.Sprintf("request cancelled %s: %v", stage, ctx.Err())
+	}
+
+	return &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		AllowFallbacks: new(false),
+		Error: &schemas.ErrorField{
+			Type:    &errorType,
+			Message: message,
+			Error:   ctx.Err(),
+		},
+	}
+}
+
+// newBifrostQueueFullError creates a 503 BifrostError for requests dropped
+// because the provider queue is full and dropExcessRequests is enabled.
+func newBifrostQueueFullError() *schemas.BifrostError {
+	statusCode := 503
+	errorType := schemas.RequestDropped
+	return &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error: &schemas.ErrorField{
+			Type:    &errorType,
+			Message: "request dropped: queue is full",
+		},
+	}
+}
+
+// newBifrostMessageChan creates a channel that sends a bifrost response.
+// It is used to send a bifrost response to the client.
+func newBifrostMessageChan(message *schemas.BifrostResponse) chan *schemas.BifrostStreamChunk {
+	// Filled and closed up front: a stream nobody reads holds no goroutine.
+	ch := make(chan *schemas.BifrostStreamChunk, 1)
+	ch <- &schemas.BifrostStreamChunk{
+		BifrostTextCompletionResponse:      message.TextCompletionResponse,
+		BifrostChatResponse:                message.ChatResponse,
+		BifrostResponsesStreamResponse:     message.ResponsesStreamResponse,
+		BifrostSpeechStreamResponse:        message.SpeechStreamResponse,
+		BifrostTranscriptionStreamResponse: message.TranscriptionStreamResponse,
+	}
+	close(ch)
+	return ch
+}
+
+// stampRequestedRoute records the provider/model the caller sent, before any
+// PreRequestHook (routing rules, load balancing, session routing) rewrites them,
+// so plugins can read the original and RoutingInfo can report it. Always written,
+// even when empty, so a reused context never reports a previous request's route.
+// A large-payload request carries its model in LargePayloadMetadata rather than
+// on req, and routing rewrites that in place, so it is copied here first.
+func stampRequestedRoute(ctx *schemas.BifrostContext, requested schemas.Route) {
+	model := requested.Model
+	if model == "" {
+		if metadata, _ := ctx.Value(schemas.BifrostContextKeyLargePayloadMetadata).(*schemas.LargePayloadMetadata); metadata != nil {
+			model = metadata.Model
+		}
+	}
+	ctx.SetValue(schemas.BifrostContextKeyRequestedProvider, requested.Provider)
+	ctx.SetValue(schemas.BifrostContextKeyRequestedModel, model)
+}
+
+// agentContinuationRoute returns the route that served the first turn of the MCP agent loop
+// this request continues, or nil when the request is not an agent-loop continuation.
+func agentContinuationRoute(ctx *schemas.BifrostContext) *schemas.RoutingInfo {
+	route, _ := ctx.Value(schemas.BifrostContextKeyMCPAgentServedRoute).(*schemas.RoutingInfo)
+	return route
+}
+
+// requestedRouteFromContext reads back the route stampRequestedRoute recorded.
+func requestedRouteFromContext(ctx *schemas.BifrostContext) schemas.Route {
+	provider, _ := ctx.Value(schemas.BifrostContextKeyRequestedProvider).(schemas.ModelProvider)
+	model, _ := ctx.Value(schemas.BifrostContextKeyRequestedModel).(string)
+	return schemas.Route{Provider: provider, Model: model}
+}
+
+// layerFallbackIdentity marks an attempt's routing info as a fallback's when the request is on one,
+// naming the primary from the previous attempt's record: the primary's own, or the primary it
+// carried on a later fallback (clearCtxForFallback keeps the record).
+func layerFallbackIdentity(ctx *schemas.BifrostContext, info *schemas.RoutingInfo) {
+	if fallbackIndex, _ := ctx.Value(schemas.BifrostContextKeyFallbackIndex).(int); fallbackIndex <= 0 {
+		return
+	}
+	info.IsFallback = true
+	prev, ok := ctx.Value(schemas.BifrostContextKeyRoutingInfo).(schemas.RoutingInfo)
+	if !ok {
+		return
+	}
+	if prev.IsFallback && prev.PrimaryProvider != nil {
+		info.PrimaryProvider = prev.PrimaryProvider
+		info.PrimaryModel = prev.PrimaryModel
+	} else if prev.Provider != "" {
+		primaryProvider, primaryModel := prev.Provider, prev.Model
+		info.PrimaryProvider = &primaryProvider
+		info.PrimaryModel = &primaryModel
+	}
+}
+
+// clearCtxForFallback clears the ctx values which are not applicable for fallback requests.
+func clearCtxForFallback(ctx *schemas.BifrostContext) {
+	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyID)
+	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyName)
+	ctx.ClearValue(schemas.BifrostContextKeyDirectKey)
+	ctx.ClearValue(schemas.BifrostContextKeyRoutingPinnedAPIKeyID)
+	ctx.ClearValue(schemas.BifrostContextKeyGovernanceIncludeOnlyKeys)
+	ctx.ClearValue(schemas.BifrostContextKeyChangeRequestType)
+	ctx.ClearValue(schemas.BifrostContextKeyAttemptTrail)
+	ctx.ClearValue(schemas.BifrostContextKeyLoadBalancerAttempt)
+	ctx.ClearValue(schemas.BifrostContextKeyStreamEndIndicator)
+	ctx.ClearValue(schemas.BifrostContextKeyConnectionClosed)
+	ctx.ClearValue(schemas.BifrostContextKeyStreamBodyExhausted)
+	ctx.ClearValue(schemas.BifrostContextKeyStreamParkedAfterFinish)
+	ctx.ClearValue(schemas.BifrostContextKeyStreamAttemptAbort)
+	ctx.ClearValue(schemas.BifrostContextKeySupportsAssistantPrefill)
+	ctx.ClearValue(schemas.BifrostContextKeyDisableStore)
+	// Provider response headers belong to the provider that produced them.
+	// If a fallback attempt fails pre-flight (no HTTP request issued), the
+	// previous provider's headers would otherwise survive on the context and
+	// be forwarded with the fallback's error response (#6973).
+	ctx.ClearValue(schemas.BifrostContextKeyProviderResponseHeaders)
+	// The Bedrock InvokeModel stream path installs an AWS event-stream reader
+	// here; a fallback to a plain-SSE provider on the same context must not
+	// inherit it. Cleared here, not when the invoke method returns, because the
+	// in-flight stream still reads it asynchronously (#6825).
+	ctx.ClearValue(schemas.BifrostContextKeySSEReaderFactory)
+}
+
+// restoreProviderResponseHeaders puts headers, the primary attempt's provider response headers,
+// back on ctx before the primary's error is returned once every fallback failed. Each fallback
+// attempt replaces them with its own provider's, so without this the transport forwards the last
+// fallback's headers (its request-id, rate-limit headers) with the primary's error body.
+func restoreProviderResponseHeaders(ctx *schemas.BifrostContext, headers map[string]string) {
+	if headers == nil {
+		ctx.ClearValue(schemas.BifrostContextKeyProviderResponseHeaders)
+		return
+	}
+	ctx.SetValue(schemas.BifrostContextKeyProviderResponseHeaders, headers)
+}
+
+// ClearContextForInternalRequest clears context state that is specific to the
+// caller's original request, so a context derived from it can carry an
+// internal sub-request (e.g. a plugin generating an embedding for its own
+// use) that must behave like a fresh top-level request.
+//
+// Two categories are cleared:
+//
+//   - Key routing: key-selection state resolved for the caller's provider
+//     (governance key allow-list, pinned/direct keys, key-selection skip). An
+//     internal request typically targets a different provider, and when it
+//     skips the plugin pipeline this state is never re-resolved — inherited,
+//     it is applied against the wrong provider's key pool and rejects every
+//     key ("no keys found for provider").
+//   - Body transport: raw-body passthrough and large-payload/large-response
+//     streaming state, plus caller-forwarded extra headers and the caller's
+//     URL-path override. Inherited, these make providers send the caller's
+//     raw or streamed body instead of marshaling the internal request, route
+//     it to the caller's endpoint path instead of the internal request's own,
+//     and forward the caller's headers on a call the caller doesn't own.
+//   - Inbound-dialect witness: the surface an Anthropic Messages caller sent
+//     natively (their own thinking mode and sampling scalars), recorded at
+//     ingress so the Anthropic egress can rebuild what the neutral request
+//     shape cannot carry. Inherited, it would answer a plugin's own Sonnet 5.5
+//     request with the caller's parameters rather than the ones that request
+//     actually carries.
+//
+// Deliberately not cleared: tracing/observability keys (the sub-request
+// should stay tied to the caller's trace) and
+// BifrostContextKeySkipPluginPipeline (whether the internal request runs the
+// plugin pipeline is the caller's decision).
+// virtualKeyHeader carries Bifrost's own virtual key. IsSensitiveHeader redacts its value
+// wherever captured headers are exported; as an extra-header span attribute it is dropped
+// outright, since even its presence says nothing useful about the request.
+const virtualKeyHeader = "x-bf-vk"
+
+// extraHeaderSpanAttribute returns the span-attribute value for a caller-supplied header and
+// whether it should be exported at all. The virtual key is dropped outright; other
+// credential-bearing headers keep their key (presence is useful) with the value redacted.
+func extraHeaderSpanAttribute(name string, values []string) (any, bool) {
+	if name == "" || len(values) == 0 {
+		return nil, false
+	}
+	if strings.EqualFold(name, virtualKeyHeader) {
+		return nil, false
+	}
+	if schemas.IsSensitiveHeader(name) {
+		return schemas.RedactedAttrValue, true
+	}
+	if len(values) == 1 {
+		return values[0], true
+	}
+	return values, true
+}
+
+func ClearContextForInternalRequest(ctx *schemas.BifrostContext) {
+	// This write is load-bearing for every ClearValue below it, not just for the
+	// witness it parks. ClearValue shadows a parent's value through this context's
+	// OWN value map, and NewBifrostContext leaves that map unallocated until
+	// something is written; on a fresh derived context every ClearValue is
+	// therefore a no-op and the caller's values - their direct key, api-key id and
+	// extra headers among them - stay visible to the sub-request. SetValue
+	// allocates the map, so it has to come first. The egress type assertion treats
+	// the nil it parks here as no witness at all.
+	ctx.SetValue(schemas.BifrostContextKeyAnthropicNativeRequestSurface, nil)
+	// Key routing.
+	ctx.ClearValue(schemas.BifrostContextKeyGovernanceIncludeOnlyKeys)
+	ctx.ClearValue(schemas.BifrostContextKeyRoutingPinnedAPIKeyID)
+	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyID)
+	ctx.ClearValue(schemas.BifrostContextKeyAPIKeyName)
+	ctx.ClearValue(schemas.BifrostContextKeyDirectKey)
+	ctx.ClearValue(schemas.BifrostContextKeySkipKeySelection)
+	ctx.ClearValue(schemas.BifrostContextKeyLoadBalancerAttempt)
+	// Body transport.
+	ctx.ClearValue(schemas.BifrostContextKeyUseRawRequestBody)
+	ctx.ClearValue(schemas.BifrostContextKeyRawRequestBodyTextRewriter)
+	ctx.ClearValue(schemas.BifrostContextKeyRawStreamTextCodec)
+	ctx.ClearValue(schemas.BifrostContextKeySendBackRawRequest)
+	ctx.ClearValue(schemas.BifrostContextKeySendBackRawResponse)
+	ctx.ClearValue(schemas.BifrostContextKeyPassthroughOverridesPresent)
+	ctx.ClearValue(schemas.BifrostContextKeyLargePayloadMode)
+	ctx.ClearValue(schemas.BifrostContextKeyLargeResponseMode)
+	ctx.ClearValue(schemas.BifrostContextKeyExtraHeaders)
+	ctx.ClearValue(schemas.BifrostContextKeyPassthroughHeaders)
+	ctx.ClearValue(schemas.BifrostContextKeyURLPath)
+}
+
+// PrepareContextForInternalRequest marks ctx as an internal sub-request issued
+// by a plugin on its own behalf. It skips the plugin pipeline — the request
+// cannot recurse back into the plugin that issued it — and sheds the
+// caller-specific key-routing and body-transport state documented on
+// ClearContextForInternalRequest. Plugins should call this instead of setting
+// BifrostContextKeySkipPluginPipeline (a reserved core key) themselves.
+func PrepareContextForInternalRequest(ctx *schemas.BifrostContext) {
+	ctx.SetValue(schemas.BifrostContextKeySkipPluginPipeline, true)
+	ClearContextForInternalRequest(ctx)
+}
+
+// PrepareContextForInternalEmbeddingRequest prepares a plugin-owned embedding request without capturing its raw payloads.
+func PrepareContextForInternalEmbeddingRequest(ctx *schemas.BifrostContext) {
+	PrepareContextForInternalRequest(ctx)
+	ctx.SetValue(schemas.BifrostContextKeyAllowPerRequestRawOverride, true)
+	ctx.SetValue(schemas.BifrostContextKeySendBackRawRequest, false)
+	ctx.SetValue(schemas.BifrostContextKeySendBackRawResponse, false)
+	ctx.SetValue(schemas.BifrostContextKeyAllowPerRequestStorageOverride, true)
+	ctx.SetValue(schemas.BifrostContextKeyStoreRawRequestResponse, false)
+}
+
+var supportedBaseProvidersSet = func() map[schemas.ModelProvider]struct{} {
+	m := make(map[schemas.ModelProvider]struct{}, len(schemas.SupportedBaseProviders))
+	for _, p := range schemas.SupportedBaseProviders {
+		m[p] = struct{}{}
+	}
+	return m
+}()
+
+// IsSupportedBaseProvider reports whether providerKey is allowed as a base provider
+// for custom providers.
+func IsSupportedBaseProvider(providerKey schemas.ModelProvider) bool {
+	_, ok := supportedBaseProvidersSet[providerKey]
+	return ok
+}
+
+var standardProvidersSet = func() map[schemas.ModelProvider]struct{} {
+	m := make(map[schemas.ModelProvider]struct{}, len(schemas.StandardProviders))
+	for _, p := range schemas.StandardProviders {
+		m[p] = struct{}{}
+	}
+	return m
+}()
+
+// IsStandardProvider reports whether providerKey is a built-in (non-custom) provider.
+func IsStandardProvider(providerKey schemas.ModelProvider) bool {
+	_, ok := standardProvidersSet[providerKey]
+	return ok
+}
+
+// IsStreamRequestType returns true if the given request type is a stream request.
+func IsStreamRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.TextCompletionStreamRequest || reqType == schemas.ChatCompletionStreamRequest || reqType == schemas.ResponsesStreamRequest || reqType == schemas.ResponsesRetrieveStreamRequest || reqType == schemas.SpeechStreamRequest || reqType == schemas.TranscriptionStreamRequest || reqType == schemas.ImageGenerationStreamRequest || reqType == schemas.ImageEditStreamRequest || reqType == schemas.PassthroughStreamRequest || reqType == schemas.WebSocketResponsesRequest || reqType == schemas.RealtimeRequest
+}
+
+func GetTracerFromContext(ctx *schemas.BifrostContext) (schemas.Tracer, string, error) {
+	tracer, ok := ctx.Value(schemas.BifrostContextKeyTracer).(schemas.Tracer)
+	if !ok || tracer == nil {
+		return nil, "", fmt.Errorf("tracer not found in context")
+	}
+	traceID, ok := ctx.Value(schemas.BifrostContextKeyTraceID).(string)
+	if !ok || traceID == "" {
+		return nil, "", fmt.Errorf("traceID not found in context")
+	}
+	return tracer, traceID, nil
+}
+
+// isBatchRequestType returns true if the given request type is a batch API operation.
+func isBatchRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.BatchCreateRequest || reqType == schemas.BatchListRequest || reqType == schemas.BatchRetrieveRequest || reqType == schemas.BatchCancelRequest || reqType == schemas.BatchDeleteRequest || reqType == schemas.BatchResultsRequest
+}
+
+// isFileRequestType returns true if the given request type is a file API operation.
+func isFileRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.FileUploadRequest || reqType == schemas.FileListRequest || reqType == schemas.FileRetrieveRequest || reqType == schemas.FileDeleteRequest || reqType == schemas.FileContentRequest
+}
+
+// isCachedContentRequestType returns true if the given request type is a cached content lifecycle operation.
+func isCachedContentRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.CachedContentCreateRequest || reqType == schemas.CachedContentListRequest ||
+		reqType == schemas.CachedContentRetrieveRequest || reqType == schemas.CachedContentUpdateRequest ||
+		reqType == schemas.CachedContentDeleteRequest
+}
+
+// isContainerRequestType returns true if the given request type is a container API operation.
+func isContainerRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.ContainerCreateRequest || reqType == schemas.ContainerListRequest ||
+		reqType == schemas.ContainerRetrieveRequest || reqType == schemas.ContainerDeleteRequest ||
+		reqType == schemas.ContainerFileCreateRequest || reqType == schemas.ContainerFileListRequest ||
+		reqType == schemas.ContainerFileRetrieveRequest || reqType == schemas.ContainerFileContentRequest ||
+		reqType == schemas.ContainerFileDeleteRequest
+}
+
+// isModellessVideoRequestType returns true if the given request type is a video request that can
+// be served without a model. Callers gate on model == "", so video edit — which takes a model when
+// the source is uploaded and omits it when the source is an existing video ID — belongs here too.
+func isModellessVideoRequestType(reqType schemas.RequestType) bool {
+	switch reqType {
+	case schemas.VideoRetrieveRequest, schemas.VideoDownloadRequest, schemas.VideoListRequest,
+		schemas.VideoDeleteRequest, schemas.VideoRemixRequest, schemas.VideoEditRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+// isPassthroughRequestType returns true if the given request type is a passthrough request.
+func isPassthroughRequestType(reqType schemas.RequestType) bool {
+	return reqType == schemas.PassthroughRequest || reqType == schemas.PassthroughStreamRequest
+}
+
+// isResponsesLifecycleRequestType returns true for OpenAI Responses API lifecycle HTTP verbs.
+func isResponsesLifecycleRequestType(reqType schemas.RequestType) bool {
+	switch reqType {
+	case schemas.ResponsesRetrieveRequest, schemas.ResponsesRetrieveStreamRequest, schemas.ResponsesDeleteRequest, schemas.ResponsesCancelRequest, schemas.ResponsesInputItemsRequest:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsFinalChunk returns true if the given context is a final chunk.
+func IsFinalChunk(ctx *schemas.BifrostContext) bool {
+	if ctx == nil {
+		return false
+	}
+
+	isStreamEndIndicator := ctx.Value(schemas.BifrostContextKeyStreamEndIndicator)
+	if isStreamEndIndicator == nil {
+		return false
+	}
+
+	if f, ok := isStreamEndIndicator.(bool); ok {
+		return f
+	}
+
+	return false
+}
+
+// GetResponseFields extracts the request type, provider, original model, and resolved model from the result or error.
+func GetResponseFields(result *schemas.BifrostResponse, err *schemas.BifrostError) (requestType schemas.RequestType, provider schemas.ModelProvider, originalModel string, resolvedModel string) {
+	if result != nil {
+		extraFields := result.GetExtraFields()
+		return extraFields.RequestType, extraFields.Provider, extraFields.OriginalModelRequested, extraFields.ResolvedModelUsed
+	}
+	if err != nil {
+		return err.ExtraFields.RequestType, err.ExtraFields.Provider, err.ExtraFields.OriginalModelRequested, err.ExtraFields.ResolvedModelUsed
+	}
+	return
+}
+
+// GetResponseRoutingInfo extracts the RoutingInfo recorded on a completed
+// attempt — from the accumulated response, or the error when the attempt failed.
+func GetResponseRoutingInfo(result *schemas.BifrostResponse, err *schemas.BifrostError) schemas.RoutingInfo {
+	if result != nil {
+		return result.GetExtraFields().RoutingInfo
+	}
+	if err != nil {
+		return err.ExtraFields.RoutingInfo
+	}
+	return schemas.RoutingInfo{}
+}
+
+// MarshalUnsafe marshals the given value to a JSON string without escaping HTML characters.
+// Returns empty string if marshaling fails.
+func MarshalUnsafe(v any) string {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	err := encoder.Encode(v)
+	if err != nil {
+		return ""
+	}
+	// Encode adds a trailing newline, trim it
+	return strings.TrimSpace(buf.String())
+}
+
+// // [Deprecated] use err.GetErrorString() instead. Will be removed in a future release.
+func GetErrorMessage(err *schemas.BifrostError) string {
+	return err.GetErrorString()
+}
+
+// GetStringFromContext safely extracts a string value from context
+func GetStringFromContext(ctx context.Context, key any) string {
+	if value := ctx.Value(key); value != nil {
+		if str, ok := value.(string); ok {
+			return str
+		}
+	}
+	return ""
+}
+
+// GetIntFromContext safely extracts an int value from context
+func GetIntFromContext(ctx context.Context, key any) int {
+	if value := ctx.Value(key); value != nil {
+		if intValue, ok := value.(int); ok {
+			return intValue
+		}
+	}
+	return 0
+}
+
+// GetBoolFromContext safely extracts a bool value from context
+func GetBoolFromContext(ctx context.Context, key any) bool {
+	if value := ctx.Value(key); value != nil {
+		if boolValue, ok := value.(bool); ok {
+			return boolValue
+		}
+	}
+	return false
+}
+
+// RedactSensitiveString redacts sensitive information in a string
+func RedactSensitiveString(s string) string {
+	if s == "" {
+		return ""
+	}
+	// Show first 4 and last 4 characters for identification, rest is [REDACTED]
+	if len(s) <= 8 {
+		return "[REDACTED]"
+	}
+	return s[:4] + "[REDACTED]" + s[len(s)-4:]
+}
+
+// externalURLDNSLookupTimeout bounds the DNS resolution in ValidateExternalURL. The
+// package-level net.LookupIP has no context/deadline of its own, so a hung or blackholed
+// resolver (rather than a fast refusal) can block the caller indefinitely -- this timeout
+// closes that gap regardless of the caller's own retry/timeout logic, since those only
+// bound the HTTP request that follows resolution, not resolution itself.
+const externalURLDNSLookupTimeout = 5 * time.Second
+
+// lookupIPAddr is a seam over (&net.Resolver{}).LookupIPAddr so tests can substitute a
+// resolver that blocks until its context is canceled, proving externalURLDNSLookupTimeout
+// actually cuts off an in-flight lookup rather than only a lookup whose context had
+// already expired before it started.
+var lookupIPAddr = (&net.Resolver{}).LookupIPAddr
+
+// ValidateExternalURL validates a URL for security concerns (SSRF protection).
+// When allowPrivateNetwork is true, RFC 1918 private IPs are permitted (for k8s/LAN deployments).
+// Link-local addresses (169.254.x.x, fe80::) are always blocked regardless of allowPrivateNetwork.
+func ValidateExternalURL(urlStr string, allowPrivateNetwork bool) error {
+	if urlStr == "" {
+		return fmt.Errorf("URL cannot be empty")
+	}
+	// Parse the URL
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return fmt.Errorf("invalid URL format: %w", err)
+	}
+	// Only allow HTTPS scheme (or HTTP for localhost in development)
+	if parsedURL.Scheme != "https" && parsedURL.Scheme != "http" {
+		return fmt.Errorf("only https and http schemes are allowed, got: %s", parsedURL.Scheme)
+	}
+	// Extract hostname
+	hostname := parsedURL.Hostname()
+	if hostname == "" {
+		return fmt.Errorf("URL must have a hostname")
+	}
+	// Resolve hostname to IP addresses. Bounded via net.Resolver.LookupIPAddr (not the
+	// package-level net.LookupIP, which has no way to accept a deadline) so a stalled
+	// resolver fails fast instead of hanging the caller forever.
+	lookupCtx, cancel := context.WithTimeout(context.Background(), externalURLDNSLookupTimeout)
+	defer cancel()
+	addrs, err := lookupIPAddr(lookupCtx, hostname)
+	if err != nil {
+		return fmt.Errorf("failed to resolve hostname: %w", err)
+	}
+	ips := make([]net.IP, len(addrs))
+	for i, addr := range addrs {
+		ips[i] = addr.IP
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() {
+			continue
+		}
+		// Unspecified (0.0.0.0, ::) and link-local (169.254.x.x, fe80::) are always blocked
+		if ip.IsUnspecified() {
+			return fmt.Errorf("unspecified IP addresses are not allowed")
+		}
+		if network.IsLinkLocal(ip) {
+			return fmt.Errorf("link-local IP addresses are not allowed")
+		}
+		if !allowPrivateNetwork && network.IsPrivateIP(ip) {
+			return fmt.Errorf("private IP addresses are not allowed")
+		}
+	}
+	return nil
+}
+
+// sanitizeSpanName sanitizes a span name to remove capital letters and spaces to make it a valid span name.
+func sanitizeSpanName(name string) string {
+	return schemas.SanitizePluginSpanName(name)
+}
+
+// pluginSpanNameSet holds the precomputed "plugin.<name>.<hook>" span names for
+// one plugin. Building them with Sprintf on every hook invocation costs ~2
+// allocs per span at request rate; plugin names are static, so cache them.
+type pluginSpanNameSet struct {
+	prehook            string
+	prerequesthook     string
+	posthook           string
+	mcpPrehook         string
+	mcpPosthook        string
+	mcpConnectPrehook  string
+	mcpConnectPosthook string
+}
+
+// pluginSpanNameCache maps plugin name -> *pluginSpanNameSet. Bounded by the
+// number of distinct registered plugins.
+var pluginSpanNameCache sync.Map
+
+func pluginSpanNamesFor(name string) *pluginSpanNameSet {
+	if v, ok := pluginSpanNameCache.Load(name); ok {
+		return v.(*pluginSpanNameSet)
+	}
+	s := sanitizeSpanName(name)
+	set := &pluginSpanNameSet{
+		prehook:            "plugin." + s + ".prehook",
+		prerequesthook:     "plugin." + s + ".prerequesthook",
+		posthook:           "plugin." + s + ".posthook",
+		mcpPrehook:         "plugin." + s + ".mcp_prehook",
+		mcpPosthook:        "plugin." + s + ".mcp_posthook",
+		mcpConnectPrehook:  "plugin." + s + ".mcp_connect_prehook",
+		mcpConnectPosthook: "plugin." + s + ".mcp_connect_posthook",
+	}
+	if v, loaded := pluginSpanNameCache.LoadOrStore(name, set); loaded {
+		return v.(*pluginSpanNameSet)
+	}
+	return set
+}
+
+// IsCodemodeTool returns true if the given tool name is a codemode tool.
+func IsCodemodeTool(toolName string) bool {
+	return mcp.IsCodeModeTool(toolName)
+}
+
+// isPromptOptionalImageEditType returns true for edit task types that do not require a text prompt.
+// It normalises hyphenated variants (e.g. "erase-object") to underscore form before matching.
+func isPromptOptionalImageEditType(t *string) bool {
+	if t == nil {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(*t))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	return slices.Contains(
+		[]string{"background_removal", "remove_background", "remove_bg", "erase_object", "upscale", "upscale_fast", "mask", "segmentation", "vectorize", "controlnet_preprocess", "controlnet", "preprocess"},
+		normalized,
+	)
+}
+
+// isPromptOptionalVideoEditType returns true for video edit task types that are driven purely by
+// the source video and take no text prompt.
+func isPromptOptionalVideoEditType(t *string) bool {
+	if t == nil {
+		return false
+	}
+	normalized := strings.ToLower(strings.TrimSpace(*t))
+	normalized = strings.ReplaceAll(normalized, "-", "_")
+	return slices.Contains(
+		[]string{"background_removal", "remove_background", "remove_bg", "upscale"},
+		normalized,
+	)
+}
+
+// wrapConvertedStreamPostHookRunner wraps a PostHookRunner so that streaming
+// responses produced by a type-converted request are converted back to the
+// caller's original type before the post-hook runs. Each converted chunk is
+// marked with ConvertedRequestType: its RawResponse is still the target API's
+// bytes, which integrations must not echo to a client of the original API.
+func wrapConvertedStreamPostHookRunner(postHookRunner schemas.PostHookRunner, targetType schemas.RequestType) schemas.PostHookRunner {
+	roleSent := false
+	var identity chatStreamIdentity
+	return func(ctx *schemas.BifrostContext, result *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError) {
+		if result != nil {
+			switch targetType {
+			case schemas.ChatCompletionRequest:
+				// text→chat: convert chat stream chunk back to text completion
+				if result.ChatResponse != nil {
+					if converted := result.ChatResponse.ToBifrostTextCompletionResponse(); converted != nil {
+						converted.ExtraFields.ConvertedRequestType = targetType
+						result = &schemas.BifrostResponse{TextCompletionResponse: converted}
+					}
+				}
+			case schemas.ResponsesRequest:
+				// chat→responses: convert responses stream chunk back to chat
+				if result.ResponsesStreamResponse != nil {
+					if converted := result.ResponsesStreamResponse.ToBifrostChatResponse(); converted != nil {
+						roleSent = setAssistantRoleOnce(converted, roleSent)
+						identity.apply(converted)
+						converted.ExtraFields.ConvertedRequestType = targetType
+						result = &schemas.BifrostResponse{ChatResponse: converted}
+					}
+				}
+			}
+		}
+		return postHookRunner(ctx, result, bifrostErr)
+	}
+}
+
+// chatStreamIdentity holds the id, model and created of a converted chat stream.
+// Only the response.created, in_progress and completed events carry the Response
+// object, so the deltas between them convert without these fields. OpenAI SDK
+// stream accumulators drop a chunk whose id differs from the stream's.
+type chatStreamIdentity struct {
+	id      string
+	model   string
+	created int
+}
+
+// apply records each field a chunk carries and fills in each one it lacks.
+func (s *chatStreamIdentity) apply(resp *schemas.BifrostChatResponse) {
+	if resp.ID == "" {
+		resp.ID = s.id
+	} else {
+		s.id = resp.ID
+	}
+	if resp.Model == "" {
+		resp.Model = s.model
+	} else {
+		s.model = resp.Model
+	}
+	if resp.Created == 0 {
+		resp.Created = s.created
+	} else {
+		s.created = resp.Created
+	}
+}
+
+// setAssistantRoleOnce puts the assistant role on the first delta of a
+// converted chat stream and clears it from later deltas. OpenAI-compatible
+// clients read the role from the first chunk only, and some concatenate a
+// repeated one. The stream converter emits a single choice per event. It
+// reports whether the role has been sent.
+func setAssistantRoleOnce(resp *schemas.BifrostChatResponse, roleSent bool) bool {
+	if len(resp.Choices) == 0 || resp.Choices[0].ChatStreamResponseChoice == nil || resp.Choices[0].Delta == nil {
+		return roleSent
+	}
+	if roleSent {
+		resp.Choices[0].Delta.Role = nil
+	} else {
+		resp.Choices[0].Delta.Role = schemas.Ptr(string(schemas.ChatMessageRoleAssistant))
+	}
+	return true
+}

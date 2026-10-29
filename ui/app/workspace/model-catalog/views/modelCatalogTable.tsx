@@ -1,0 +1,206 @@
+import PageTitle from "@/components/pageTitle";
+import { Badge } from "@/components/ui/badge";
+import { Card, CardContent } from "@/components/ui/card";
+import { ProviderSelector } from "@/components/ui/providerSelector";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { ProviderIconType, RenderProviderIcon } from "@/lib/constants/icons";
+import { ProviderLabels } from "@/lib/constants/logs";
+import { Info } from "lucide-react";
+
+function formatCost(dollars: number) {
+	return `$${dollars.toFixed(4)}`;
+}
+
+export interface ModelCatalogRow {
+	providerName: string;
+	isCustom: boolean;
+	baseProviderType?: string;
+	modelsUsed: string[];
+	totalTraffic24h: number;
+	totalCost24h: number;
+}
+
+// The filter spells "no provider filter" as a sentinel, since the control needs a value to
+// show for it. Module level so its identity is stable across renders.
+const ALL_PROVIDERS_VALUE = "all";
+const ALL_PROVIDERS_OPTION = { value: ALL_PROVIDERS_VALUE, label: "All Providers" };
+
+interface ModelCatalogTableProps {
+	rows: ModelCatalogRow[];
+	providerFilter: string;
+	onProviderFilterChange: (value: string) => void;
+	totalProviders: number;
+	totalModels: number;
+	totalRequests24h: number;
+	totalCost24h: number;
+	isLoadingModels: boolean;
+}
+
+export default function ModelCatalogTable({
+	rows,
+	providerFilter,
+	onProviderFilterChange,
+	totalProviders,
+	totalModels,
+	totalRequests24h,
+	totalCost24h,
+	isLoadingModels,
+}: ModelCatalogTableProps) {
+	const summaryCards = [
+		{ label: "Total Providers", value: totalProviders.toLocaleString() },
+		{ label: "Total Models", value: totalModels.toLocaleString() },
+		{ label: "Total Requests (24h)", value: totalRequests24h.toLocaleString() },
+		{ label: "Total Cost (24h)", value: formatCost(totalCost24h) },
+	];
+
+	return (
+		<div className="space-y-6">
+			{/* Summary Cards */}
+			<div className="grid grid-cols-1 gap-4 md:grid-cols-4">
+				{summaryCards.map((card) => (
+					<Card key={card.label} className="py-4 shadow-none">
+						<CardContent className="px-4">
+							<p className="text-muted-foreground text-xs">{card.label}</p>
+							<p className="mt-1 text-xl font-semibold">{card.value}</p>
+						</CardContent>
+					</Card>
+				))}
+			</div>
+
+			{/* Header + Filter */}
+			<div className="flex items-center justify-end">
+				<PageTitle title="Model Catalog">Overview of all configured providers, models, and usage.</PageTitle>
+				<ProviderSelector
+					data-testid="model-catalog-provider-trigger"
+					ariaLabel="Filter by provider"
+					className="w-[200px]"
+					allOption={ALL_PROVIDERS_OPTION}
+					value={providerFilter || ALL_PROVIDERS_VALUE}
+					onChange={(val: string) => onProviderFilterChange(val === ALL_PROVIDERS_VALUE ? "" : val)}
+				/>
+			</div>
+
+			{/* Table */}
+			<div className="rounded-sm border">
+				<Table className="min-w-[760px] table-fixed">
+					<colgroup>
+						<col className="w-[220px]" />
+						<col />
+						<col className="w-[180px]" />
+						<col className="w-[160px]" />
+					</colgroup>
+					<TableHeader>
+						<TableRow>
+							<TableHead>Provider</TableHead>
+							<TableHead>
+								<TooltipProvider>
+									<div className="flex items-center gap-1">
+										Models
+										<Tooltip>
+											<TooltipTrigger aria-label="About the models column" data-testid="model-catalog-models-info-trigger">
+												<Info className="text-muted-foreground h-3.5 w-3.5" aria-hidden="true" />
+											</TooltipTrigger>
+											<TooltipContent side="bottom">Models used in the last 30 days</TooltipContent>
+										</Tooltip>
+									</div>
+								</TooltipProvider>
+							</TableHead>
+							<TableHead className="text-right">Total Traffic (24h)</TableHead>
+							<TableHead className="text-right">Total Cost (24h)</TableHead>
+						</TableRow>
+					</TableHeader>
+					<TableBody>
+						{rows.length === 0 ? (
+							<TableRow>
+								<TableCell colSpan={4} className="h-24 text-center">
+									<span className="text-muted-foreground text-sm">No matching providers found.</span>
+								</TableCell>
+							</TableRow>
+						) : (
+							rows.map((row) => (
+								<TableRow key={row.providerName}>
+									<TableCell className="overflow-hidden">
+										<div className="flex items-center gap-2">
+											<RenderProviderIcon
+												provider={(row.isCustom ? row.baseProviderType : row.providerName) as ProviderIconType}
+												size="sm"
+												className="h-4 w-4 shrink-0"
+											/>
+											<span className="truncate font-medium">
+												{row.isCustom
+													? row.providerName
+													: ProviderLabels[row.providerName as keyof typeof ProviderLabels] || row.providerName}
+											</span>
+											{row.isCustom && (
+												<Badge variant="secondary" className="text-muted-foreground shrink-0 px-1.5 py-0.5 text-[10px] font-bold">
+													CUSTOM
+												</Badge>
+											)}
+										</div>
+									</TableCell>
+									<TableCell className="overflow-hidden">
+										{isLoadingModels ? (
+											<div className="flex items-center gap-1">
+												<Skeleton className="h-5 w-24 rounded-full" />
+												<Skeleton className="h-5 w-32 rounded-full" />
+												<Skeleton className="h-5 w-20 rounded-full" />
+											</div>
+										) : (
+											<ModelsUsedCell models={row.modelsUsed} />
+										)}
+									</TableCell>
+									<TableCell className="text-right font-mono text-sm">{row.totalTraffic24h.toLocaleString()}</TableCell>
+									<TableCell className="text-right font-mono text-sm">{formatCost(row.totalCost24h)}</TableCell>
+								</TableRow>
+							))
+						)}
+					</TableBody>
+				</Table>
+			</div>
+		</div>
+	);
+}
+
+function ModelsUsedCell({ models: rawModels }: { models: string[] }) {
+	const models = Array.from(new Set(rawModels.filter(Boolean)));
+	if (models.length === 0) {
+		return <span className="text-muted-foreground text-sm">-</span>;
+	}
+
+	const MAX_VISIBLE = 3;
+	const visible = models.slice(0, MAX_VISIBLE);
+	const remaining = models.length - MAX_VISIBLE;
+
+	return (
+		<TooltipProvider>
+			<div className="flex flex-wrap items-center gap-1">
+				{visible.map((m) => (
+					<Tooltip key={m}>
+						<TooltipTrigger asChild>
+							<Badge variant="outline" className="block max-w-[220px] truncate text-xs font-normal">
+								{m}
+							</Badge>
+						</TooltipTrigger>
+						<TooltipContent side="bottom" className="max-w-xs break-all">
+							{m}
+						</TooltipContent>
+					</Tooltip>
+				))}
+				{remaining > 0 && (
+					<Tooltip>
+						<TooltipTrigger data-testid="model-catalog-models-overflow-trigger">
+							<Badge variant="outline" className="text-xs font-normal">
+								+{remaining} more
+							</Badge>
+						</TooltipTrigger>
+						<TooltipContent side="bottom" className="max-w-xs">
+							{models.slice(MAX_VISIBLE).join(", ")}
+						</TooltipContent>
+					</Tooltip>
+				)}
+			</div>
+		</TooltipProvider>
+	);
+}

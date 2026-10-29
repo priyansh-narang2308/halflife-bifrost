@@ -1,0 +1,6120 @@
+package logging
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+
+	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/framework/configstore"
+	cstables "github.com/maximhq/bifrost/framework/configstore/tables"
+	"github.com/maximhq/bifrost/framework/grant"
+	"github.com/maximhq/bifrost/framework/jobaccounting"
+	"github.com/maximhq/bifrost/framework/logstore"
+	"github.com/maximhq/bifrost/framework/modelcatalog"
+	"github.com/maximhq/bifrost/framework/modelcatalog/datasheet"
+	"github.com/maximhq/bifrost/framework/streaming"
+	"github.com/maximhq/bifrost/framework/tracing"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
+)
+
+type testLogger struct{}
+
+func (testLogger) Debug(string, ...any)                   {}
+func (testLogger) Info(string, ...any)                    {}
+func (testLogger) Warn(string, ...any)                    {}
+func (testLogger) Error(string, ...any)                   {}
+func (testLogger) Fatal(string, ...any)                   {}
+func (testLogger) SetLevel(schemas.LogLevel)              {}
+func (testLogger) SetOutputType(schemas.LoggerOutputType) {}
+func (testLogger) LogHTTPRequest(schemas.LogLevel, string) schemas.LogEventBuilder {
+	return schemas.NoopLogEvent
+}
+
+// fakeBatchStore is an in-memory jobaccounting.SweepStore for logging tests.
+type fakeBatchStore struct {
+	jobs map[string]*cstables.TableProviderJob
+}
+
+func newFakeBatchStore() *fakeBatchStore {
+	return &fakeBatchStore{jobs: make(map[string]*cstables.TableProviderJob)}
+}
+
+func (s *fakeBatchStore) UpsertProviderJob(ctx context.Context, job *cstables.TableProviderJob) error {
+	if job.ID == "" {
+		job.ID = cstables.ProviderJobID(cstables.ProviderJobKindBatch, job.Provider, job.JobID)
+	}
+	existing, ok := s.jobs[job.ID]
+	if !ok {
+		copied := *job
+		if copied.AccountingStatus == "" {
+			copied.AccountingStatus = cstables.ProviderJobAccountingStatusPending
+		}
+		s.jobs[job.ID] = &copied
+		return nil
+	}
+	if job.Model != "" {
+		existing.Model = job.Model
+	}
+	if job.ProviderStatus != "" {
+		existing.ProviderStatus = job.ProviderStatus
+	}
+	if job.InputFileID != "" {
+		existing.InputFileID = job.InputFileID
+	}
+	if job.OutputFileID != nil {
+		existing.OutputFileID = job.OutputFileID
+	}
+	if job.NextCheckAt != nil {
+		existing.NextCheckAt = job.NextCheckAt
+	}
+	if cstables.IsTerminalBatchProviderStatus(job.ProviderStatus) &&
+		job.ProviderStatus != string(schemas.BatchStatusCompleted) &&
+		job.ProviderStatus != string(schemas.BatchStatusEnded) {
+		existing.NextCheckAt = nil
+	}
+	return nil
+}
+
+func (s *fakeBatchStore) GetProviderJob(ctx context.Context, jobID string) (*cstables.TableProviderJob, error) {
+	job, ok := s.jobs[jobID]
+	if !ok {
+		return nil, errors.New("missing batch job")
+	}
+	copied := *job
+	return &copied, nil
+}
+
+func (s *fakeBatchStore) ListDueProviderJobs(ctx context.Context, kind, provider string, now time.Time, limit int) ([]*cstables.TableProviderJob, error) {
+	var jobs []*cstables.TableProviderJob
+	if kind == "" {
+		kind = cstables.ProviderJobKindBatch
+	}
+	for _, job := range s.jobs {
+		// Mirror the real store: a sweeper only ever sees its own kind's rows.
+		jobKind := job.Kind
+		if jobKind == "" {
+			jobKind = cstables.ProviderJobKindBatch
+		}
+		if jobKind != kind {
+			continue
+		}
+		if provider != "" && job.Provider != provider {
+			continue
+		}
+		if job.NextCheckAt == nil || job.NextCheckAt.After(now) {
+			continue
+		}
+		if job.AccountingStatus == cstables.ProviderJobAccountingStatusAccounted || job.AccountingStatus == cstables.ProviderJobAccountingStatusUnpriceable {
+			continue
+		}
+		jobs = append(jobs, job)
+	}
+	return jobs, nil
+}
+
+func (s *fakeBatchStore) ClaimProviderJob(ctx context.Context, jobID, runnerID string, staleBefore time.Time, allowUnpriceable bool) (bool, error) {
+	entry, ok := s.jobs[jobID]
+	if !ok {
+		return false, errors.New("missing batch job")
+	}
+	if entry.AccountingStatus == cstables.ProviderJobAccountingStatusAccounted {
+		return false, nil
+	}
+	// "unpriceable" is a stop-polling marker, not a refusal of money: a caller
+	// holding real results may re-drive it. Mirrors the real store's allowUnpriceable,
+	// which this fake previously ignored — hiding the result-driven re-accounting path
+	// from every test using it.
+	if entry.AccountingStatus == cstables.ProviderJobAccountingStatusUnpriceable && !allowUnpriceable {
+		return false, nil
+	}
+	// Claim staleness reads claimed_at, not updated_at — updated_at is refreshed by
+	// the unfenced UpsertProviderJob, so it cannot represent claim age.
+	if entry.AccountingStatus == cstables.ProviderJobAccountingStatusProcessing &&
+		entry.ClaimedAt != nil && entry.ClaimedAt.After(staleBefore) {
+		return false, nil
+	}
+	now := time.Now().UTC()
+	rid := runnerID
+	entry.AccountingStatus = cstables.ProviderJobAccountingStatusProcessing
+	entry.RunnerID = &rid
+	entry.ClaimedAt = &now
+	entry.UpdatedAt = now
+	return true, nil
+}
+
+func (s *fakeBatchStore) markTerminal(id, status, reason string) error {
+	entry, ok := s.jobs[id]
+	if !ok {
+		return errors.New("missing batch job")
+	}
+	entry.AccountingStatus = status
+	entry.RunnerID = nil
+	entry.ClaimedAt = nil
+	if reason != "" {
+		entry.UnpriceableReason = &reason
+	}
+	return nil
+}
+
+func (s *fakeBatchStore) MarkProviderJobAggregateLogWritten(ctx context.Context, id, runnerID string) error {
+	entry, ok := s.jobs[id]
+	if !ok {
+		return errors.New("missing batch job")
+	}
+	now := time.Now().UTC()
+	entry.AggregateLogWrittenAt = &now
+	return nil
+}
+
+func (s *fakeBatchStore) MarkProviderJobGovernanceReported(ctx context.Context, id, runnerID string) error {
+	entry, ok := s.jobs[id]
+	if !ok {
+		return errors.New("missing batch job")
+	}
+	now := time.Now().UTC()
+	entry.GovernanceReportedAt = &now
+	return nil
+}
+
+func (s *fakeBatchStore) CompleteProviderJob(ctx context.Context, id, runnerID string) error {
+	return s.markTerminal(id, cstables.ProviderJobAccountingStatusAccounted, "")
+}
+
+func (s *fakeBatchStore) MarkProviderJobUnpriceable(ctx context.Context, id, runnerID, reason string, err error) error {
+	return s.markTerminal(id, cstables.ProviderJobAccountingStatusUnpriceable, reason)
+}
+
+func (s *fakeBatchStore) FailProviderJob(ctx context.Context, id, runnerID string, err error) error {
+	return s.markTerminal(id, cstables.ProviderJobAccountingStatusError, "")
+}
+
+func newTestStore(t testing.TB) logstore.LogStore {
+	t.Helper()
+
+	store, err := logstore.NewLogStore(context.Background(), &logstore.Config{
+		Enabled: true,
+		Type:    logstore.LogStoreTypeSQLite,
+		Config: &logstore.SQLiteConfig{
+			Path: filepath.Join(t.TempDir(), "logging.db"),
+		},
+	}, testLogger{})
+	if err != nil {
+		t.Fatalf("NewLogStore() error = %v", err)
+	}
+	return store
+}
+
+func TestProcessBatchReconcilesA2ACorrelationAfterInsert(t *testing.T) {
+	store := newTestStore(t)
+	t.Cleanup(func() { require.NoError(t, store.Close(context.Background())) })
+	plugin := &LoggerPlugin{ctx: context.Background(), store: store, logger: testLogger{}}
+	taskID, contextID := "task-1", "context-1"
+	now := time.Now().UTC()
+
+	plugin.processBatch(context.Background(), []*writeQueueEntry{{agentLog: &logstore.AgentLog{
+		ID: "request-first", Timestamp: now, RecordKind: "request", Status: "success", AgentName: "fixture", RequestID: "request-1",
+	}}})
+	plugin.processBatch(context.Background(), []*writeQueueEntry{{agentLog: &logstore.AgentLog{
+		ID: "event-later", Timestamp: now.Add(time.Second), RecordKind: "event", Status: "success", AgentName: "fixture", RequestID: "request-1", TaskID: &taskID, ContextID: &contextID,
+	}}})
+
+	found, err := store.FindAgentLog(context.Background(), "request-first")
+	require.NoError(t, err)
+	require.Equal(t, taskID, *found.TaskID)
+	require.Equal(t, contextID, *found.ContextID)
+}
+
+func TestUserAgentFromContextUsesRequestHeaders(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"user-agent": "codex-tui/1.0",
+	})
+	ctx.SetValue(schemas.BifrostContextKeyUserAgent, "fallback/1.0")
+
+	if got := userAgentFromContext(ctx); got != "codex-tui/1.0" {
+		t.Fatalf("expected request-header user agent, got %q", got)
+	}
+}
+
+func TestUserAgentFromContextUsesCanonicalRequestHeader(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"User-Agent": "Claude-Code/1.0",
+	})
+
+	if got := userAgentFromContext(ctx); got != "Claude-Code/1.0" {
+		t.Fatalf("expected canonical request-header user agent, got %q", got)
+	}
+}
+
+func TestUserAgentFromContextUsesUppercaseRequestHeader(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"USER-AGENT": "Cursor/0.47",
+	})
+
+	if got := userAgentFromContext(ctx); got != "Cursor/0.47" {
+		t.Fatalf("expected uppercase request-header user agent, got %q", got)
+	}
+}
+
+func TestUserAgentFromContextFallsBackWhenHeaderValueIsEmpty(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"user-agent": "",
+	})
+	ctx.SetValue(schemas.BifrostContextKeyUserAgent, "fallback/1.0")
+
+	if got := userAgentFromContext(ctx); got != "fallback/1.0" {
+		t.Fatalf("expected fallback user agent for empty header, got %q", got)
+	}
+}
+
+func TestUserAgentFromContextFallsBackToUserAgentKey(t *testing.T) {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyUserAgent, "cursor/0.47")
+
+	if got := userAgentFromContext(ctx); got != "cursor/0.47" {
+		t.Fatalf("expected fallback user agent, got %q", got)
+	}
+}
+
+// TestAntigravityLogClassification preserves synthetic raw agents while giving logs distinct built-in labels and honoring custom mappings.
+func TestAntigravityLogClassification(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	for userAgent, expected := range map[string]string{"antigravity/2.23.0": "Antigravity Desktop", "antigravity-cli/1.0": "Antigravity CLI"} {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{"user-agent": userAgent})
+		ctx.SetValue(schemas.BifrostContextKeyUserAgent, "bifrost-edge/0.1.0")
+		actual := userAgentFromContext(ctx)
+		if actual != userAgent || plugin.detectAppFromUserAgent(actual) != expected {
+			t.Fatalf("user agent %q was not classified as %s", actual, expected)
+		}
+		entry := &logstore.Log{}
+		applyUserAgent(entry, actual)
+		if entry.App == nil || *entry.App != expected || entry.UserAgent == nil || *entry.UserAgent != userAgent {
+			t.Fatalf("log lost raw agent or classification: %+v", entry)
+		}
+	}
+	plugin.userAgentMappings.Store([]compiledUserAgentMapping{{Pattern: "antigravity/", MatchType: schemas.UserAgentMappingMatchTypeContains, App: "Custom Antigravity"}})
+	if actual := plugin.detectAppFromUserAgent("antigravity/2.23.0"); actual != "Custom Antigravity" {
+		t.Fatalf("custom mapping overridden: %s", actual)
+	}
+}
+
+func TestPreLLMHookSetsAppContextFromDetectedApp(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close(context.Background())
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-app-context")
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"user-agent":   "claude-cli/2.1.168 (external, cli)",
+		"x-bf-vk":      "vk-test",
+		"x-bf-user-id": "user-test",
+	})
+
+	_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o-mini",
+			Params:   &schemas.ChatParameters{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	if got, _ := ctx.Value(schemas.BifrostContextKeyApp).(string); got != "claude-code" {
+		t.Fatalf("app context = %q, want claude-code", got)
+	}
+}
+
+// TestPreLLMHookContextKeyComesFromUserAgentNotAgentHeader replays the header
+// shape the desktop agent stamps for a Claude Cowork request: Cowork's runtime
+// shares Claude Code's CLI User-Agent, so the logging plugin derives
+// claude-code for the context key. Header-based app enforcement (X-Bf-App)
+// lives in the enterprise agent policy plugin, which prefers the header over
+// this context key.
+func TestPreLLMHookContextKeyComesFromUserAgentNotAgentHeader(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close(context.Background())
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-cowork-context")
+	// Captured from the agent's MITM → GATEWAY forwarding of a Cowork request.
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"user-agent":                "claude-cli/2.1.170 (external, local-agent, agent-sdk/0.3.170)",
+		"anthropic-client-platform": "desktop_app",
+		"x-app":                     "cli",
+		"x-bf-app":                  "claude-cowork",
+		"x-bifrost-agent":           "bifrost-agent/0.1.0",
+	})
+
+	_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.Anthropic,
+			Model:    "claude-opus-4-8",
+			Params:   &schemas.ChatParameters{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	if got, _ := ctx.Value(schemas.BifrostContextKeyApp).(string); got != "claude-code" {
+		t.Fatalf("app context = %q, want claude-code (derived from User-Agent)", got)
+	}
+}
+
+func TestCustomUserAgentMappingOverridesBuiltInDetection(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close(context.Background())
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+
+	_, err = plugin.CreateUserAgentMapping(context.Background(), &logstore.UserAgentMapping{
+		Pattern:   `claude-cli/\d+\.\d+`,
+		MatchType: string(schemas.UserAgentMappingMatchTypeRegex),
+		App:       "Internal Claude Wrapper",
+		IsActive:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUserAgentMapping() error = %v", err)
+	}
+
+	if got := plugin.detectAppFromUserAgent("claude-cli/2.1.168 (external, cli)"); got != "Internal Claude Wrapper" {
+		t.Fatalf("expected custom app mapping, got %q", got)
+	}
+}
+
+func TestPreLLMHookSetsAppContextFromCustomMapping(t *testing.T) {
+	store := newTestStore(t)
+	defer store.Close(context.Background())
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+	_, err = plugin.CreateUserAgentMapping(context.Background(), &logstore.UserAgentMapping{
+		Pattern:   `custom-wrapper/\d+`,
+		MatchType: string(schemas.UserAgentMappingMatchTypeRegex),
+		App:       "Internal Claude Wrapper",
+		IsActive:  true,
+	})
+	if err != nil {
+		t.Fatalf("CreateUserAgentMapping() error = %v", err)
+	}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-custom-app-context")
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"user-agent": "custom-wrapper/42",
+	})
+
+	_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o-mini",
+			Params:   &schemas.ChatParameters{},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	if got, _ := ctx.Value(schemas.BifrostContextKeyApp).(string); got != "internal-claude-wrapper" {
+		t.Fatalf("app context = %q, want internal-claude-wrapper", got)
+	}
+}
+
+func TestPostLLMHookNoPendingErrorPreservesMetadata(t *testing.T) {
+	store := newTestStore(t)
+	loggingHeaders := []string{"x-custom-log"}
+	plugin, err := Init(context.Background(), &Config{LoggingHeaders: &loggingHeaders}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-error-no-pending")
+	agentCorrelationID := strings.Repeat("a", maxPersistedAgentCorrelationIDLen+1)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"x-bf-lh-tenant":            "acme",
+		"x-custom-log":              "custom-value",
+		"X-Bf-Agent-Correlation-Id": agentCorrelationID,
+	})
+	ctx.SetValue(schemas.BifrostContextKeyDimensions, map[string]string{
+		"region": "us-east",
+	})
+	ctx.SetValue(schemas.BifrostIsAsyncRequest, true)
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceProjectID, "proj-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceProjectName, "Project One")
+	ctx.SetValue(schemas.BifrostContextKeySessionID, "session-no-pending-error")
+
+	statusCode := 500
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error:          &schemas.ErrorField{Message: "provider failed"},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType:            schemas.ChatCompletionRequest,
+			Provider:               schemas.OpenAI,
+			OriginalModelRequested: "gpt-4o",
+			ResolvedModelUsed:      "gpt-4o",
+		},
+	}
+
+	_, _, err = plugin.PostLLMHook(ctx, nil, bifrostErr)
+	if err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), "req-error-no-pending")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.Status != "error" {
+		t.Fatalf("expected error status, got %q", logEntry.Status)
+	}
+	if logEntry.MetadataParsed == nil {
+		t.Fatalf("expected metadata to be persisted")
+	}
+	if got := logEntry.MetadataParsed["tenant"]; got != "acme" {
+		t.Fatalf("expected tenant metadata acme, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["x-custom-log"]; got != "custom-value" {
+		t.Fatalf("expected configured header metadata custom-value, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["region"]; got != "us-east" {
+		t.Fatalf("expected dimension metadata us-east, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["isAsyncRequest"]; got != true {
+		t.Fatalf("expected async metadata true, got %#v", got)
+	}
+	if logEntry.ProjectID == nil || *logEntry.ProjectID != "proj-1" {
+		t.Fatalf("expected project ID proj-1 on the minimal-error entry, got %v", logEntry.ProjectID)
+	}
+	if logEntry.ProjectName == nil || *logEntry.ProjectName != "Project One" {
+		t.Fatalf("expected project name %q on the minimal-error entry, got %v", "Project One", logEntry.ProjectName)
+	}
+	if logEntry.SessionID == nil || *logEntry.SessionID != "session-no-pending-error" {
+		t.Fatalf("expected session ID on the minimal-error entry, got %v", logEntry.SessionID)
+	}
+	if logEntry.AgentCorrelationID == nil || *logEntry.AgentCorrelationID != agentCorrelationID[:maxPersistedAgentCorrelationIDLen] {
+		t.Fatalf("minimal-error agent correlation ID = %v, want %q", logEntry.AgentCorrelationID, agentCorrelationID[:maxPersistedAgentCorrelationIDLen])
+	}
+}
+
+func TestEmitAggregateLogRunsCallback(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		ctx:   context.Background(),
+		store: store,
+	}
+	callbacks := 0
+	plugin.SetLogCallback(func(ctx context.Context, logEntry *logstore.Log) {
+		callbacks++
+	})
+
+	entry := &logstore.Log{
+		ID:        "batch-cost:openai:callback",
+		Timestamp: time.Now().UTC(),
+		Object:    string(schemas.BatchResultsRequest),
+		Provider:  string(schemas.OpenAI),
+		Model:     "gpt-4o-mini",
+		Status:    "success",
+	}
+	plugin.EmitAggregateLog(context.Background(), entry)
+	if callbacks != 1 {
+		t.Fatalf("callback count after emit = %d, want 1", callbacks)
+	}
+}
+
+// captureObsPlugin is a minimal ObservabilityPlugin that extracts the attributes of
+// the first cost-bearing span in each injected trace. It copies the values out
+// synchronously (the tracer recycles the trace after Inject returns) and hands them
+// to the test over a channel.
+type captureObsPlugin struct {
+	spans chan map[string]any
+}
+
+func (c *captureObsPlugin) GetName() string { return "capture-obs" }
+func (c *captureObsPlugin) Cleanup() error  { return nil }
+func (c *captureObsPlugin) Inject(_ context.Context, trace *schemas.Trace) error {
+	if trace == nil {
+		return nil
+	}
+	spans := trace.Spans
+	if trace.RootSpan != nil {
+		spans = append(spans, trace.RootSpan)
+	}
+	for _, span := range spans {
+		if span == nil {
+			continue
+		}
+		if _, ok := span.Attributes[schemas.AttrUsageCost]; !ok {
+			continue
+		}
+		attrs := make(map[string]any, len(span.Attributes))
+		for k, v := range span.Attributes {
+			attrs[k] = v
+		}
+		select {
+		case c.spans <- attrs:
+		default:
+		}
+		return nil
+	}
+	return nil
+}
+
+// TestEmitAggregateLogEmitsSettlementSpan verifies the settlement→observability
+// bridge: a settled aggregate cost row is mirrored onto a span carrying the cost,
+// tokens, request type, and enrichment dimensions, so the trace-fed connectors
+// (Datadog/BigQuery/Splunk/OTEL/Kafka/Pub-Sub) can record batch/video cost that the
+// async settlement path would otherwise keep out of the tracing pipeline entirely.
+func TestEmitAggregateLogEmitsSettlementSpan(t *testing.T) {
+	logger := testLogger{}
+	tracer := tracing.NewTracer(tracing.NewTraceStore(time.Minute, logger), nil, logger)
+	capture := &captureObsPlugin{spans: make(chan map[string]any, 1)}
+	tracer.SetObservabilityPlugins([]schemas.ObservabilityPlugin{capture}, nil)
+
+	plugin := &LoggerPlugin{ctx: context.Background()}
+	plugin.SetSettlementTracer(tracer)
+
+	cost := 0.0123
+	teamID := "team-42"
+	vkID := "vk-7"
+	entry := &logstore.Log{
+		ID:               "batch-cost:openai:settlement-span",
+		Timestamp:        time.Now().UTC(),
+		Object:           string(schemas.BatchResultsRequest),
+		Provider:         string(schemas.OpenAI),
+		Model:            "gpt-4o-mini",
+		Status:           "success",
+		Cost:             &cost,
+		PromptTokens:     100,
+		CompletionTokens: 50,
+		TotalTokens:      150,
+		TeamID:           &teamID,
+		VirtualKeyID:     &vkID,
+		BatchDebugParsed: &schemas.BifrostBatchDebug{BatchID: "batch_abc123"},
+	}
+	plugin.EmitAggregateLog(context.Background(), entry)
+
+	select {
+	case attrs := <-capture.spans:
+		if got, _ := attrs[schemas.AttrBatchID].(string); got != "batch_abc123" {
+			t.Fatalf("span batch id = %v, want batch_abc123", attrs[schemas.AttrBatchID])
+		}
+		if got, _ := attrs[schemas.AttrUsageCost].(float64); got != cost {
+			t.Fatalf("span cost = %v, want %v", attrs[schemas.AttrUsageCost], cost)
+		}
+		if got, _ := attrs[schemas.AttrLegacyRequestType].(string); got != string(schemas.BatchResultsRequest) {
+			t.Fatalf("span request.type = %q, want %q", got, schemas.BatchResultsRequest)
+		}
+		if got, _ := attrs[schemas.AttrProviderName].(string); got != string(schemas.OpenAI) {
+			t.Fatalf("span provider = %q, want %q", got, schemas.OpenAI)
+		}
+		if got, _ := attrs[schemas.AttrRequestModel].(string); got != "gpt-4o-mini" {
+			t.Fatalf("span model = %q, want gpt-4o-mini", got)
+		}
+		if got, _ := attrs[schemas.AttrTotalTokens].(int); got != 150 {
+			t.Fatalf("span total tokens = %v, want 150", attrs[schemas.AttrTotalTokens])
+		}
+		if got, _ := attrs[schemas.AttrBifrostTeamID].(string); got != teamID {
+			t.Fatalf("span team_id = %q, want %q", got, teamID)
+		}
+		if got, _ := attrs[schemas.AttrBifrostVirtualKeyID].(string); got != vkID {
+			t.Fatalf("span virtual_key_id = %q, want %q", got, vkID)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no settlement span injected to the observability connector")
+	}
+}
+
+// TestEmitAggregateLogSkipsSettlementSpanWithoutCost verifies an unpriced aggregate
+// row emits no span (nothing for a connector to record), and that a nil tracer is a
+// safe no-op rather than a panic.
+func TestEmitAggregateLogSkipsSettlementSpanWithoutCost(t *testing.T) {
+	logger := testLogger{}
+	tracer := tracing.NewTracer(tracing.NewTraceStore(time.Minute, logger), nil, logger)
+	capture := &captureObsPlugin{spans: make(chan map[string]any, 1)}
+	tracer.SetObservabilityPlugins([]schemas.ObservabilityPlugin{capture}, nil)
+
+	plugin := &LoggerPlugin{ctx: context.Background()}
+	plugin.SetSettlementTracer(tracer)
+
+	entry := &logstore.Log{
+		ID:        "batch-cost:openai:no-cost",
+		Timestamp: time.Now().UTC(),
+		Object:    string(schemas.BatchResultsRequest),
+		Provider:  string(schemas.OpenAI),
+		Model:     "gpt-4o-mini",
+		Status:    "success",
+		// Cost intentionally nil.
+	}
+	plugin.EmitAggregateLog(context.Background(), entry)
+
+	select {
+	case <-capture.spans:
+		t.Fatal("unpriced aggregate row must not emit a settlement span")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Nil tracer must not panic.
+	plugin.SetSettlementTracer(nil)
+	cost := 1.0
+	entry.Cost = &cost
+	plugin.EmitAggregateLog(context.Background(), entry)
+}
+
+func TestLogSubscribersComposeAndUnsubscribe(t *testing.T) {
+	plugin := &LoggerPlugin{ctx: context.Background(), logger: testLogger{}}
+	primary, first, second := 0, 0, 0
+	plugin.SetLogCallback(func(context.Context, *logstore.Log) { primary++ })
+	unsubscribeFirst := plugin.SubscribeLogCallback(func(context.Context, *logstore.Log) { first++ })
+	plugin.SubscribeLogCallback(func(context.Context, *logstore.Log) { second++ })
+
+	plugin.notifyLogCallbacks(context.Background(), &logstore.Log{ID: "one"})
+	unsubscribeFirst()
+	unsubscribeFirst()
+	plugin.notifyLogCallbacks(context.Background(), &logstore.Log{ID: "two"})
+
+	if primary != 2 || first != 1 || second != 2 {
+		t.Fatalf("callback counts = primary:%d first:%d second:%d", primary, first, second)
+	}
+}
+
+// A delete a caller makes through the manager is announced to every
+// subscriber once the store has done it, with the ids; a delete the store
+// refused announces nothing, since nothing was deleted.
+func TestLogDeleteSubscribersAreToldWhatWasDeleted(t *testing.T) {
+	store := newTestStore(t)
+	t.Cleanup(func() { require.NoError(t, store.Close(context.Background())) })
+	plugin := &LoggerPlugin{ctx: context.Background(), store: store, logger: testLogger{}}
+	for _, id := range []string{"one", "two", "three"} {
+		require.NoError(t, store.Create(context.Background(), &logstore.Log{ID: id, Timestamp: time.Now(), Object: "chat.completion", Status: "success"}))
+	}
+	var first, second [][]string
+	unsubscribeFirst := plugin.SubscribeLogDeleteCallback(func(_ context.Context, ids []string) { first = append(first, ids) })
+	plugin.SubscribeLogDeleteCallback(func(_ context.Context, ids []string) { second = append(second, ids) })
+	manager := plugin.GetPluginLogManager()
+
+	require.NoError(t, manager.DeleteLogs(context.Background(), []string{"one", "two"}))
+	unsubscribeFirst()
+	unsubscribeFirst()
+	require.NoError(t, manager.DeleteLog(context.Background(), "three"))
+
+	require.Equal(t, [][]string{{"one", "two"}}, first)
+	require.Equal(t, [][]string{{"one", "two"}, {"three"}}, second)
+	_, err := store.FindByID(context.Background(), "three")
+	require.ErrorIs(t, err, logstore.ErrNotFound, "the store deleted it before anyone was told")
+
+	// Nothing to delete, nothing to announce.
+	require.NoError(t, manager.DeleteLogs(context.Background(), nil))
+	require.Len(t, second, 2)
+}
+
+// failingDeleteStore fails every log delete with err.
+type failingDeleteStore struct {
+	logstore.LogStore
+	err error
+}
+
+func (s failingDeleteStore) DeleteLog(context.Context, string) error    { return s.err }
+func (s failingDeleteStore) DeleteLogs(context.Context, []string) error { return s.err }
+
+// A partial delete removed the logs, so subscribers hear of it and the caller
+// still gets the error; a delete that failed before the logs went announces
+// nothing.
+func TestLogDeleteSubscribersAreToldOfPartialDeletes(t *testing.T) {
+	partial := fmt.Errorf("%w: cleanup failed", logstore.ErrPartialLogDelete)
+	plugin := &LoggerPlugin{ctx: context.Background(), store: failingDeleteStore{err: partial}, logger: testLogger{}}
+	var told [][]string
+	plugin.SubscribeLogDeleteCallback(func(_ context.Context, ids []string) { told = append(told, ids) })
+	manager := plugin.GetPluginLogManager()
+
+	require.ErrorIs(t, manager.DeleteLogs(context.Background(), []string{"one", "two"}), logstore.ErrPartialLogDelete)
+	require.ErrorIs(t, manager.DeleteLog(context.Background(), "three"), logstore.ErrPartialLogDelete)
+	require.Equal(t, [][]string{{"one", "two"}, {"three"}}, told)
+
+	plugin.store = failingDeleteStore{err: errors.New("log delete failed")}
+	require.Error(t, manager.DeleteLogs(context.Background(), []string{"four"}))
+	require.Error(t, manager.DeleteLog(context.Background(), "five"))
+	require.Len(t, told, 2)
+}
+
+func TestPostLLMHookStreamingErrorPreservesHeaderMetadata(t *testing.T) {
+	store := newTestStore(t)
+	loggingHeaders := []string{"x-custom-log"}
+	plugin, err := Init(context.Background(), &Config{LoggingHeaders: &loggingHeaders}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-stream-error-metadata")
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"x-custom-log":   "custom-value",
+		"x-bf-lh-user":   `{"device_id":"device-1","session_id":"session-1"}`,
+		"x-bf-lh-tag":    "from-header",
+		"x-bf-lh-shared": "from-header",
+	})
+	ctx.SetValue(schemas.BifrostContextKeyDimensions, map[string]string{
+		"environment": "staging",
+	})
+
+	req := &schemas.BifrostRequest{
+		RequestType: schemas.ResponsesStreamRequest,
+		ResponsesRequest: &schemas.BifrostResponsesRequest{
+			Provider: schemas.Bedrock,
+			Model:    "us.anthropic.claude-opus-4-7",
+			Params:   &schemas.ResponsesParameters{},
+		},
+	}
+	if _, _, err = plugin.PreLLMHook(ctx, req); err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	statusCode := 500
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error:          &schemas.ErrorField{Message: "stream failed"},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType:            schemas.ResponsesStreamRequest,
+			Provider:               schemas.Bedrock,
+			OriginalModelRequested: "us.anthropic.claude-opus-4-7",
+			ResolvedModelUsed:      "us.anthropic.claude-opus-4-7",
+		},
+	}
+	if _, _, err = plugin.PostLLMHook(ctx, nil, bifrostErr); err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), "req-stream-error-metadata")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.Status != "error" {
+		t.Fatalf("expected error status, got %q", logEntry.Status)
+	}
+	if logEntry.MetadataParsed == nil {
+		t.Fatalf("expected metadata to be persisted")
+	}
+	if got := logEntry.MetadataParsed["user"]; got != `{"device_id":"device-1","session_id":"session-1"}` {
+		t.Fatalf("expected user metadata from header, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["tag"]; got != "from-header" {
+		t.Fatalf("expected tag metadata from header, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["x-custom-log"]; got != "custom-value" {
+		t.Fatalf("expected configured header metadata custom-value, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["shared"]; got != "from-header" {
+		t.Fatalf("expected shared metadata from header, got %#v", got)
+	}
+	if got := logEntry.MetadataParsed["environment"]; got != "staging" {
+		t.Fatalf("expected dimension metadata staging, got %#v", got)
+	}
+}
+
+// TestPostLLMHookCancelledStreamLogsCost verifies #3357 at the logging layer: a
+// streaming request cancelled mid-flight (including when a chunk is returned)
+// whose error carries the
+// partial usage the provider already processed (BifrostError.ExtraFields.BilledUsage)
+// must produce a log row with status="cancelled", the consumed tokens, AND an
+// accurate cost computed from the datasheet rates.
+func TestPostLLMHookCancelledStreamLogsCost(t *testing.T) {
+	store := newTestStore(t)
+
+	// Pricing manager loaded from the committed datasheet testdata via an
+	// offline file:// URL (no network).
+	abs, err := filepath.Abs("../../framework/modelcatalog/datasheet/testdata/pricing.json")
+	if err != nil {
+		t.Fatalf("resolve testdata path: %v", err)
+	}
+	ds := datasheet.New(nil, testLogger{}, datasheet.Config{URL: "file://" + abs})
+	if err := ds.LoadFromURLIntoMemory(context.Background()); err != nil {
+		t.Fatalf("load pricing datasheet: %v", err)
+	}
+	pricingManager := modelcatalog.NewTestCatalogWithDatasheet(ds)
+
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, pricingManager, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-cancel-cost")
+
+	req := &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionStreamRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o",
+			Params:   &schemas.ChatParameters{},
+		},
+	}
+	if _, _, err = plugin.PreLLMHook(ctx, req); err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	embeddingProvider := "openai"
+	embeddingModel := "text-embedding-3-small"
+	embeddingTokens := 12
+	if !schemas.SetCacheMetadataOnContext(ctx, &schemas.BifrostCacheMetadata{
+		ProviderUsed: &embeddingProvider,
+		ModelUsed:    &embeddingModel,
+		InputTokens:  &embeddingTokens,
+	}) {
+		t.Fatal("expected semantic cache metadata to be stored on context")
+	}
+	routingEmbeddingTokens := 13
+	if !schemas.AppendRoutingCallOnContext(ctx, schemas.BifrostRoutingCall{
+		ProviderUsed:       &embeddingProvider,
+		ModelUsed:          &embeddingModel,
+		InputTokens:        &routingEmbeddingTokens,
+		CountTowardBudgets: true,
+	}) {
+		t.Fatal("expected routing metadata to be stored on context")
+	}
+	if !schemas.AppendGuardrailJudgeCallOnContext(ctx, schemas.BifrostGuardrailJudgeCall{
+		JudgeProvider:    schemas.OpenAI,
+		JudgeModel:       "gpt-4o",
+		JudgeRequestType: schemas.ChatCompletionRequest,
+		PromptTokens:     10,
+		CompletionTokens: 5,
+		TotalTokens:      15,
+	}) {
+		t.Fatal("expected guardrail judge call to be stored on context")
+	}
+
+	const promptTokens, completionTokens = 100, 50
+	statusCode := 499 // client closed request (mid-stream cancel)
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error:          &schemas.ErrorField{Message: "client disconnected"},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType:            schemas.ChatCompletionStreamRequest,
+			Provider:               schemas.OpenAI,
+			OriginalModelRequested: "gpt-4o",
+			ResolvedModelUsed:      "gpt-4o",
+			// Provider processed these tokens before the client disconnected.
+			BilledUsage: &schemas.BifrostLLMUsage{
+				PromptTokens:     promptTokens,
+				CompletionTokens: completionTokens,
+				TotalTokens:      promptTokens + completionTokens,
+			},
+		},
+	}
+	streamChunk := &schemas.BifrostResponse{
+		ChatResponse: &schemas.BifrostChatResponse{
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType:            schemas.ChatCompletionStreamRequest,
+				Provider:               schemas.OpenAI,
+				OriginalModelRequested: "gpt-4o",
+				ResolvedModelUsed:      "gpt-4o",
+			},
+		},
+	}
+	if _, _, err = plugin.PostLLMHook(ctx, streamChunk, bifrostErr); err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	entry, err := store.FindByID(context.Background(), "req-cancel-cost")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if entry.Status != "cancelled" {
+		t.Fatalf("expected cancelled status, got %q", entry.Status)
+	}
+	if entry.TokenUsageParsed == nil {
+		t.Fatalf("expected token usage recorded from BilledUsage on the cancel path")
+	}
+	if entry.TotalTokens != promptTokens+completionTokens {
+		t.Fatalf("expected total_tokens %d, got %d", promptTokens+completionTokens, entry.TotalTokens)
+	}
+	if entry.Cost == nil {
+		t.Fatalf("expected a cost to be logged for a cancelled request that consumed tokens (#3357)")
+	}
+	// gpt-4o testdata rates: input 2.5e-6/token, output 1e-5/token.
+	// text-embedding-3-small is 2e-8/token. The cache lookup, routing
+	// classification, and judge call must all be added even though the stream
+	// ended with an error chunk.
+	want := float64(promptTokens)*2.5e-6 + float64(completionTokens)*1e-5 +
+		float64(embeddingTokens+routingEmbeddingTokens)*2e-8 + float64(10)*2.5e-6 + float64(5)*1e-5
+	if diff := *entry.Cost - want; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("logged cost %v does not match datasheet-computed cost %v", *entry.Cost, want)
+	}
+	// The routing classification call must survive the full write/read round
+	// trip through the DB — this is what makes it visible in the log detail
+	// view, not just correctly billed.
+	if entry.RoutingMetadataParsed == nil || len(entry.RoutingMetadataParsed.Calls) != 1 {
+		t.Fatalf("expected one routing call to round-trip through the DB, got %+v", entry.RoutingMetadataParsed)
+	}
+	if call := entry.RoutingMetadataParsed.Calls[0]; call.ProviderUsed == nil || *call.ProviderUsed != embeddingProvider ||
+		call.InputTokens == nil || *call.InputTokens != routingEmbeddingTokens {
+		t.Fatalf("routing call round-tripped incorrectly: %+v", call)
+	}
+}
+
+func TestPostLLMHookContextTimeoutLogsCancelledStatus(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-context-timeout")
+
+	req := &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o",
+			Params:   &schemas.ChatParameters{},
+		},
+	}
+	if _, _, err = plugin.PreLLMHook(ctx, req); err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+
+	statusCode := 504
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error: &schemas.ErrorField{
+			Message: "Request timed out by context: context deadline exceeded",
+			Type:    schemas.Ptr(schemas.RequestTimedOut),
+		},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType:            schemas.ChatCompletionRequest,
+			Provider:               schemas.OpenAI,
+			OriginalModelRequested: "gpt-4o",
+			ResolvedModelUsed:      "gpt-4o",
+		},
+	}
+	if _, _, err = plugin.PostLLMHook(ctx, nil, bifrostErr); err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	entry, err := store.FindByID(context.Background(), "req-context-timeout")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if entry.Status != "cancelled" {
+		t.Fatalf("expected cancelled status, got %q", entry.Status)
+	}
+}
+
+func TestPostLLMHookProviderTimeoutRemainsErrorStatus(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-provider-timeout")
+
+	req := &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o",
+			Params:   &schemas.ChatParameters{},
+		},
+	}
+	if _, _, err = plugin.PreLLMHook(ctx, req); err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+
+	statusCode := 504
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error: &schemas.ErrorField{
+			Message: schemas.ErrProviderRequestTimedOut,
+			Type:    schemas.Ptr(schemas.RequestTimedOut),
+		},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType:            schemas.ChatCompletionRequest,
+			Provider:               schemas.OpenAI,
+			OriginalModelRequested: "gpt-4o",
+			ResolvedModelUsed:      "gpt-4o",
+		},
+	}
+	if _, _, err = plugin.PostLLMHook(ctx, nil, bifrostErr); err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	entry, err := store.FindByID(context.Background(), "req-provider-timeout")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if entry.Status != "error" {
+		t.Fatalf("expected error status, got %q", entry.Status)
+	}
+}
+
+func TestPostLLMHookCapturesComplexityRoutingContext(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-complexity-capture")
+
+	req := &schemas.BifrostRequest{
+		RequestType: schemas.ChatCompletionRequest,
+		ChatRequest: &schemas.BifrostChatRequest{
+			Provider: schemas.OpenAI,
+			Model:    "gpt-4o",
+			Params:   &schemas.ChatParameters{},
+		},
+	}
+	if _, _, err = plugin.PreLLMHook(ctx, req); err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+
+	// Set by the governance plugin when a routing rule references complexity_tier.
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityTier, "COMPLEX")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityMechanism, "semantic")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceComplexityScore, 0.42)
+	ctx.SetValue(schemas.BifrostContextKeySessionID, "session-log-123")
+
+	statusCode := 500
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error:          &schemas.ErrorField{Message: "provider failed"},
+		ExtraFields: schemas.BifrostErrorExtraFields{
+			RequestType:            schemas.ChatCompletionRequest,
+			Provider:               schemas.OpenAI,
+			OriginalModelRequested: "gpt-4o",
+			ResolvedModelUsed:      "gpt-4o",
+		},
+	}
+	if _, _, err = plugin.PostLLMHook(ctx, nil, bifrostErr); err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	entry, err := store.FindByID(context.Background(), "req-complexity-capture")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if entry.ComplexityTier == nil || *entry.ComplexityTier != "COMPLEX" {
+		t.Fatalf("expected complexity_tier COMPLEX, got %v", entry.ComplexityTier)
+	}
+	if entry.ComplexityMechanism == nil || *entry.ComplexityMechanism != "semantic" {
+		t.Fatalf("expected complexity_mechanism semantic, got %v", entry.ComplexityMechanism)
+	}
+	if entry.ComplexityScore == nil || *entry.ComplexityScore != 0.42 {
+		t.Fatalf("expected complexity_score 0.42, got %v", entry.ComplexityScore)
+	}
+	if entry.SessionID == nil || *entry.SessionID != "session-log-123" {
+		t.Fatalf("expected session_id session-log-123, got %v", entry.SessionID)
+	}
+}
+
+func TestLogStatusForErrorDoesNotTreatGenericDeadlineMessageAsCancelled(t *testing.T) {
+	statusCode := 504
+	bifrostErr := &schemas.BifrostError{
+		IsBifrostError: true,
+		StatusCode:     &statusCode,
+		Error: &schemas.ErrorField{
+			Message: "provider request hit project deadline exceeded limit",
+			Type:    schemas.Ptr(schemas.RequestTimedOut),
+		},
+	}
+
+	if got := logStatusForError(bifrostErr); got != "error" {
+		t.Fatalf("expected generic provider deadline message to remain error, got %q", got)
+	}
+}
+
+func TestApplyStreamingOutputToEntryPreservesAccumulatorCancelledStatus(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+	statusCode := 499
+	streamResponse := &streaming.ProcessedStreamResponse{
+		Data: &streaming.AccumulatedData{
+			ErrorDetails: &schemas.BifrostError{
+				IsBifrostError: true,
+				StatusCode:     &statusCode,
+				Error: &schemas.ErrorField{
+					Message: "Request cancelled: client disconnected",
+					Type:    schemas.Ptr(schemas.RequestCancelled),
+				},
+			},
+			Latency: 42,
+		},
+	}
+
+	plugin.applyStreamingOutputToEntry(entry, streamResponse, false, true)
+	if entry.Status != "cancelled" {
+		t.Fatalf("expected initial cancelled status, got %q", entry.Status)
+	}
+	if entry.ErrorDetailsParsed == nil {
+		t.Fatalf("expected parsed error details to be set")
+	}
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error: %v", err)
+	}
+	if entry.ErrorDetails == "" {
+		t.Fatalf("expected serialized error details after SerializeFields")
+	}
+
+	// Match the downstream Path B re-derivation in PostLLMHook. If
+	// ErrorDetailsParsed is missing, this collapses accumulator-originated
+	// cancellations back to "error".
+	if entry.ErrorDetailsParsed != nil {
+		entry.Status = logStatusForError(entry.ErrorDetailsParsed)
+	}
+	if entry.Status != "cancelled" {
+		t.Fatalf("expected downstream reclassification to preserve cancelled status, got %q", entry.Status)
+	}
+}
+
+func TestApplyStreamingOutputToEntryPreservesServiceTier(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+	priority := schemas.BifrostServiceTierPriority
+
+	plugin.applyStreamingOutputToEntry(entry, &streaming.ProcessedStreamResponse{
+		Data: &streaming.AccumulatedData{
+			ServiceTier: &priority,
+			TokenUsage:  &schemas.BifrostLLMUsage{TotalTokens: 1},
+		},
+	}, false, true)
+
+	if entry.ServiceTier == nil || *entry.ServiceTier != string(schemas.BifrostServiceTierPriority) {
+		t.Fatalf("expected priority service tier, got %v", entry.ServiceTier)
+	}
+}
+
+// newTestPricingManager builds a ModelCatalog backed by the committed pricing
+// testdata via an offline file:// URL (no network).
+func newTestPricingManager(t *testing.T) *modelcatalog.ModelCatalog {
+	t.Helper()
+	abs, err := filepath.Abs("../../framework/modelcatalog/datasheet/testdata/pricing.json")
+	if err != nil {
+		t.Fatalf("resolve testdata path: %v", err)
+	}
+	ds := datasheet.New(nil, testLogger{}, datasheet.Config{URL: "file://" + abs})
+	if err := ds.LoadFromURLIntoMemory(context.Background()); err != nil {
+		t.Fatalf("load pricing datasheet: %v", err)
+	}
+	return modelcatalog.NewTestCatalogWithDatasheet(ds)
+}
+
+func TestApplyInternalCallCostsRoutingOwnershipAndBudgetFlag(t *testing.T) {
+	plugin := &LoggerPlugin{pricingManager: newTestPricingManager(t)}
+	provider, model, inputTokens := "openai", "text-embedding-3-small", 13
+
+	for _, test := range []struct {
+		name               string
+		countTowardBudgets bool
+		retryNumber        int
+		fallbackIndex      int
+		wantCost           bool
+	}{
+		{name: "initial attempt billed", countTowardBudgets: true, wantCost: true},
+		{name: "budget attribution disabled", countTowardBudgets: false},
+		{name: "retry does not rebill", countTowardBudgets: true, retryNumber: 1},
+		{name: "fallback does not rebill", countTowardBudgets: true, fallbackIndex: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyNumberOfRetries, test.retryNumber)
+			ctx.SetValue(schemas.BifrostContextKeyFallbackIndex, test.fallbackIndex)
+			if !schemas.AppendRoutingCallOnContext(ctx, schemas.BifrostRoutingCall{
+				ProviderUsed:       &provider,
+				ModelUsed:          &model,
+				InputTokens:        &inputTokens,
+				CountTowardBudgets: test.countTowardBudgets,
+			}) {
+				t.Fatal("AppendRoutingCallOnContext() = false")
+			}
+			entry := &logstore.Log{Provider: string(schemas.OpenAI), Model: "gpt-4o"}
+
+			plugin.applyInternalCallCosts(ctx, entry, nil)
+
+			if !test.wantCost {
+				if entry.Cost != nil {
+					t.Fatalf("cost = %v, want nil", *entry.Cost)
+				}
+				return
+			}
+			if entry.Cost == nil {
+				t.Fatal("cost = nil")
+			}
+			want := float64(inputTokens) * 2e-8
+			if diff := *entry.Cost - want; diff < -1e-12 || diff > 1e-12 {
+				t.Fatalf("cost = %v, want %v", *entry.Cost, want)
+			}
+		})
+	}
+}
+
+// TestApplyErrorBillingFromBilledUsage_ComputesCostWhenTokensAlreadyParsed guards
+// the case where stream accumulation already captured token usage on a failed
+// request but no cost was computed: cost must still be backfilled, and the
+// already-parsed token counters must be left untouched (not double-applied).
+func TestApplyErrorBillingFromBilledUsage_ComputesCostWhenTokensAlreadyParsed(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, newTestPricingManager(t), nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	const promptTokens, completionTokens = 100, 50
+	entry := &logstore.Log{
+		Provider:         string(schemas.OpenAI),
+		Model:            "gpt-4o",
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+		TokenUsageParsed: &schemas.BifrostLLMUsage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      promptTokens + completionTokens,
+		},
+	}
+	billed := entry.TokenUsageParsed
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	plugin.applyErrorBillingFromBilledUsage(ctx, entry, billed, schemas.ChatCompletionStreamRequest)
+
+	if entry.Cost == nil {
+		t.Fatal("expected cost to be computed even though token usage was already parsed")
+	}
+	// gpt-4o testdata rates: input 2.5e-6/token, output 1e-5/token.
+	want := float64(promptTokens)*2.5e-6 + float64(completionTokens)*1e-5
+	if diff := *entry.Cost - want; diff < -1e-9 || diff > 1e-9 {
+		t.Fatalf("cost %v does not match datasheet-computed %v", *entry.Cost, want)
+	}
+	if entry.PromptTokens != promptTokens || entry.TotalTokens != promptTokens+completionTokens {
+		t.Fatalf("token counters mutated: prompt=%d total=%d", entry.PromptTokens, entry.TotalTokens)
+	}
+	// The breakdown must ride on the usage so the denormalized split populates,
+	// not just the scalar total (Discrepancy B: failed/cancelled billing).
+	if entry.TokenUsageParsed.Cost == nil {
+		t.Fatal("expected cost breakdown attached to usage for the denormalized split")
+	}
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields: %v", err)
+	}
+	wantIn := float64(promptTokens) * 2.5e-6
+	wantOut := float64(completionTokens) * 1e-5
+	if d := entry.InputCost - wantIn; d < -1e-9 || d > 1e-9 {
+		t.Fatalf("input_cost %v != %v", entry.InputCost, wantIn)
+	}
+	if d := entry.OutputCost - wantOut; d < -1e-9 || d > 1e-9 {
+		t.Fatalf("output_cost %v != %v", entry.OutputCost, wantOut)
+	}
+}
+
+// TestApplyInternalCallCosts_DenormalizesGuardrailToAdditional guards Discrepancy
+// B for internal-only sidecar costs: a guardrail judge call with no provider
+// response must land on the additional side of the split, not just the total,
+// and must not leak into input/output.
+func TestApplyInternalCallCosts_DenormalizesGuardrailToAdditional(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, newTestPricingManager(t), nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	entry := &logstore.Log{Provider: string(schemas.OpenAI), Model: "gpt-4o"}
+	guardrail := &schemas.BifrostGuardrailMetadata{
+		JudgeCalls: []schemas.BifrostGuardrailJudgeCall{{
+			JudgeProvider:    schemas.OpenAI,
+			JudgeModel:       "gpt-4o",
+			PromptTokens:     100,
+			CompletionTokens: 50,
+			TotalTokens:      150,
+		}},
+	}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	plugin.applyInternalCallCosts(ctx, entry, guardrail)
+
+	want := float64(100)*2.5e-6 + float64(50)*1e-5
+	if entry.Cost == nil {
+		t.Fatal("expected guardrail cost on entry.Cost")
+	}
+	if d := *entry.Cost - want; d < -1e-9 || d > 1e-9 {
+		t.Fatalf("entry.Cost %v != guardrail %v", *entry.Cost, want)
+	}
+	// No usage carrier exists, so the split is written directly on the columns.
+	if d := entry.AdditionalCost - want; d < -1e-9 || d > 1e-9 {
+		t.Fatalf("additional_cost %v != guardrail %v", entry.AdditionalCost, want)
+	}
+	if entry.InputCost != 0 || entry.OutputCost != 0 {
+		t.Fatalf("guardrail-only cost must not populate input/output: in=%v out=%v", entry.InputCost, entry.OutputCost)
+	}
+}
+
+// TestApplyErrorBillingFromBilledUsage_FillsTokensAndCostWhenUnparsed pins the
+// original behaviour: when no usage was captured yet, both tokens and cost are
+// backfilled from BilledUsage.
+func TestApplyErrorBillingFromBilledUsage_FillsTokensAndCostWhenUnparsed(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, newTestPricingManager(t), nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	const promptTokens, completionTokens = 100, 50
+	entry := &logstore.Log{Provider: string(schemas.OpenAI), Model: "gpt-4o"}
+	billed := &schemas.BifrostLLMUsage{
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      promptTokens + completionTokens,
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	plugin.applyErrorBillingFromBilledUsage(ctx, entry, billed, schemas.ChatCompletionStreamRequest)
+
+	if entry.TokenUsageParsed == nil || entry.TotalTokens != promptTokens+completionTokens {
+		t.Fatalf("expected tokens backfilled, got %+v", entry.TokenUsageParsed)
+	}
+	if entry.Cost == nil {
+		t.Fatal("expected cost computed on the unparsed path")
+	}
+}
+
+func TestRecalculateCostsProcessesAllBatches(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:          store,
+		pricingManager: newTestPricingManager(t),
+		logger:         testLogger{},
+	}
+
+	now := time.Now().UTC()
+	for i := range 5 {
+		if err := store.Create(context.Background(), testRecalculateCostLog(
+			"req-recalc-batch-"+string(rune('a'+i)),
+			now.Add(time.Duration(i)*time.Second),
+			100+i,
+			50,
+		)); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+	}
+
+	result, err := plugin.RecalculateCosts(context.Background(), logstore.SearchFilters{}, 2)
+	if err != nil {
+		t.Fatalf("RecalculateCosts() error = %v", err)
+	}
+	if result.TotalMatched != 5 || result.Updated != 5 || result.Skipped != 0 || result.Remaining != 0 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	for _, id := range []string{"req-recalc-batch-a", "req-recalc-batch-b", "req-recalc-batch-c", "req-recalc-batch-d", "req-recalc-batch-e"} {
+		entry, err := store.FindByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("FindByID(%s) error = %v", id, err)
+		}
+		if entry.Cost == nil || *entry.Cost <= 0 {
+			t.Fatalf("expected positive cost for %s, got %v", id, entry.Cost)
+		}
+	}
+}
+
+func TestRecalculateCostsSkipsUnresolvableRowsAndContinues(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:          store,
+		pricingManager: newTestPricingManager(t),
+		logger:         testLogger{},
+	}
+
+	now := time.Now().UTC()
+	if err := store.Create(context.Background(), &logstore.Log{
+		ID:        "req-recalc-skip",
+		Timestamp: now,
+		Object:    string(schemas.ChatCompletionRequest),
+		Provider:  string(schemas.OpenAI),
+		Model:     "gpt-4o",
+		Status:    "success",
+	}); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	for i := range 3 {
+		if err := store.Create(context.Background(), testRecalculateCostLog(
+			"req-recalc-continue-"+string(rune('a'+i)),
+			now.Add(time.Duration(i+1)*time.Second),
+			100+i,
+			50,
+		)); err != nil {
+			t.Fatalf("Create() error = %v", err)
+		}
+	}
+
+	result, err := plugin.RecalculateCosts(context.Background(), logstore.SearchFilters{}, 2)
+	if err != nil {
+		t.Fatalf("RecalculateCosts() error = %v", err)
+	}
+	if result.TotalMatched != 4 || result.Updated != 3 || result.Skipped != 1 || result.Remaining != 1 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	skipped, err := store.FindByID(context.Background(), "req-recalc-skip")
+	if err != nil {
+		t.Fatalf("FindByID(req-recalc-skip) error = %v", err)
+	}
+	if skipped.Cost != nil {
+		t.Fatalf("expected skipped row cost to remain nil, got %v", skipped.Cost)
+	}
+	for _, id := range []string{"req-recalc-continue-a", "req-recalc-continue-b", "req-recalc-continue-c"} {
+		entry, err := store.FindByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("FindByID(%s) error = %v", id, err)
+		}
+		if entry.Cost == nil || *entry.Cost <= 0 {
+			t.Fatalf("expected positive cost for %s, got %v", id, entry.Cost)
+		}
+	}
+}
+
+func TestRecalculateCostsDoesNotWriteZeroForUnresolvedPricing(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:          store,
+		pricingManager: newTestPricingManager(t),
+		logger:         testLogger{},
+	}
+
+	entry := testRecalculateCostLog("req-recalc-unpriced", time.Now().UTC(), 100, 50)
+	entry.Model = "unknown-model"
+	if err := store.Create(context.Background(), entry); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	result, err := plugin.RecalculateCosts(context.Background(), logstore.SearchFilters{}, 2)
+	if err != nil {
+		t.Fatalf("RecalculateCosts() error = %v", err)
+	}
+	if result.TotalMatched != 1 || result.Updated != 0 || result.Skipped != 1 || result.Remaining != 1 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), "req-recalc-unpriced")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.Cost != nil {
+		t.Fatalf("expected unresolved pricing to leave cost nil, got %v", *logEntry.Cost)
+	}
+}
+
+func TestRecalculateCostsNormalizesProviderObjectForPricing(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:          store,
+		pricingManager: newTestPricingManager(t),
+		logger:         testLogger{},
+	}
+
+	entry := testRecalculateCostLog("req-recalc-provider-object", time.Now().UTC(), 100, 50)
+	entry.Object = "chat.completion"
+	zeroCost := 0.0
+	entry.Cost = &zeroCost
+	if err := store.Create(context.Background(), entry); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	result, err := plugin.RecalculateCosts(context.Background(), logstore.SearchFilters{}, 2)
+	if err != nil {
+		t.Fatalf("RecalculateCosts() error = %v", err)
+	}
+	if result.TotalMatched != 1 || result.Updated != 1 || result.Skipped != 0 || result.Remaining != 0 {
+		t.Fatalf("unexpected result: %+v", result)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), "req-recalc-provider-object")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.Cost == nil || *logEntry.Cost <= 0 {
+		t.Fatalf("expected legacy provider object to recalculate positive cost, got %v", logEntry.Cost)
+	}
+}
+
+func testRecalculateCostLog(id string, timestamp time.Time, promptTokens int, completionTokens int) *logstore.Log {
+	totalTokens := promptTokens + completionTokens
+	return &logstore.Log{
+		ID:               id,
+		Timestamp:        timestamp,
+		Object:           string(schemas.ChatCompletionRequest),
+		Provider:         string(schemas.OpenAI),
+		Model:            "gpt-4o",
+		Status:           "success",
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		TotalTokens:      totalTokens,
+		TokenUsageParsed: &schemas.BifrostLLMUsage{
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+			TotalTokens:      totalTokens,
+		},
+	}
+}
+
+func TestBuildInitialLogEntryPreservesMetadata(t *testing.T) {
+	metadata := map[string]any{"tenant": "acme"}
+	entry := buildInitialLogEntry(&PendingLogData{
+		RequestID:     "req-initial-metadata",
+		Timestamp:     time.Now().UTC(),
+		FallbackIndex: 1,
+		InitialData: &InitialLogData{
+			Provider: string(schemas.OpenAI),
+			Model:    "gpt-4o",
+			Object:   string(schemas.ChatCompletionRequest),
+			Metadata: metadata,
+		},
+	})
+
+	if entry.MetadataParsed == nil {
+		t.Fatalf("expected metadata on initial log entry")
+	}
+	if got := entry.MetadataParsed["tenant"]; got != "acme" {
+		t.Fatalf("expected tenant metadata acme, got %#v", got)
+	}
+}
+
+func TestBuildInitialLogEntryPreservesUserAgent(t *testing.T) {
+	userAgent := "codex-cli/1.0"
+	entry := buildInitialLogEntry(&PendingLogData{
+		RequestID:     "req-initial-user-agent",
+		Timestamp:     time.Now().UTC(),
+		FallbackIndex: 1,
+		InitialData: &InitialLogData{
+			Provider:  string(schemas.OpenAI),
+			Model:     "gpt-4o",
+			Object:    string(schemas.ChatCompletionRequest),
+			UserAgent: userAgent,
+		},
+	})
+
+	if entry.UserAgent == nil {
+		t.Fatalf("expected user agent on initial log entry")
+	}
+	if got := *entry.UserAgent; got != userAgent {
+		t.Fatalf("expected user agent %q, got %q", userAgent, got)
+	}
+	if entry.App == nil {
+		t.Fatalf("expected app on initial log entry")
+	}
+	if got := *entry.App; got != "Codex CLI" {
+		t.Fatalf("expected app Codex CLI, got %q", got)
+	}
+}
+
+func TestBuildCompleteLogEntryPreservesUserAgent(t *testing.T) {
+	userAgent := "cursor/0.47"
+	entry := buildCompleteLogEntryFromPending(&PendingLogData{
+		RequestID:     "req-complete-user-agent",
+		Timestamp:     time.Now().UTC(),
+		FallbackIndex: 1,
+		InitialData: &InitialLogData{
+			Provider:  string(schemas.OpenAI),
+			Model:     "gpt-4o",
+			Object:    string(schemas.ChatCompletionRequest),
+			UserAgent: userAgent,
+		},
+	})
+
+	if entry.UserAgent == nil {
+		t.Fatalf("expected user agent on complete log entry")
+	}
+	if got := *entry.UserAgent; got != userAgent {
+		t.Fatalf("expected user agent %q, got %q", userAgent, got)
+	}
+	if entry.App == nil {
+		t.Fatalf("expected app on complete log entry")
+	}
+	if got := *entry.App; got != "Cursor" {
+		t.Fatalf("expected app Cursor, got %q", got)
+	}
+}
+
+func TestBuildCompleteLogEntryBoundsAgentCorrelationID(t *testing.T) {
+	agentCorrelationID := strings.Repeat("a", maxPersistedAgentCorrelationIDLen+1)
+	entry := buildCompleteLogEntryFromPending(&PendingLogData{
+		RequestID: "req-complete-agent-correlation",
+		Timestamp: time.Now().UTC(),
+		InitialData: &InitialLogData{
+			AgentCorrelationID: agentCorrelationID,
+		},
+	})
+
+	if entry.AgentCorrelationID == nil || *entry.AgentCorrelationID != agentCorrelationID[:maxPersistedAgentCorrelationIDLen] {
+		t.Fatalf("complete log agent correlation ID = %v, want %q", entry.AgentCorrelationID, agentCorrelationID[:maxPersistedAgentCorrelationIDLen])
+	}
+}
+
+func TestBuildLogEntriesOmitEmptyUserAgent(t *testing.T) {
+	pending := &PendingLogData{
+		RequestID:     "req-empty-user-agent",
+		Timestamp:     time.Now().UTC(),
+		FallbackIndex: 1,
+		InitialData: &InitialLogData{
+			Provider: string(schemas.OpenAI),
+			Model:    "gpt-4o",
+			Object:   string(schemas.ChatCompletionRequest),
+		},
+	}
+
+	if entry := buildInitialLogEntry(pending); entry.UserAgent != nil {
+		t.Fatalf("expected nil initial user agent, got %#v", entry.UserAgent)
+	} else if entry.App != nil {
+		t.Fatalf("expected nil initial app, got %#v", entry.App)
+	}
+	if entry := buildCompleteLogEntryFromPending(pending); entry.UserAgent != nil {
+		t.Fatalf("expected nil complete user agent, got %#v", entry.UserAgent)
+	} else if entry.App != nil {
+		t.Fatalf("expected nil complete app, got %#v", entry.App)
+	}
+}
+
+func TestApplyMCPCorrelationFieldsBoundsAgentCorrelationID(t *testing.T) {
+	agentCorrelationID := strings.Repeat("a", maxPersistedAgentCorrelationIDLen+1)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"x-bf-agent-correlation-id": agentCorrelationID,
+	})
+	entry := &logstore.MCPToolLog{}
+
+	applyMCPCorrelationFieldsToEntry(ctx, entry)
+
+	if entry.AgentCorrelationID == nil || *entry.AgentCorrelationID != agentCorrelationID[:maxPersistedAgentCorrelationIDLen] {
+		t.Fatalf("MCP agent correlation ID = %v, want %q", entry.AgentCorrelationID, agentCorrelationID[:maxPersistedAgentCorrelationIDLen])
+	}
+}
+
+// TestMCPHooksPersistPluginLogs verifies PostMCPHook stores the plugin-log
+// snapshot accumulated before logging's post-hook runs.
+func TestMCPHooksPersistPluginLogs(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-mcp-batch")
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-batch-flow")
+	ctx.SetValue(schemas.BifrostContextKeyUserID, "user-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceTeamID, "team-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceCustomerID, "customer-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBusinessUnitID, "bu-1")
+	ctx.SetValue(schemas.BifrostContextKeySessionID, "session-mcp-normal")
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"x-bf-agent-correlation-id": "agent-mcp-normal",
+	})
+	schemas.SetRedactionDataOnContext(ctx, schemas.RedactionData{
+		ReversibleMappings: schemas.RedactionMapsByPhase{
+			Input:  map[string]string{"EMAIL-1": "private@example.com"},
+			Output: map[string]string{"EMAIL-2": "result@example.com"},
+		},
+	})
+
+	toolName := "docs-search"
+	_, _, err = plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+		RequestType: schemas.MCPRequestTypeChatToolCall,
+		ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+			Function: schemas.ChatAssistantMessageToolCallFunction{
+				Name:      &toolName,
+				Arguments: `{"query":"find this"}`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreMCPHook() error = %v", err)
+	}
+
+	if _, err := store.FindMCPToolLog(context.Background(), "mcp-batch-flow"); !errors.Is(err, logstore.ErrNotFound) {
+		t.Fatalf("expected MCP log to stay in memory before PostMCPHook, got err=%v", err)
+	}
+	pendingValue, ok := plugin.pendingMCPLogsToInject.Load("mcp-batch-flow")
+	if !ok {
+		t.Fatal("expected pending MCP log entry")
+	}
+	pendingEntry, ok := pendingValue.(*logstore.MCPToolLog)
+	if !ok {
+		t.Fatalf("pending MCP log entry has type %T", pendingValue)
+	}
+	if pendingEntry.RedactionData != nil {
+		t.Fatal("expected redaction data to be attached only after PostMCPHook")
+	}
+
+	result := `{"answer":"done"}`
+	guardrailsName := "guardrails"
+	guardrailsCtx := ctx.WithPluginScope(&guardrailsName)
+	guardrailsCtx.Log(schemas.LogLevelInfo, "MCP tool arguments redacted")
+	guardrailsCtx.ReleasePluginScope()
+
+	_, _, err = plugin.PostMCPHook(ctx, &schemas.BifrostMCPResponse{
+		ChatMessage: &schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleTool,
+			Content: &schemas.ChatMessageContent{ContentStr: &result},
+		},
+		ExtraFields: schemas.BifrostMCPResponseExtraFields{
+			MCPRequestType: schemas.MCPRequestTypeChatToolCall,
+			ClientName:     "docs",
+			ToolName:       "search",
+			Latency:        42,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PostMCPHook() error = %v", err)
+	}
+	if pendingEntry.RedactionData == nil {
+		t.Fatal("expected PostMCPHook to attach redaction data")
+	}
+	if got := pendingEntry.RedactionData.ReversibleMappings.Output["EMAIL-2"]; got != "result@example.com" {
+		t.Fatalf("output redaction mapping = %q, want %q", got, "result@example.com")
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-batch-flow")
+	if err != nil {
+		t.Fatalf("FindMCPToolLog() error = %v", err)
+	}
+	if logEntry.Status != "success" {
+		t.Fatalf("expected status success, got %q", logEntry.Status)
+	}
+	if logEntry.ArgumentsParsed == nil {
+		t.Fatalf("expected arguments to be persisted")
+	}
+	resultMap, ok := logEntry.ResultParsed.(map[string]interface{})
+	if !ok || resultMap["answer"] != "done" {
+		t.Fatalf("expected parsed result to be persisted, got %#v", logEntry.ResultParsed)
+	}
+	if logEntry.Latency == nil || *logEntry.Latency != 42 {
+		t.Fatalf("expected latency 42, got %#v", logEntry.Latency)
+	}
+	var pluginLogs map[string][]schemas.PluginLogEntry
+	if err := json.Unmarshal([]byte(logEntry.PluginLogs), &pluginLogs); err != nil {
+		t.Fatalf("expected valid plugin logs JSON, got %q: %v", logEntry.PluginLogs, err)
+	}
+	if got := pluginLogs[guardrailsName]; len(got) != 1 || got[0].Message != "MCP tool arguments redacted" {
+		t.Fatalf("expected guardrails plugin log to be persisted, got %#v", pluginLogs)
+	}
+	assertMCPLogGovernanceFields(t, logEntry, "user-1", "team-1", "customer-1", "bu-1")
+	if logEntry.SessionID == nil || *logEntry.SessionID != "session-mcp-normal" {
+		t.Fatalf("expected MCP session ID, got %v", logEntry.SessionID)
+	}
+	if logEntry.AgentCorrelationID == nil || *logEntry.AgentCorrelationID != "agent-mcp-normal" {
+		t.Fatalf("expected MCP agent correlation ID, got %v", logEntry.AgentCorrelationID)
+	}
+}
+
+// TestPostMCPHookDropsArgumentsWhenContentIsDisabledLate pins the MCP hook ordering hole: logging's
+// PreMCPHook runs before governance's, so a virtual key that turns content off is not yet on the
+// context when the tool arguments are captured. PostMCPHook re-resolves the policy and must drop
+// the arguments it captured too early, not only the result.
+func TestPostMCPHookDropsArgumentsWhenContentIsDisabledLate(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-mcp-late-off")
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-late-off")
+
+	toolName := "docs-search"
+	_, _, err = plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+		RequestType: schemas.MCPRequestTypeChatToolCall,
+		ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+			Function: schemas.ChatAssistantMessageToolCallFunction{
+				Name:      &toolName,
+				Arguments: `{"query":"find this"}`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreMCPHook() error = %v", err)
+	}
+	pendingValue, ok := plugin.pendingMCPLogsToInject.Load("mcp-late-off")
+	if !ok {
+		t.Fatal("expected pending MCP log entry")
+	}
+	if pendingValue.(*logstore.MCPToolLog).ArgumentsParsed == nil {
+		t.Fatal("arguments are captured in PreMCPHook while nothing has turned content off yet")
+	}
+
+	// Governance's PreMCPHook runs after ours and stamps the key's decision.
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+
+	result := `{"answer":"done"}`
+	_, _, err = plugin.PostMCPHook(ctx, &schemas.BifrostMCPResponse{
+		ChatMessage: &schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleTool,
+			Content: &schemas.ChatMessageContent{ContentStr: &result},
+		},
+		ExtraFields: schemas.BifrostMCPResponseExtraFields{
+			MCPRequestType: schemas.MCPRequestTypeChatToolCall,
+			ClientName:     "docs",
+			ToolName:       "search",
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PostMCPHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-late-off")
+	if err != nil {
+		t.Fatalf("FindMCPToolLog() error = %v", err)
+	}
+	if logEntry.Status != "success" {
+		t.Fatalf("expected status success, got %q", logEntry.Status)
+	}
+	if logEntry.ResultParsed != nil {
+		t.Fatalf("expected the result to be dropped, got %#v", logEntry.ResultParsed)
+	}
+	if logEntry.ArgumentsParsed != nil {
+		t.Fatalf("expected the arguments captured before the key was stamped to be dropped, got %#v", logEntry.ArgumentsParsed)
+	}
+}
+
+// TestPostLLMHookDropsCapturedInputWhenContentIsDisabledLate pins the passthrough ordering hole:
+// governance skips PreRequestHook for passthrough and stamps the key's decision in its own
+// PreLLMHook, which runs after ours, so the passthrough body is captured while nothing has turned
+// content off yet. PostLLMHook must resolve the final policy and drop every captured input, not
+// only mark the row content_hidden.
+func TestPostLLMHookDropsCapturedInputWhenContentIsDisabledLate(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-passthrough-late-off")
+	_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+		RequestType: schemas.PassthroughRequest,
+		PassthroughRequest: &schemas.BifrostPassthroughRequest{
+			Provider: schemas.OpenAI,
+			Method:   "POST",
+			Path:     "/v1/fine-tuning/jobs",
+			Body:     []byte(`{"training_file":"file-secret"}`),
+			// The body is captured only for JSON requests.
+			SafeHeaders: map[string]string{"content-type": "application/json"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	pendingValue, ok := plugin.pendingLogsEntries.Load("req-passthrough-late-off")
+	if !ok {
+		t.Fatal("expected pending log entry")
+	}
+	if pendingValue.(*PendingLogData).InitialData.PassthroughRequestBody == "" {
+		t.Fatal("the body is captured in PreLLMHook while nothing has turned content off yet")
+	}
+
+	// Governance's PreLLMHook runs after ours and stamps the key's decision.
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+
+	_, _, err = plugin.PostLLMHook(ctx, &schemas.BifrostResponse{
+		PassthroughResponse: &schemas.BifrostPassthroughResponse{
+			StatusCode: 200,
+			Body:       []byte(`{"id":"ftjob-1"}`),
+			Path:       "/v1/fine-tuning/jobs",
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.PassthroughRequest,
+				Provider:    schemas.OpenAI,
+			},
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PostLLMHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), "req-passthrough-late-off")
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if !logEntry.ContentHidden {
+		t.Fatal("expected the row to be content_hidden")
+	}
+	if logEntry.PassthroughRequestBody != "" {
+		t.Fatalf("expected the passthrough body captured before the key was stamped to be dropped, got %q", logEntry.PassthroughRequestBody)
+	}
+	if logEntry.PassthroughResponseBody != "" {
+		t.Fatalf("expected no passthrough response body, got %q", logEntry.PassthroughResponseBody)
+	}
+}
+
+// TestPostMCPHookSkipsRedactionMappingsWhenContentIsHidden pins that reveal mappings are attached
+// only when the MCP log's content is visible. With object-storage retention on, a key that turned
+// content off yields storeContent=true but visible=false: the arguments and result are removed, so
+// the mappings that would reveal redactions in them must not be kept either.
+func TestPostMCPHookSkipsRedactionMappingsWhenContentIsHidden(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{RetainContentInObjectStorage: new(true), ObjectStorageEnabled: true}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-mcp-hidden-redaction")
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-hidden-redaction")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+	schemas.SetRedactionDataOnContext(ctx, schemas.RedactionData{
+		ReversibleMappings: schemas.RedactionMapsByPhase{
+			Input: map[string]string{"EMAIL-1": "private@example.com"},
+		},
+	})
+
+	toolName := "docs-search"
+	_, _, err = plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+		RequestType: schemas.MCPRequestTypeChatToolCall,
+		ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+			Function: schemas.ChatAssistantMessageToolCallFunction{Name: &toolName, Arguments: `{"query":"find this"}`},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreMCPHook() error = %v", err)
+	}
+	pendingValue, ok := plugin.pendingMCPLogsToInject.Load("mcp-hidden-redaction")
+	if !ok {
+		t.Fatal("expected pending MCP log entry")
+	}
+	pendingEntry := pendingValue.(*logstore.MCPToolLog)
+
+	result := `{"answer":"done"}`
+	_, _, err = plugin.PostMCPHook(ctx, &schemas.BifrostMCPResponse{
+		ChatMessage: &schemas.ChatMessage{Role: schemas.ChatMessageRoleTool, Content: &schemas.ChatMessageContent{ContentStr: &result}},
+		ExtraFields: schemas.BifrostMCPResponseExtraFields{MCPRequestType: schemas.MCPRequestTypeChatToolCall, ClientName: "docs", ToolName: "search"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PostMCPHook() error = %v", err)
+	}
+	if pendingEntry.ResultParsed != nil || pendingEntry.ArgumentsParsed != nil {
+		t.Fatalf("hidden content must be removed, got args=%#v result=%#v", pendingEntry.ArgumentsParsed, pendingEntry.ResultParsed)
+	}
+	if pendingEntry.RedactionData != nil {
+		t.Fatalf("expected no redaction mappings on an entry whose content is hidden, got %#v", pendingEntry.RedactionData)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+}
+
+// TestPreMCPHookHoldsArgumentsUntilGovernanceStampsTheKey pins the MCP hook ordering hole on the
+// path PostMCPHook cannot cover: a request that presents a virtual key governance has not stamped
+// yet is captured while its content decision is still unknown. The arguments must not sit on the
+// pending entry, where the pre-hook callback and the stale-entry cleanup would expose them; they
+// are held aside and attached in PostMCPHook only once the final policy says content is visible.
+func TestPreMCPHookHoldsArgumentsUntilGovernanceStampsTheKey(t *testing.T) {
+	newCtx := func(requestID, mcpLogID string) *schemas.BifrostContext {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, requestID)
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, mcpLogID)
+		// The transport settled a presented key; governance has not resolved it yet.
+		ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-presented")
+		return ctx
+	}
+	toolName := "docs-search"
+	preHook := func(t *testing.T, plugin *LoggerPlugin, ctx *schemas.BifrostContext) *logstore.MCPToolLog {
+		t.Helper()
+		_, _, err := plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+			RequestType: schemas.MCPRequestTypeChatToolCall,
+			ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+				Function: schemas.ChatAssistantMessageToolCallFunction{Name: &toolName, Arguments: `{"query":"find this"}`},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PreMCPHook() error = %v", err)
+		}
+		pendingValue, ok := plugin.pendingMCPLogsToInject.Load(ctx.Value(schemas.BifrostContextKeyMCPLogID).(string))
+		if !ok {
+			t.Fatal("expected pending MCP log entry")
+		}
+		return pendingValue.(*logstore.MCPToolLog)
+	}
+	postHook := func(t *testing.T, plugin *LoggerPlugin, ctx *schemas.BifrostContext) {
+		t.Helper()
+		result := `{"answer":"done"}`
+		_, _, err := plugin.PostMCPHook(ctx, &schemas.BifrostMCPResponse{
+			ChatMessage: &schemas.ChatMessage{Role: schemas.ChatMessageRoleTool, Content: &schemas.ChatMessageContent{ContentStr: &result}},
+			ExtraFields: schemas.BifrostMCPResponseExtraFields{MCPRequestType: schemas.MCPRequestTypeChatToolCall, ClientName: "docs", ToolName: "search"},
+		}, nil)
+		if err != nil {
+			t.Fatalf("PostMCPHook() error = %v", err)
+		}
+	}
+
+	t.Run("stale cleanup persists no arguments for an unresolved key", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		ctx := newCtx("req-mcp-provisional-stale", "mcp-provisional-stale")
+		pending := preHook(t, plugin, ctx)
+		if pending.ArgumentsParsed != nil {
+			t.Fatalf("arguments must be held aside while the key's decision is unknown, got %#v", pending.ArgumentsParsed)
+		}
+
+		// PostMCPHook never fires; the reaper persists what the pending entry holds.
+		pending.CreatedAt = time.Now().Add(-pendingLogTTL - time.Minute)
+		plugin.cleanupStalePendingLogs()
+		if err := plugin.Cleanup(); err != nil {
+			t.Fatalf("Cleanup() error = %v", err)
+		}
+		logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-provisional-stale")
+		if err != nil {
+			t.Fatalf("FindMCPToolLog() error = %v", err)
+		}
+		if logEntry.Status != "error" {
+			t.Fatalf("expected the stale status, got %q", logEntry.Status)
+		}
+		if logEntry.ArgumentsParsed != nil {
+			t.Fatalf("a stale entry captured before the key was stamped must not persist arguments, got %#v", logEntry.ArgumentsParsed)
+		}
+	})
+
+	t.Run("arguments are attached once the resolved key keeps content on", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		ctx := newCtx("req-mcp-provisional-on", "mcp-provisional-on")
+		preHook(t, plugin, ctx)
+		// Governance resolved the key and it inherits: content stays on.
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+		postHook(t, plugin, ctx)
+		if err := plugin.Cleanup(); err != nil {
+			t.Fatalf("Cleanup() error = %v", err)
+		}
+		logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-provisional-on")
+		if err != nil {
+			t.Fatalf("FindMCPToolLog() error = %v", err)
+		}
+		if logEntry.ArgumentsParsed == nil {
+			t.Fatal("arguments held aside must be attached once the final policy keeps content on")
+		}
+	})
+
+	t.Run("arguments are dropped once the resolved key turns content off", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		ctx := newCtx("req-mcp-provisional-off", "mcp-provisional-off")
+		preHook(t, plugin, ctx)
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+		postHook(t, plugin, ctx)
+		if err := plugin.Cleanup(); err != nil {
+			t.Fatalf("Cleanup() error = %v", err)
+		}
+		logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-provisional-off")
+		if err != nil {
+			t.Fatalf("FindMCPToolLog() error = %v", err)
+		}
+		if logEntry.ArgumentsParsed != nil || logEntry.ResultParsed != nil {
+			t.Fatalf("content-off key must persist no arguments or result, got args=%#v result=%#v", logEntry.ArgumentsParsed, logEntry.ResultParsed)
+		}
+	})
+}
+
+// TestPreLLMHookNotificationCarriesNoInputWhileKeyIsUnresolved pins that the live "processing"
+// notification PreLLMHook sends to log subscribers never carries captured input for a request
+// whose virtual key governance has not stamped yet: the key may turn content off once it does.
+func TestPreLLMHookNotificationCarriesNoInputWhileKeyIsUnresolved(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() { _ = plugin.Cleanup() })
+	var notified []*logstore.Log
+	plugin.SetLogCallback(func(_ context.Context, logEntry *logstore.Log) { notified = append(notified, logEntry) })
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-notify-unresolved")
+	ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-presented")
+	_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+		RequestType: schemas.PassthroughRequest,
+		PassthroughRequest: &schemas.BifrostPassthroughRequest{
+			Provider:    schemas.OpenAI,
+			Method:      "POST",
+			Path:        "/v1/fine-tuning/jobs",
+			Body:        []byte(`{"training_file":"file-secret"}`),
+			SafeHeaders: map[string]string{"content-type": "application/json"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	if len(notified) == 0 {
+		t.Fatal("expected the processing notification")
+	}
+	if body := notified[0].PassthroughRequestBody; body != "" {
+		t.Fatalf("the notification went out before the key was stamped and must carry no input, got %q", body)
+	}
+}
+
+// TestPreLLMHookNotificationCarriesNoEmbeddingInputWhileKeyIsUnresolved pins that embedding input,
+// captured provisionally because the presented key may turn content on, stays out of the notification.
+func TestPreLLMHookNotificationCarriesNoEmbeddingInputWhileKeyIsUnresolved(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{DisableContentLogging: new(true)}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() { _ = plugin.Cleanup() })
+	var notified []*logstore.Log
+	plugin.SetLogCallback(func(_ context.Context, logEntry *logstore.Log) { notified = append(notified, logEntry) })
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-notify-unresolved-embedding")
+	ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-presented")
+	text := "secret embedding text"
+	_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+		RequestType: schemas.EmbeddingRequest,
+		EmbeddingRequest: &schemas.BifrostEmbeddingRequest{
+			Provider: schemas.OpenAI,
+			Model:    "text-embedding-3-small",
+			Input: []schemas.EmbeddingInputItem{
+				{Content: schemas.EmbeddingContent{{Type: schemas.EmbeddingContentPartTypeText, Text: &text}}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreLLMHook() error = %v", err)
+	}
+	if len(notified) == 0 {
+		t.Fatal("expected the processing notification")
+	}
+	if input := notified[0].EmbeddingInputParsed; input != nil {
+		t.Fatalf("the notification went out before the key was stamped and must carry no embedding input, got %#v", input)
+	}
+}
+
+// TestKeyTurningContentOnOverClientFlagKeepsEarlyCapturedContent pins the other direction of the
+// hook ordering hole: with the client flag off, a key that turns content on is still unstamped when
+// PreLLMHook and PreMCPHook capture, so they must capture provisionally and let the final policy in
+// the post-hooks decide, instead of dropping content the key is entitled to keep.
+func TestKeyTurningContentOnOverClientFlagKeepsEarlyCapturedContent(t *testing.T) {
+	newCtx := func(requestID string) *schemas.BifrostContext {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, requestID)
+		ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-presented")
+		return ctx
+	}
+	stampKeyOn := func(ctx *schemas.BifrostContext) {
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, false)
+	}
+
+	t.Run("passthrough body", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{DisableContentLogging: new(true)}, testLogger{}, store, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		ctx := newCtx("req-key-on-passthrough")
+		_, _, err = plugin.PreLLMHook(ctx, &schemas.BifrostRequest{
+			RequestType: schemas.PassthroughRequest,
+			PassthroughRequest: &schemas.BifrostPassthroughRequest{
+				Provider:    schemas.OpenAI,
+				Method:      "POST",
+				Path:        "/v1/fine-tuning/jobs",
+				Body:        []byte(`{"training_file":"file-kept"}`),
+				SafeHeaders: map[string]string{"content-type": "application/json"},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PreLLMHook() error = %v", err)
+		}
+		stampKeyOn(ctx)
+		_, _, err = plugin.PostLLMHook(ctx, &schemas.BifrostResponse{
+			PassthroughResponse: &schemas.BifrostPassthroughResponse{
+				StatusCode:  200,
+				Body:        []byte(`{"id":"ftjob-1"}`),
+				Path:        "/v1/fine-tuning/jobs",
+				ExtraFields: schemas.BifrostResponseExtraFields{RequestType: schemas.PassthroughRequest, Provider: schemas.OpenAI},
+			},
+		}, nil)
+		if err != nil {
+			t.Fatalf("PostLLMHook() error = %v", err)
+		}
+		if err := plugin.Cleanup(); err != nil {
+			t.Fatalf("Cleanup() error = %v", err)
+		}
+		logEntry, err := store.FindByID(context.Background(), "req-key-on-passthrough")
+		if err != nil {
+			t.Fatalf("FindByID() error = %v", err)
+		}
+		if logEntry.ContentHidden {
+			t.Fatal("a key that turns content on must leave the row visible")
+		}
+		if logEntry.PassthroughRequestBody != `{"training_file":"file-kept"}` {
+			t.Fatalf("expected the passthrough body kept for a content-on key, got %q", logEntry.PassthroughRequestBody)
+		}
+	})
+
+	t.Run("mcp arguments", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{DisableContentLogging: new(true)}, testLogger{}, store, nil, nil, nil)
+		if err != nil {
+			t.Fatalf("Init() error = %v", err)
+		}
+		ctx := newCtx("req-key-on-mcp")
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-key-on")
+		toolName := "docs-search"
+		_, _, err = plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+			RequestType: schemas.MCPRequestTypeChatToolCall,
+			ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+				Function: schemas.ChatAssistantMessageToolCallFunction{Name: &toolName, Arguments: `{"query":"find this"}`},
+			},
+		})
+		if err != nil {
+			t.Fatalf("PreMCPHook() error = %v", err)
+		}
+		stampKeyOn(ctx)
+		result := `{"answer":"done"}`
+		_, _, err = plugin.PostMCPHook(ctx, &schemas.BifrostMCPResponse{
+			ChatMessage: &schemas.ChatMessage{Role: schemas.ChatMessageRoleTool, Content: &schemas.ChatMessageContent{ContentStr: &result}},
+			ExtraFields: schemas.BifrostMCPResponseExtraFields{MCPRequestType: schemas.MCPRequestTypeChatToolCall, ClientName: "docs", ToolName: "search"},
+		}, nil)
+		if err != nil {
+			t.Fatalf("PostMCPHook() error = %v", err)
+		}
+		if err := plugin.Cleanup(); err != nil {
+			t.Fatalf("Cleanup() error = %v", err)
+		}
+		logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-key-on")
+		if err != nil {
+			t.Fatalf("FindMCPToolLog() error = %v", err)
+		}
+		if logEntry.ResultParsed == nil {
+			t.Fatal("precondition: a content-on key stores the result")
+		}
+		if logEntry.ArgumentsParsed == nil {
+			t.Fatal("expected the arguments kept for a content-on key, alongside its result")
+		}
+	})
+}
+
+// projectNamingCtx is a request with no virtual key that names a project through the request
+// header, before governance has admitted it: the caller is a dashboard session.
+func projectNamingCtx(requestID string, header string) *schemas.BifrostContext {
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, requestID)
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{header: "proj-1"})
+	ctx.SetGrant(grant.New())
+	ctx.Grant().SetIdentity(grant.NewIdentity(grant.NewCredential(grant.CredentialSessionToken, "session"), nil, nil, nil, nil, nil, nil))
+	return ctx
+}
+
+// admitProject leaves the context the way the documented contract describes a request once its
+// named project is admitted: the identity carries the project, and the governance content
+// decision key carries the project's decision when it has one.
+func admitProject(ctx *schemas.BifrostContext, disableContentLogging *bool) {
+	project := &schemas.EntityRef{ID: "proj-1", Name: "Project One"}
+	ctx.Grant().SetIdentity(grant.NewIdentity(grant.NewCredential(grant.CredentialSessionToken, "session"), nil, nil, nil, nil, nil, project))
+	if disableContentLogging != nil {
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, *disableContentLogging)
+	}
+}
+
+// TestGovernanceDecisionPending pins when the logging hooks treat the content decision on the
+// context as not final yet: while a presented virtual key or a named project is still unresolved.
+func TestGovernanceDecisionPending(t *testing.T) {
+	t.Run("nothing presented or named", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		require.False(t, governanceDecisionPending(ctx))
+	})
+	t.Run("project named by id", func(t *testing.T) {
+		require.True(t, governanceDecisionPending(projectNamingCtx("req-pending-id", schemas.HeaderGovernanceProjectID)))
+	})
+	t.Run("project named by name", func(t *testing.T) {
+		require.True(t, governanceDecisionPending(projectNamingCtx("req-pending-name", schemas.HeaderGovernanceProjectName)))
+	})
+	t.Run("an empty project header still names one", func(t *testing.T) {
+		// The governance funnel treats an empty header as having asked, and refuses the request
+		// when nothing was admitted behind it; until then its decision is not known either.
+		ctx := projectNamingCtx("req-pending-empty", schemas.HeaderGovernanceProjectID)
+		ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{schemas.HeaderGovernanceProjectID: ""})
+		require.True(t, governanceDecisionPending(ctx))
+	})
+	t.Run("an admitted project is settled", func(t *testing.T) {
+		ctx := projectNamingCtx("req-pending-admitted", schemas.HeaderGovernanceProjectID)
+		admitProject(ctx, nil)
+		require.False(t, governanceDecisionPending(ctx))
+	})
+	t.Run("an admitted project still waits on an unresolved key", func(t *testing.T) {
+		ctx := projectNamingCtx("req-pending-key", schemas.HeaderGovernanceProjectID)
+		admitProject(ctx, nil)
+		ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-presented")
+		require.True(t, governanceDecisionPending(ctx))
+	})
+	t.Run("a stamped key with no project named is settled", func(t *testing.T) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-presented")
+		ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+		require.False(t, governanceDecisionPending(ctx))
+	})
+}
+
+// TestProjectDecisionAppliesToContentCapturedBeforeAdmission pins the hook ordering hole for a
+// request that names a project and presents no virtual key: governance admits the project, and
+// stamps its content decision, only after the logging pre-hooks have captured. Content must be
+// held provisionally so the final policy in the post-hooks decides, in both directions.
+func TestProjectDecisionAppliesToContentCapturedBeforeAdmission(t *testing.T) {
+	toolName := "docs-search"
+	mcpRequest := &schemas.BifrostMCPRequest{
+		RequestType: schemas.MCPRequestTypeChatToolCall,
+		ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+			Function: schemas.ChatAssistantMessageToolCallFunction{Name: &toolName, Arguments: `{"query":"find this"}`},
+		},
+	}
+	result := `{"answer":"done"}`
+	mcpResponse := &schemas.BifrostMCPResponse{
+		ChatMessage: &schemas.ChatMessage{Role: schemas.ChatMessageRoleTool, Content: &schemas.ChatMessageContent{ContentStr: &result}},
+		ExtraFields: schemas.BifrostMCPResponseExtraFields{MCPRequestType: schemas.MCPRequestTypeChatToolCall, ClientName: "docs", ToolName: "search"},
+	}
+	passthroughRequest := func(body string) *schemas.BifrostRequest {
+		return &schemas.BifrostRequest{
+			RequestType: schemas.PassthroughRequest,
+			PassthroughRequest: &schemas.BifrostPassthroughRequest{
+				Provider:    schemas.OpenAI,
+				Method:      "POST",
+				Path:        "/v1/fine-tuning/jobs",
+				Body:        []byte(body),
+				SafeHeaders: map[string]string{"content-type": "application/json"},
+			},
+		}
+	}
+	passthroughResponse := &schemas.BifrostResponse{
+		PassthroughResponse: &schemas.BifrostPassthroughResponse{
+			StatusCode:  200,
+			Body:        []byte(`{"id":"ftjob-1"}`),
+			Path:        "/v1/fine-tuning/jobs",
+			ExtraFields: schemas.BifrostResponseExtraFields{RequestType: schemas.PassthroughRequest, Provider: schemas.OpenAI},
+		},
+	}
+
+	t.Run("project turning content on over the client flag keeps llm input", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{DisableContentLogging: new(true)}, testLogger{}, store, nil, nil, nil)
+		require.NoError(t, err)
+		ctx := projectNamingCtx("req-project-on-llm", schemas.HeaderGovernanceProjectID)
+		_, _, err = plugin.PreLLMHook(ctx, passthroughRequest(`{"training_file":"file-kept"}`))
+		require.NoError(t, err)
+		admitProject(ctx, new(false))
+		_, _, err = plugin.PostLLMHook(ctx, passthroughResponse, nil)
+		require.NoError(t, err)
+		require.NoError(t, plugin.Cleanup())
+		logEntry, err := store.FindByID(context.Background(), "req-project-on-llm")
+		require.NoError(t, err)
+		require.False(t, logEntry.ContentHidden, "a project that turns content on must leave the row visible")
+		require.Equal(t, `{"training_file":"file-kept"}`, logEntry.PassthroughRequestBody, "input captured before admission belongs to a content-on project")
+	})
+
+	t.Run("project turning content off drops llm input", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+		require.NoError(t, err)
+		ctx := projectNamingCtx("req-project-off-llm", schemas.HeaderGovernanceProjectName)
+		_, _, err = plugin.PreLLMHook(ctx, passthroughRequest(`{"training_file":"file-secret"}`))
+		require.NoError(t, err)
+		admitProject(ctx, new(true))
+		_, _, err = plugin.PostLLMHook(ctx, passthroughResponse, nil)
+		require.NoError(t, err)
+		require.NoError(t, plugin.Cleanup())
+		logEntry, err := store.FindByID(context.Background(), "req-project-off-llm")
+		require.NoError(t, err)
+		require.Empty(t, logEntry.PassthroughRequestBody, "a content-off project must persist no input")
+	})
+
+	t.Run("processing notification carries no input before admission", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = plugin.Cleanup() })
+		var notified []*logstore.Log
+		plugin.SetLogCallback(func(_ context.Context, logEntry *logstore.Log) { notified = append(notified, logEntry) })
+		ctx := projectNamingCtx("req-project-notify", schemas.HeaderGovernanceProjectID)
+		_, _, err = plugin.PreLLMHook(ctx, passthroughRequest(`{"training_file":"file-secret"}`))
+		require.NoError(t, err)
+		require.NotEmpty(t, notified, "expected the processing notification")
+		require.Empty(t, notified[0].PassthroughRequestBody, "the notification went out before the project was admitted and must carry no input")
+	})
+
+	t.Run("mcp arguments are held until admission and dropped for a content-off project", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+		require.NoError(t, err)
+		ctx := projectNamingCtx("req-project-off-mcp", schemas.HeaderGovernanceProjectID)
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-project-off")
+		_, _, err = plugin.PreMCPHook(ctx, mcpRequest)
+		require.NoError(t, err)
+		pending, ok := plugin.pendingMCPLogsToInject.Load("mcp-project-off")
+		require.True(t, ok, "expected pending MCP log entry")
+		require.Nil(t, pending.(*logstore.MCPToolLog).ArgumentsParsed, "arguments must be held aside while the project's decision is unknown")
+		admitProject(ctx, new(true))
+		_, _, err = plugin.PostMCPHook(ctx, mcpResponse, nil)
+		require.NoError(t, err)
+		require.NoError(t, plugin.Cleanup())
+		logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-project-off")
+		require.NoError(t, err)
+		require.Nil(t, logEntry.ArgumentsParsed, "a content-off project must persist no arguments")
+		require.Nil(t, logEntry.ResultParsed, "a content-off project must persist no result")
+	})
+
+	t.Run("mcp arguments are attached for a project turning content on over the client flag", func(t *testing.T) {
+		store := newTestStore(t)
+		plugin, err := Init(context.Background(), &Config{DisableContentLogging: new(true)}, testLogger{}, store, nil, nil, nil)
+		require.NoError(t, err)
+		ctx := projectNamingCtx("req-project-on-mcp", schemas.HeaderGovernanceProjectID)
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-project-on")
+		_, _, err = plugin.PreMCPHook(ctx, mcpRequest)
+		require.NoError(t, err)
+		admitProject(ctx, new(false))
+		_, _, err = plugin.PostMCPHook(ctx, mcpResponse, nil)
+		require.NoError(t, err)
+		require.NoError(t, plugin.Cleanup())
+		logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-project-on")
+		require.NoError(t, err)
+		require.NotNil(t, logEntry.ResultParsed, "precondition: a content-on project stores the result")
+		require.NotNil(t, logEntry.ArgumentsParsed, "expected the arguments kept for a content-on project, alongside its result")
+	})
+}
+
+// TestClaimStaleMCPEntryLeavesHeldArgumentsWhenPostHookWon pins the TTL-boundary race: when
+// PostMCPHook claims the pending entry first, the reaper's claim fails and must leave the held
+// arguments for PostMCPHook to attach, not delete them out from under it.
+func TestClaimStaleMCPEntryLeavesHeldArgumentsWhenPostHookWon(t *testing.T) {
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, newTestStore(t), nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() { _ = plugin.Cleanup() })
+
+	// PostMCPHook already took the pending entry; its held arguments are still waiting.
+	plugin.provisionalMCPArguments.Store("mcp-race", `{"query":"find this"}`)
+
+	if _, ok := plugin.claimStaleMCPEntry("mcp-race"); ok {
+		t.Fatal("the reaper must not claim an entry PostMCPHook already took")
+	}
+	if _, ok := plugin.provisionalMCPArguments.Load("mcp-race"); !ok {
+		t.Fatal("a failed claim must leave the held arguments for PostMCPHook")
+	}
+
+	// And a claim that wins takes the held arguments with the entry.
+	plugin.pendingMCPLogsToInject.Store("mcp-won", &logstore.MCPToolLog{ID: "mcp-won"})
+	plugin.provisionalMCPArguments.Store("mcp-won", `{"query":"find this"}`)
+	if _, ok := plugin.claimStaleMCPEntry("mcp-won"); !ok {
+		t.Fatal("the reaper must claim a pending entry nobody else took")
+	}
+	if _, ok := plugin.provisionalMCPArguments.Load("mcp-won"); ok {
+		t.Fatal("a winning claim must drop the held arguments; a stale entry never gets them")
+	}
+}
+
+// TestPostMCPHookFallbackStampsGovernanceFields verifies fallback MCP logs
+// created without a pending pre-hook entry still carry DAC ownership fields.
+func TestPostMCPHookFallbackStampsGovernanceFields(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-mcp-fallback")
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-fallback-flow")
+	ctx.SetValue(schemas.BifrostContextKeyUserID, "user-fallback")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceTeamID, "team-fallback")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceCustomerID, "customer-fallback")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBusinessUnitID, "bu-fallback")
+	ctx.SetValue(schemas.BifrostContextKeySessionID, "session-mcp-fallback")
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{
+		"X-BF-Agent-Correlation-ID": "agent-mcp-fallback",
+	})
+
+	result := `{"answer":"fallback"}`
+	_, _, err = plugin.PostMCPHook(ctx, &schemas.BifrostMCPResponse{
+		ChatMessage: &schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleTool,
+			Content: &schemas.ChatMessageContent{ContentStr: &result},
+		},
+		ExtraFields: schemas.BifrostMCPResponseExtraFields{
+			MCPRequestType: schemas.MCPRequestTypeChatToolCall,
+			ClientName:     "docs",
+			ToolName:       "search",
+			Latency:        7,
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("PostMCPHook() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-fallback-flow")
+	if err != nil {
+		t.Fatalf("FindMCPToolLog() error = %v", err)
+	}
+	assertMCPLogGovernanceFields(t, logEntry, "user-fallback", "team-fallback", "customer-fallback", "bu-fallback")
+	if logEntry.SessionID == nil || *logEntry.SessionID != "session-mcp-fallback" {
+		t.Fatalf("expected fallback MCP session ID, got %v", logEntry.SessionID)
+	}
+	if logEntry.AgentCorrelationID == nil || *logEntry.AgentCorrelationID != "agent-mcp-fallback" {
+		t.Fatalf("expected fallback MCP agent correlation ID, got %v", logEntry.AgentCorrelationID)
+	}
+}
+
+// TestCleanupStalePendingMCPLogsPersistsErrorFallback verifies stale pending
+// MCP logs are committed as terminal errors instead of being silently dropped.
+func TestCleanupStalePendingMCPLogsPersistsErrorFallback(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	staleCreatedAt := time.Now().Add(-pendingLogTTL - time.Minute)
+	plugin.pendingMCPLogsToInject.Store("mcp-stale", &logstore.MCPToolLog{
+		ID:          "mcp-stale",
+		RequestID:   "req-stale",
+		Timestamp:   staleCreatedAt,
+		ToolName:    "search",
+		ServerLabel: "docs",
+		Status:      "processing",
+		CreatedAt:   staleCreatedAt,
+		ArgumentsParsed: map[string]interface{}{
+			"query": "stale input",
+		},
+	})
+
+	plugin.cleanupStalePendingLogs()
+
+	if _, ok := plugin.pendingMCPLogsToInject.Load("mcp-stale"); ok {
+		t.Fatal("expected stale MCP pending log to be removed from memory")
+	}
+	if _, err := store.FindMCPToolLog(context.Background(), "mcp-stale"); !errors.Is(err, logstore.ErrNotFound) {
+		t.Fatalf("expected stale MCP log to be queued before batch flush, got err=%v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	logEntry, err := store.FindMCPToolLog(context.Background(), "mcp-stale")
+	if err != nil {
+		t.Fatalf("FindMCPToolLog() error = %v", err)
+	}
+	if logEntry.Status != "error" {
+		t.Fatalf("expected status error, got %q", logEntry.Status)
+	}
+	if logEntry.ArgumentsParsed == nil {
+		t.Fatal("expected stale MCP input arguments to be persisted")
+	}
+	if logEntry.ResultParsed != nil || logEntry.Result != "" {
+		t.Fatalf("expected stale MCP log to have no result, got parsed=%#v raw=%q", logEntry.ResultParsed, logEntry.Result)
+	}
+	if logEntry.ErrorDetailsParsed == nil || logEntry.ErrorDetailsParsed.Error == nil {
+		t.Fatalf("expected stale MCP error details, got %#v", logEntry.ErrorDetailsParsed)
+	}
+	if !strings.Contains(logEntry.ErrorDetailsParsed.Error.Message, "pending log TTL") {
+		t.Fatalf("expected stale MCP timeout message, got %q", logEntry.ErrorDetailsParsed.Error.Message)
+	}
+}
+
+// TestActiveStreamSurvivesCleanup is the regression test for the prod issue where
+// streaming requests running longer than the pending TTL had their in-memory
+// pending entry evicted mid-flight (causing the final log row to be lost and a
+// per-chunk "no pending log data found" warning). An entry whose CreatedAt is
+// older than the TTL but whose LastActivity is recent must NOT be reaped.
+func TestActiveStreamSurvivesCleanup(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+
+	oldCreatedAt := time.Now().Add(-pendingLogTTL - time.Minute)
+	pending := &PendingLogData{
+		RequestID:   "req-active-stream",
+		Timestamp:   oldCreatedAt,
+		Status:      "processing",
+		InitialData: &InitialLogData{Object: "chat.completion.chunk"},
+		CreatedAt:   oldCreatedAt,
+	}
+	// Simulate a chunk that arrived just now: request started long ago but is
+	// still actively streaming.
+	pending.LastActivity.Store(time.Now().UnixNano())
+	plugin.pendingLogsEntries.Store("req-active-stream", pending)
+
+	plugin.cleanupStalePendingLogs()
+
+	if _, ok := plugin.pendingLogsEntries.Load("req-active-stream"); !ok {
+		t.Fatal("expected actively-streaming pending entry to survive cleanup")
+	}
+}
+
+// TestIdlePendingEntryEvicted verifies the reaper still removes genuinely dead
+// requests: an entry whose CreatedAt AND LastActivity are both older than the
+// TTL (no chunk activity for the whole idle window) must be deleted.
+func TestIdlePendingEntryEvicted(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+
+	stale := time.Now().Add(-pendingLogTTL - time.Minute)
+	pending := &PendingLogData{
+		RequestID:   "req-idle",
+		Timestamp:   stale,
+		Status:      "processing",
+		InitialData: &InitialLogData{Object: "chat.completion.chunk"},
+		CreatedAt:   stale,
+	}
+	pending.LastActivity.Store(stale.UnixNano())
+	plugin.pendingLogsEntries.Store("req-idle", pending)
+
+	plugin.cleanupStalePendingLogs()
+
+	if _, ok := plugin.pendingLogsEntries.Load("req-idle"); ok {
+		t.Fatal("expected idle pending entry to be evicted by cleanup")
+	}
+}
+
+func TestCleanupStalePendingAgentLogsUsesTimestamp(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, plugin.Cleanup())
+	})
+
+	freshKey := a2aPendingKey("req-agent-fresh", schemas.A2ARequestTypeSendMessage)
+	staleKey := a2aPendingKey("req-agent-stale", schemas.A2ARequestTypeSendMessage)
+	plugin.pendingAgentLogs.Store(freshKey, &logstore.AgentLog{
+		RequestID: "req-agent-fresh",
+		Timestamp: time.Now(),
+	})
+	plugin.pendingAgentLogs.Store(staleKey, &logstore.AgentLog{
+		RequestID: "req-agent-stale",
+		Timestamp: time.Now().Add(-pendingLogTTL - time.Minute),
+	})
+
+	plugin.cleanupStalePendingLogs()
+
+	_, freshExists := plugin.pendingAgentLogs.Load(freshKey)
+	require.True(t, freshExists, "fresh Agent request should survive cleanup")
+	_, staleExists := plugin.pendingAgentLogs.Load(staleKey)
+	require.False(t, staleExists, "expired Agent request should be removed")
+}
+
+// TestPreMCPHookSkipsPrefixedCodemodeTool verifies that PreMCP skips codemode
+// meta-tools invoked with a client prefix (e.g. "myclient-executeToolCode"),
+// not just bare names. Otherwise PostMCP — which sees the stripped bare name —
+// would silently skip and leave the pending row to expire as a fake TTL error.
+func TestPreMCPHookSkipsPrefixedCodemodeTool(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if cleanupErr := plugin.Cleanup(); cleanupErr != nil {
+			t.Errorf("Cleanup() error = %v", cleanupErr)
+		}
+	})
+
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-prefixed-codemode")
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-prefixed-codemode")
+
+	toolName := "myclient-executeToolCode"
+	_, _, err = plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+		RequestType: schemas.MCPRequestTypeChatToolCall,
+		ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+			Function: schemas.ChatAssistantMessageToolCallFunction{
+				Name:      &toolName,
+				Arguments: `{}`,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PreMCPHook() error = %v", err)
+	}
+
+	if _, ok := plugin.pendingMCPLogsToInject.Load("mcp-prefixed-codemode"); ok {
+		t.Fatal("expected PreMCPHook to skip prefixed codemode tool, but a pending row was created")
+	}
+}
+
+func assertMCPLogGovernanceFields(t *testing.T, logEntry *logstore.MCPToolLog, userID, teamID, customerID, businessUnitID string) {
+	t.Helper()
+	if logEntry.UserID == nil || *logEntry.UserID != userID {
+		t.Fatalf("expected user_id %q, got %#v", userID, logEntry.UserID)
+	}
+	if logEntry.TeamID == nil || *logEntry.TeamID != teamID {
+		t.Fatalf("expected team_id %q, got %#v", teamID, logEntry.TeamID)
+	}
+	if logEntry.CustomerID == nil || *logEntry.CustomerID != customerID {
+		t.Fatalf("expected customer_id %q, got %#v", customerID, logEntry.CustomerID)
+	}
+	if logEntry.BusinessUnitID == nil || *logEntry.BusinessUnitID != businessUnitID {
+		t.Fatalf("expected business_unit_id %q, got %#v", businessUnitID, logEntry.BusinessUnitID)
+	}
+}
+
+func TestUpdateLogEntryPreservesResponsesInputContentSummary(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:  store,
+		logger: testLogger{},
+	}
+
+	requestID := "req-1"
+	now := time.Now().UTC()
+	inputText := "request-side text"
+	initial := &InitialLogData{
+		Object:   "responses",
+		Provider: "openai",
+		Model:    "gpt-4o-mini",
+		ResponsesInputHistory: []schemas.ResponsesMessage{{
+			Content: &schemas.ResponsesMessageContent{
+				ContentStr: &inputText,
+			},
+		}},
+	}
+
+	if err := plugin.insertInitialLogEntry(context.Background(), requestID, "", now, 0, nil, initial); err != nil {
+		t.Fatalf("insertInitialLogEntry() error = %v", err)
+	}
+
+	responsesText := "responses output"
+	update := &UpdateLogData{
+		Status: "success",
+		ResponsesOutput: []schemas.ResponsesMessage{{
+			Content: &schemas.ResponsesMessageContent{
+				ContentStr: &responsesText,
+			},
+		}},
+	}
+
+	if err := plugin.updateLogEntry(context.Background(), requestID, "", "", 10, "", "", "", "", 0, nil, "", update, true); err != nil {
+		t.Fatalf("updateLogEntry() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), requestID)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if !strings.Contains(logEntry.ContentSummary, inputText) {
+		t.Fatalf("expected content summary to preserve responses input, got %q", logEntry.ContentSummary)
+	}
+	if strings.Contains(logEntry.ContentSummary, responsesText) {
+		t.Fatalf("expected content summary to avoid overwriting with responses output-only data, got %q", logEntry.ContentSummary)
+	}
+}
+
+func TestUpdateLogEntryUpdatesContentSummaryForChatOutput(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:  store,
+		logger: testLogger{},
+	}
+
+	requestID := "req-chat"
+	now := time.Now().UTC()
+	initial := &InitialLogData{
+		Object:   "chat_completion",
+		Provider: "openai",
+		Model:    "gpt-4o-mini",
+	}
+
+	if err := plugin.insertInitialLogEntry(context.Background(), requestID, "", now, 0, nil, initial); err != nil {
+		t.Fatalf("insertInitialLogEntry() error = %v", err)
+	}
+
+	chatText := "assistant output"
+	update := &UpdateLogData{
+		Status: "success",
+		ChatOutput: &schemas.ChatMessage{
+			Role: schemas.ChatMessageRoleAssistant,
+			Content: &schemas.ChatMessageContent{
+				ContentStr: &chatText,
+			},
+		},
+	}
+
+	if err := plugin.updateLogEntry(context.Background(), requestID, "", "", 10, "", "", "", "", 0, nil, "", update, true); err != nil {
+		t.Fatalf("updateLogEntry() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), requestID)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if !strings.Contains(logEntry.ContentSummary, chatText) {
+		t.Fatalf("expected content summary to include chat output, got %q", logEntry.ContentSummary)
+	}
+}
+
+func TestUpdateLogEntrySuppressesChatOutputWhenContentLoggingDisabled(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:  store,
+		logger: testLogger{},
+	}
+
+	requestID := "req-chat-disabled"
+	now := time.Now().UTC()
+	initial := &InitialLogData{
+		Object:   "chat_completion",
+		Provider: "openai",
+		Model:    "gpt-4o-mini",
+	}
+
+	if err := plugin.insertInitialLogEntry(context.Background(), requestID, "", now, 0, nil, initial); err != nil {
+		t.Fatalf("insertInitialLogEntry() error = %v", err)
+	}
+
+	chatText := "assistant output should not be logged"
+	update := &UpdateLogData{
+		Status: "success",
+		ChatOutput: &schemas.ChatMessage{
+			Role: schemas.ChatMessageRoleAssistant,
+			Content: &schemas.ChatMessageContent{
+				ContentStr: &chatText,
+			},
+		},
+	}
+
+	if err := plugin.updateLogEntry(context.Background(), requestID, "", "", 10, "", "", "", "", 0, nil, "", update, false); err != nil {
+		t.Fatalf("updateLogEntry() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), requestID)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.OutputMessage != "" {
+		t.Fatalf("expected output_message to be suppressed, got %q", logEntry.OutputMessage)
+	}
+	if strings.Contains(logEntry.ContentSummary, chatText) {
+		t.Fatalf("expected content summary to suppress chat output, got %q", logEntry.ContentSummary)
+	}
+}
+
+func TestStoreOrEnqueueRetryPreservesAllEntries(t *testing.T) {
+	// Simulate fallback/retry scenario where multiple PostLLMHook calls
+	// store entries under the same traceID. All entries must be preserved.
+	plugin := &LoggerPlugin{
+		logger:     testLogger{},
+		writeQueue: make(chan *writeQueueEntry, 10),
+	}
+
+	traceID := "trace-retry-test"
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+
+	// Simulate 3 retry attempts storing entries under the same traceID
+	entry1 := &logstore.Log{ID: "req-attempt-1", Model: "gpt-4o"}
+	entry2 := &logstore.Log{ID: "req-attempt-2", Model: "gpt-4o"}
+	entry3 := &logstore.Log{ID: "req-attempt-3", Model: "claude-3-5-sonnet"}
+
+	plugin.storeOrEnqueueEntry(ctx, entry1, nil)
+	plugin.storeOrEnqueueEntry(ctx, entry2, nil)
+	plugin.storeOrEnqueueEntry(ctx, entry3, nil)
+
+	// Verify all 3 entries are stored
+	val, ok := plugin.pendingLogsToInject.Load(traceID)
+	if !ok {
+		t.Fatal("expected pending entries for traceID, got none")
+	}
+	pending, ok := val.(*pendingInjectEntries)
+	if !ok {
+		t.Fatal("expected *pendingInjectEntries type")
+	}
+	if len(pending.entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(pending.entries))
+	}
+	if pending.entries[0].ID != "req-attempt-1" || pending.entries[1].ID != "req-attempt-2" || pending.entries[2].ID != "req-attempt-3" {
+		t.Fatalf("entries not in expected order: %v, %v, %v", pending.entries[0].ID, pending.entries[1].ID, pending.entries[2].ID)
+	}
+
+	// Now test Inject flushes all entries with plugin logs attached
+	trace := &schemas.Trace{
+		TraceID: traceID,
+		PluginLogs: []schemas.PluginLogEntry{
+			{PluginName: "hello-world", Level: schemas.LogLevelInfo, Message: "test log"},
+		},
+	}
+
+	if err := plugin.Inject(context.Background(), trace); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	// Verify all 3 entries were enqueued to writeQueue
+	if len(plugin.writeQueue) != 3 {
+		t.Fatalf("expected 3 entries in writeQueue, got %d", len(plugin.writeQueue))
+	}
+
+	// Verify plugin logs were attached to each entry
+	for i := 0; i < 3; i++ {
+		qe := <-plugin.writeQueue
+		if qe.log.PluginLogs == "" {
+			t.Fatalf("entry %d: expected PluginLogs to be set", i)
+		}
+	}
+
+	// Verify pendingLogsToInject was cleaned up
+	if _, ok := plugin.pendingLogsToInject.Load(traceID); ok {
+		t.Fatal("expected pendingLogsToInject to be cleaned up after Inject")
+	}
+}
+
+// injectAndCollect runs Inject and returns the enqueued entries keyed by ID.
+func injectAndCollect(t *testing.T, entries []*logstore.Log, upstreamMs, overheadMs float64) map[string]*logstore.Log {
+	t.Helper()
+	plugin := &LoggerPlugin{
+		logger:     testLogger{},
+		writeQueue: make(chan *writeQueueEntry, len(entries)),
+	}
+	traceID := "trace-overhead-order"
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	for _, e := range entries {
+		plugin.storeOrEnqueueEntry(ctx, e, nil)
+	}
+	trace := &schemas.Trace{
+		TraceID: traceID,
+		RootSpan: &schemas.Span{
+			Attributes: map[string]any{
+				schemas.AttrBifrostUpstreamDurationMs: upstreamMs,
+				schemas.AttrBifrostOverheadDurationMs: overheadMs,
+			},
+		},
+	}
+	if err := plugin.Inject(context.Background(), trace); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+	out := make(map[string]*logstore.Log, len(entries))
+	for len(plugin.writeQueue) > 0 {
+		qe := <-plugin.writeQueue
+		out[qe.log.ID] = qe.log
+	}
+	if len(out) != len(entries) {
+		t.Fatalf("expected %d enqueued entries, got %d", len(entries), len(out))
+	}
+	return out
+}
+
+// TestInject_StampsOverheadOnLatestTimestampRow guards against positional selection:
+// a concurrent list_models fan-out appends entries under one trace in nondeterministic
+// completion order, so request-level upstream/overhead must land on the latest-Timestamp
+// row, not "whichever slice position happened to be last". Here the latest row is the
+// middle one, so a positional "last" would stamp the wrong entry.
+func TestInject_StampsOverheadOnLatestTimestampRow(t *testing.T) {
+	base := time.Now().UTC()
+	got := injectAndCollect(t, []*logstore.Log{
+		{ID: "a", Provider: "openai", Timestamp: base},
+		{ID: "b", Provider: "anthropic", Timestamp: base.Add(2 * time.Second)}, // latest, but middle
+		{ID: "c", Provider: "gemini", Timestamp: base.Add(1 * time.Second)},    // positional last
+	}, 10, 5)
+
+	b := got["b"]
+	if b.UpstreamLatency == nil || *b.UpstreamLatency != 10 {
+		t.Fatalf("entry b UpstreamLatency = %v, want 10", b.UpstreamLatency)
+	}
+	if b.OverheadLatency == nil || *b.OverheadLatency != 5 {
+		t.Fatalf("entry b OverheadLatency = %v, want 5", b.OverheadLatency)
+	}
+	if b.Latency == nil || *b.Latency != 15 {
+		t.Fatalf("entry b Latency = %v, want 15 (upstream+overhead)", b.Latency)
+	}
+	for _, id := range []string{"a", "c"} {
+		if e := got[id]; e.UpstreamLatency != nil || e.OverheadLatency != nil {
+			t.Fatalf("entry %s must not carry request-level latency: up=%v ov=%v", id, e.UpstreamLatency, e.OverheadLatency)
+		}
+	}
+}
+
+// TestInject_OverheadTieBrokenByID pins determinism when timestamps collide (the
+// realistic fan-out case): the highest ID wins, so the target row is stable across runs.
+func TestInject_OverheadTieBrokenByID(t *testing.T) {
+	ts := time.Now().UTC()
+	got := injectAndCollect(t, []*logstore.Log{
+		{ID: "id-c", Provider: "openai", Timestamp: ts},
+		{ID: "id-a", Provider: "anthropic", Timestamp: ts},
+		{ID: "id-b", Provider: "gemini", Timestamp: ts},
+	}, 8, 2)
+
+	if e := got["id-c"]; e.OverheadLatency == nil || *e.OverheadLatency != 2 {
+		t.Fatalf("highest ID id-c should carry overhead, got %v", e.OverheadLatency)
+	}
+	for _, id := range []string{"id-a", "id-b"} {
+		if e := got[id]; e.UpstreamLatency != nil || e.OverheadLatency != nil {
+			t.Fatalf("entry %s must not carry request-level latency", id)
+		}
+	}
+}
+
+// TestInject_SequentialAttemptsEachCarryOwnLatency pins per-row accounting for a trace
+// that logged two attempts (an MCP agent loop's turns): each row carries only its own
+// upstream, the first row reaches back to the request start, the last row reaches the
+// request end, and upstream spent between the rows (a tool call) lands on neither.
+func TestInject_SequentialAttemptsEachCarryOwnLatency(t *testing.T) {
+	plugin := &LoggerPlugin{logger: testLogger{}, writeQueue: make(chan *writeQueueEntry, 2)}
+	traceID := "trace-agent-turns"
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	ctx.ResetUpstreamLatency()
+
+	rootStart := time.Now()
+	time.Sleep(10 * time.Millisecond) // transport parse and routing before turn 1
+	ctx.MarkAttemptStart()
+	time.Sleep(40 * time.Millisecond)
+	schemas.AddUpstreamLatency(ctx, 30*time.Millisecond)
+	turn1 := &logstore.Log{ID: "turn-1", Timestamp: time.Now().UTC()}
+	// Bracket each call that sets a row's window edge, so the latency bounds come from
+	// measured instants rather than from how long the sleeps happened to run.
+	turn1EndMin := time.Now()
+	plugin.storeOrEnqueueEntry(ctx, turn1, nil)
+	turn1EndMax := time.Now()
+
+	time.Sleep(20 * time.Millisecond) // tool execution between turns
+	schemas.AddUpstreamLatency(ctx, 15*time.Millisecond)
+
+	turn2StartMin := time.Now()
+	ctx.MarkAttemptStart()
+	turn2StartMax := time.Now()
+	time.Sleep(60 * time.Millisecond)
+	schemas.AddUpstreamLatency(ctx, 50*time.Millisecond)
+	turn2 := &logstore.Log{ID: "turn-2", Timestamp: time.Now().UTC()}
+	plugin.storeOrEnqueueEntry(ctx, turn2, nil)
+	time.Sleep(10 * time.Millisecond) // response write
+	rootEnd := time.Now()
+
+	trace := &schemas.Trace{
+		TraceID: traceID,
+		RootSpan: &schemas.Span{
+			StartTime: rootStart,
+			EndTime:   rootEnd,
+			Attributes: map[string]any{
+				schemas.AttrBifrostUpstreamDurationMs: 95.0,
+				schemas.AttrBifrostOverheadDurationMs: durationMs(rootEnd.Sub(rootStart)) - 95.0,
+			},
+		},
+	}
+	if err := plugin.Inject(context.Background(), trace); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+	got := map[string]*logstore.Log{}
+	for len(plugin.writeQueue) > 0 {
+		qe := <-plugin.writeQueue
+		got[qe.log.ID] = qe.log
+	}
+
+	checkRow := func(id string, wantUpstream, minLatency, maxLatency float64) {
+		t.Helper()
+		e := got[id]
+		if e == nil {
+			t.Fatalf("row %s was not written", id)
+		}
+		if e.UpstreamLatency == nil || e.OverheadLatency == nil || e.Latency == nil {
+			t.Fatalf("row %s: upstream=%v overhead=%v latency=%v, want all three set", id, e.UpstreamLatency, e.OverheadLatency, e.Latency)
+		}
+		if *e.UpstreamLatency != wantUpstream {
+			t.Errorf("row %s upstream = %vms, want %vms (its own turn only)", id, *e.UpstreamLatency, wantUpstream)
+		}
+		if *e.Latency < minLatency-0.001 || *e.Latency > maxLatency+0.001 {
+			t.Errorf("row %s latency = %vms, want within [%v, %v]ms", id, *e.Latency, minLatency, maxLatency)
+		}
+		if sum := *e.UpstreamLatency + *e.OverheadLatency; sum < *e.Latency-0.001 || sum > *e.Latency+0.001 {
+			t.Errorf("row %s upstream + overhead = %vms, want latency %vms", id, sum, *e.Latency)
+		}
+	}
+	// Turn 1 runs from the request start to its store; turn 2 from its mark to the request
+	// end. The 15ms tool call between them is in neither.
+	checkRow("turn-1", 30, durationMs(turn1EndMin.Sub(rootStart)), durationMs(turn1EndMax.Sub(rootStart)))
+	checkRow("turn-2", 50, durationMs(rootEnd.Sub(turn2StartMax)), durationMs(rootEnd.Sub(turn2StartMin)))
+}
+
+func TestConvertToProcessedStreamResponseUsesResponsesStreamTypeForWebSocketResponses(t *testing.T) {
+	result := &schemas.StreamAccumulatorResult{
+		RequestID:      "req-ws-3000",
+		RequestedModel: "gpt-4o-mini",
+		ResolvedModel:  "gpt-4o-mini",
+		Provider:       schemas.OpenAI,
+		Status:         "success",
+	}
+
+	processed := convertToProcessedStreamResponse(result, schemas.WebSocketResponsesRequest)
+	if processed == nil {
+		t.Fatal("expected processed stream response, got nil")
+	}
+	if processed.StreamType != "responses" {
+		t.Fatalf("expected stream type responses, got %s", processed.StreamType)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryBackfillsUserTranscriptFromRawRequest(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	assistantText := "Hello!"
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest:  `{"type":"conversation.item.input_audio_transcription.completed","transcript":"Hello."}`,
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error = %v", err)
+	}
+
+	if len(entry.InputHistoryParsed) != 1 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 1", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Role != schemas.ChatMessageRoleUser {
+		t.Fatalf("InputHistoryParsed[0].Role = %q, want user", entry.InputHistoryParsed[0].Role)
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != "Hello." {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want transcript", entry.InputHistoryParsed[0])
+	}
+	if entry.OutputMessageParsed == nil || entry.OutputMessageParsed.Content == nil || entry.OutputMessageParsed.Content.ContentStr == nil || *entry.OutputMessageParsed.Content.ContentStr != assistantText {
+		t.Fatalf("OutputMessageParsed = %+v, want assistant text", entry.OutputMessageParsed)
+	}
+	if !strings.Contains(entry.ContentSummary, "Hello.") {
+		t.Fatalf("ContentSummary = %q, want user transcript", entry.ContentSummary)
+	}
+	if !strings.Contains(entry.ContentSummary, "Hello!") {
+		t.Fatalf("ContentSummary = %q, want assistant text", entry.ContentSummary)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryBackfillsMissingTranscriptPlaceholder(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	assistantText := "Hi there!"
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest:  `{"type":"conversation.item.input_audio_transcription.completed","transcript":""}`,
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error = %v", err)
+	}
+
+	if len(entry.InputHistoryParsed) != 1 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 1", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != realtimeMissingTranscriptText {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want missing transcript placeholder", entry.InputHistoryParsed[0])
+	}
+	if !strings.Contains(entry.ContentSummary, realtimeMissingTranscriptText) {
+		t.Fatalf("ContentSummary = %q, want missing transcript placeholder", entry.ContentSummary)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryBackfillsDoneMissingTranscriptPlaceholder(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	assistantText := "Hi there!"
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest:  `{"type":"conversation.item.done","item":{"id":"item_user","type":"message","role":"user","status":"completed","content":[{"type":"input_audio","transcript":null}]}}`,
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error = %v", err)
+	}
+
+	if len(entry.InputHistoryParsed) != 1 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 1", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != realtimeMissingTranscriptText {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want missing transcript placeholder", entry.InputHistoryParsed[0])
+	}
+}
+
+func TestApplyRealtimeOutputToEntryBackfillsRetrievedUserAndToolHistory(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	assistantText := "I checked that for you."
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest: strings.Join([]string{
+					`{"type":"conversation.item.retrieved","item":{"id":"item_user","type":"message","role":"user","status":"completed","content":[{"type":"input_text","text":"Where is my order?"}]}}`,
+					`{"type":"conversation.item.retrieved","item":{"id":"item_tool","type":"function_call_output","call_id":"call_123","status":"completed","output":"{\"status\":\"delivered\"}"}}`,
+				}, "\n\n"),
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error = %v", err)
+	}
+
+	if len(entry.InputHistoryParsed) != 2 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 2", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Role != schemas.ChatMessageRoleUser {
+		t.Fatalf("InputHistoryParsed[0].Role = %q, want user", entry.InputHistoryParsed[0].Role)
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != "Where is my order?" {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want user content", entry.InputHistoryParsed[0])
+	}
+	if entry.InputHistoryParsed[1].Role != schemas.ChatMessageRoleTool {
+		t.Fatalf("InputHistoryParsed[1].Role = %q, want tool", entry.InputHistoryParsed[1].Role)
+	}
+	if entry.InputHistoryParsed[1].Content == nil || entry.InputHistoryParsed[1].Content.ContentStr == nil || *entry.InputHistoryParsed[1].Content.ContentStr != `{"status":"delivered"}` {
+		t.Fatalf("InputHistoryParsed[1] = %+v, want tool content", entry.InputHistoryParsed[1])
+	}
+	if entry.InputHistoryParsed[1].ChatToolMessage == nil || entry.InputHistoryParsed[1].ChatToolMessage.ToolCallID == nil || *entry.InputHistoryParsed[1].ChatToolMessage.ToolCallID != "call_123" {
+		t.Fatalf("InputHistoryParsed[1].ChatToolMessage = %+v, want tool call id", entry.InputHistoryParsed[1].ChatToolMessage)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryBackfillsCreatedUserAndToolHistory(t *testing.T) {
+	t.Parallel()
+
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RawRequest: strings.Join([]string{
+					`{"type":"conversation.item.created","item":{"id":"item_user","type":"message","role":"user","status":"completed","content":[{"type":"input_text","text":"I need help"}]}}`,
+					`{"type":"conversation.item.created","item":{"id":"item_tool","type":"function_call_output","call_id":"call_456","status":"completed","output":"{\"status\":\"ok\"}"}}`,
+				}, "\n\n"),
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+
+	if len(entry.InputHistoryParsed) != 2 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 2", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Role != schemas.ChatMessageRoleUser {
+		t.Fatalf("InputHistoryParsed[0].Role = %q, want user", entry.InputHistoryParsed[0].Role)
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != "I need help" {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want user content", entry.InputHistoryParsed[0])
+	}
+	if entry.InputHistoryParsed[1].Role != schemas.ChatMessageRoleTool {
+		t.Fatalf("InputHistoryParsed[1].Role = %q, want tool", entry.InputHistoryParsed[1].Role)
+	}
+	if entry.InputHistoryParsed[1].Content == nil || entry.InputHistoryParsed[1].Content.ContentStr == nil || *entry.InputHistoryParsed[1].Content.ContentStr != `{"status":"ok"}` {
+		t.Fatalf("InputHistoryParsed[1] = %+v, want tool content", entry.InputHistoryParsed[1])
+	}
+	if entry.InputHistoryParsed[1].ChatToolMessage == nil || entry.InputHistoryParsed[1].ChatToolMessage.ToolCallID == nil || *entry.InputHistoryParsed[1].ChatToolMessage.ToolCallID != "call_456" {
+		t.Fatalf("InputHistoryParsed[1].ChatToolMessage = %+v, want tool call id", entry.InputHistoryParsed[1].ChatToolMessage)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryBackfillsAddedUserAndToolHistory(t *testing.T) {
+	t.Parallel()
+
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	assistantText := "Done."
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest: strings.Join([]string{
+					`{"type":"conversation.item.added","item":{"id":"item_user","type":"message","role":"user","status":"completed","content":[{"type":"input_text","text":"hello from added item"}]}}`,
+					`{"type":"conversation.item.added","item":{"id":"item_tool","type":"function_call_output","call_id":"call_added","status":"completed","output":"{\"status\":\"ok\"}"}}`,
+				}, "\n\n"),
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error = %v", err)
+	}
+
+	if len(entry.InputHistoryParsed) != 2 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 2", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != "hello from added item" {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want added user content", entry.InputHistoryParsed[0])
+	}
+	if entry.InputHistoryParsed[1].ChatToolMessage == nil || entry.InputHistoryParsed[1].ChatToolMessage.ToolCallID == nil || *entry.InputHistoryParsed[1].ChatToolMessage.ToolCallID != "call_added" {
+		t.Fatalf("InputHistoryParsed[1].ChatToolMessage = %+v, want added tool call id", entry.InputHistoryParsed[1].ChatToolMessage)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryMergesRawTranscriptIntoStructuredRealtimeHistory(t *testing.T) {
+	t.Parallel()
+
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{
+		InputHistoryParsed: []schemas.ChatMessage{
+			{
+				Role: schemas.ChatMessageRoleUser,
+				Content: &schemas.ChatMessageContent{
+					ContentStr: schemas.Ptr("Can you help with my ticket?"),
+				},
+			},
+			{
+				Role: schemas.ChatMessageRoleTool,
+				Content: &schemas.ChatMessageContent{
+					ContentStr: schemas.Ptr(`{"status":"open"}`),
+				},
+				ChatToolMessage: &schemas.ChatToolMessage{
+					ToolCallID: schemas.Ptr("call_789"),
+				},
+			},
+		},
+	}
+
+	assistantText := "Let me check."
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest: strings.Join([]string{
+					`{"type":"conversation.item.input_audio_transcription.completed","transcript":"Hello."}`,
+					`{"type":"conversation.item.retrieved","item":{"id":"item_tool","type":"function_call_output","call_id":"call_789","status":"completed","output":"{\"status\":\"open\"}"}}`,
+				}, "\n\n"),
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, true, true)
+	if err := entry.SerializeFields(); err != nil {
+		t.Fatalf("SerializeFields() error = %v", err)
+	}
+
+	if len(entry.InputHistoryParsed) != 3 {
+		t.Fatalf("len(InputHistoryParsed) = %d, want 3", len(entry.InputHistoryParsed))
+	}
+	if entry.InputHistoryParsed[0].Content == nil || entry.InputHistoryParsed[0].Content.ContentStr == nil || *entry.InputHistoryParsed[0].Content.ContentStr != "Can you help with my ticket?" {
+		t.Fatalf("InputHistoryParsed[0] = %+v, want structured user content", entry.InputHistoryParsed[0])
+	}
+	if entry.InputHistoryParsed[1].Role != schemas.ChatMessageRoleUser {
+		t.Fatalf("InputHistoryParsed[1].Role = %q, want user", entry.InputHistoryParsed[1].Role)
+	}
+	if entry.InputHistoryParsed[1].Content == nil || entry.InputHistoryParsed[1].Content.ContentStr == nil || *entry.InputHistoryParsed[1].Content.ContentStr != "Hello." {
+		t.Fatalf("InputHistoryParsed[1] = %+v, want raw transcript merge", entry.InputHistoryParsed[1])
+	}
+	if entry.InputHistoryParsed[2].Role != schemas.ChatMessageRoleTool {
+		t.Fatalf("InputHistoryParsed[2].Role = %q, want tool", entry.InputHistoryParsed[2].Role)
+	}
+	if entry.InputHistoryParsed[2].ChatToolMessage == nil || entry.InputHistoryParsed[2].ChatToolMessage.ToolCallID == nil || *entry.InputHistoryParsed[2].ChatToolMessage.ToolCallID != "call_789" {
+		t.Fatalf("InputHistoryParsed[2].ChatToolMessage = %+v, want original tool call id", entry.InputHistoryParsed[2].ChatToolMessage)
+	}
+	if strings.Count(entry.ContentSummary, "Hello.") != 1 {
+		t.Fatalf("ContentSummary = %q, want one merged transcript", entry.ContentSummary)
+	}
+}
+
+func TestApplyRealtimeOutputToEntryDoesNotPersistRawWhenShouldStoreRawFalse(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	assistantText := "Hello!"
+	messageType := schemas.ResponsesMessageTypeMessage
+	assistantRole := schemas.ResponsesInputMessageRoleAssistant
+	result := &schemas.BifrostResponse{
+		ResponsesResponse: &schemas.BifrostResponsesResponse{
+			Output: []schemas.ResponsesMessage{{
+				Type: &messageType,
+				Role: &assistantRole,
+				Content: &schemas.ResponsesMessageContent{
+					ContentStr: &assistantText,
+				},
+			}},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.RealtimeRequest,
+				RawRequest:  `{"type":"conversation.item.input_audio_transcription.completed","transcript":"Hello."}`,
+				RawResponse: `{"type":"response.done"}`,
+			},
+		},
+	}
+
+	plugin.applyRealtimeOutputToEntry(entry, result, false, true)
+
+	if entry.RawRequest != "" {
+		t.Fatalf("expected RawRequest to remain empty when shouldStoreRaw=false, got %q", entry.RawRequest)
+	}
+	if entry.RawResponse != "" {
+		t.Fatalf("expected RawResponse to remain empty when shouldStoreRaw=false, got %q", entry.RawResponse)
+	}
+	if len(entry.InputHistoryParsed) == 0 {
+		t.Fatal("expected InputHistoryParsed to still be backfilled when shouldStoreRaw=false")
+	}
+	if entry.InputHistoryParsed[0].Role != schemas.ChatMessageRoleUser {
+		t.Fatalf("InputHistoryParsed[0].Role = %q, want user", entry.InputHistoryParsed[0].Role)
+	}
+}
+
+// TestContentLoggingEnabledHelper verifies precedence: ctx override > global config > default-enabled.
+func TestContentLoggingEnabledHelper(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	tests := []struct {
+		name          string
+		globalDisable *bool
+		ctxOverride   *bool // nil = don't set the key
+		want          bool
+	}{
+		{"no config no override → enabled", nil, nil, true},
+		{"global disable=false no override → enabled", boolPtr(false), nil, true},
+		{"global disable=true no override → disabled", boolPtr(true), nil, false},
+		{"ctx override=false global disable=true → enabled", boolPtr(true), boolPtr(false), true},
+		{"ctx override=true global disable=false → disabled", boolPtr(false), boolPtr(true), false},
+		{"ctx override=true nil global → disabled", nil, boolPtr(true), false},
+		{"ctx override=false nil global → enabled", nil, boolPtr(false), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := &LoggerPlugin{disableContentLogging: tc.globalDisable}
+
+			var ctx *schemas.BifrostContext
+			if tc.ctxOverride != nil {
+				ctx = schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				ctx.SetValue(schemas.BifrostContextKeyAllowPerRequestStorageOverride, true)
+				ctx.SetValue(schemas.BifrostContextKeyDisableContentLogging, *tc.ctxOverride)
+			}
+
+			got := p.contentLoggingEnabled(ctx)
+			if got != tc.want {
+				t.Errorf("contentLoggingEnabled() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestContentLoggingEnabledHelperNilCtx verifies nil context falls back to global config.
+func TestContentLoggingEnabledHelperNilCtx(t *testing.T) {
+	disabled := true
+	p := &LoggerPlugin{disableContentLogging: &disabled}
+	if p.contentLoggingEnabled(nil) {
+		t.Error("expected false with nil ctx and global disable=true")
+	}
+}
+
+// TestUpdateLogEntryPerRequestOverrideEnablesContent verifies that passing contentLoggingEnabled=true
+// to updateLogEntry stores output even when the plugin's global toggle is disabled.
+func TestUpdateLogEntryPerRequestOverrideEnablesContent(t *testing.T) {
+	store := newTestStore(t)
+	disabled := true
+	plugin := &LoggerPlugin{
+		store:                 store,
+		logger:                testLogger{},
+		disableContentLogging: &disabled, // global: off
+	}
+
+	requestID := "req-per-request-enable"
+	now := time.Now().UTC()
+	if err := plugin.insertInitialLogEntry(context.Background(), requestID, "", now, 0, nil, &InitialLogData{
+		Object:   "chat_completion",
+		Provider: "openai",
+		Model:    "gpt-4o-mini",
+	}); err != nil {
+		t.Fatalf("insertInitialLogEntry() error = %v", err)
+	}
+
+	chatText := "should be stored via per-request override"
+	update := &UpdateLogData{
+		Status: "success",
+		ChatOutput: &schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleAssistant,
+			Content: &schemas.ChatMessageContent{ContentStr: &chatText},
+		},
+	}
+
+	// Explicitly pass true — simulates the per-request ctx override enabling content logging
+	if err := plugin.updateLogEntry(context.Background(), requestID, "", "", 10, "", "", "", "", 0, nil, "", update, true); err != nil {
+		t.Fatalf("updateLogEntry() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), requestID)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.OutputMessage == "" {
+		t.Error("expected output_message to be stored when contentLoggingEnabled=true override is used")
+	}
+}
+
+// TestUpdateLogEntryPerRequestOverrideDisablesContent verifies that passing contentLoggingEnabled=false
+// suppresses output even when the plugin's global toggle is enabled.
+func TestUpdateLogEntryPerRequestOverrideDisablesContent(t *testing.T) {
+	store := newTestStore(t)
+	plugin := &LoggerPlugin{
+		store:  store,
+		logger: testLogger{},
+		// global: nil → content logging on by default
+	}
+
+	requestID := "req-per-request-disable"
+	now := time.Now().UTC()
+	if err := plugin.insertInitialLogEntry(context.Background(), requestID, "", now, 0, nil, &InitialLogData{
+		Object:   "chat_completion",
+		Provider: "openai",
+		Model:    "gpt-4o-mini",
+	}); err != nil {
+		t.Fatalf("insertInitialLogEntry() error = %v", err)
+	}
+
+	chatText := "should NOT be stored"
+	update := &UpdateLogData{
+		Status: "success",
+		ChatOutput: &schemas.ChatMessage{
+			Role:    schemas.ChatMessageRoleAssistant,
+			Content: &schemas.ChatMessageContent{ContentStr: &chatText},
+		},
+	}
+
+	// Explicitly pass false — simulates x-bf-disable-content-logging: true on this request
+	if err := plugin.updateLogEntry(context.Background(), requestID, "", "", 10, "", "", "", "", 0, nil, "", update, false); err != nil {
+		t.Fatalf("updateLogEntry() error = %v", err)
+	}
+
+	logEntry, err := store.FindByID(context.Background(), requestID)
+	if err != nil {
+		t.Fatalf("FindByID() error = %v", err)
+	}
+	if logEntry.OutputMessage != "" {
+		t.Errorf("expected output_message to be suppressed, got %q", logEntry.OutputMessage)
+	}
+}
+
+// TestApplyNonStreamingOutputToEntryContentLoggingDisabled verifies that output fields are
+// suppressed when contentLoggingEnabled=false.
+func TestApplyNonStreamingOutputToEntryContentLoggingDisabled(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	entry := &logstore.Log{}
+
+	chatText := "should not appear"
+	result := &schemas.BifrostResponse{
+		ChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{
+				{
+					ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{
+						Message: &schemas.ChatMessage{
+							Role:    schemas.ChatMessageRoleAssistant,
+							Content: &schemas.ChatMessageContent{ContentStr: &chatText},
+						},
+					},
+				},
+			},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.ChatCompletionRequest,
+			},
+		},
+	}
+
+	plugin.applyNonStreamingOutputToEntry(entry, result, false, false)
+
+	if entry.OutputMessageParsed != nil {
+		t.Error("expected OutputMessageParsed to be nil when contentLoggingEnabled=false")
+	}
+}
+
+// TestApplyNonStreamingOutputToEntryContentLoggingEnabled verifies that output fields are
+// stored when contentLoggingEnabled=true regardless of the global plugin config.
+func TestApplyNonStreamingOutputToEntryContentLoggingEnabled(t *testing.T) {
+	disabled := true
+	plugin := &LoggerPlugin{disableContentLogging: &disabled} // global off, but explicit true passed
+	entry := &logstore.Log{}
+
+	chatText := "should appear"
+	result := &schemas.BifrostResponse{
+		ChatResponse: &schemas.BifrostChatResponse{
+			Choices: []schemas.BifrostResponseChoice{
+				{
+					ChatNonStreamResponseChoice: &schemas.ChatNonStreamResponseChoice{
+						Message: &schemas.ChatMessage{
+							Role:    schemas.ChatMessageRoleAssistant,
+							Content: &schemas.ChatMessageContent{ContentStr: &chatText},
+						},
+					},
+				},
+			},
+			ExtraFields: schemas.BifrostResponseExtraFields{
+				RequestType: schemas.ChatCompletionRequest,
+			},
+		},
+	}
+
+	plugin.applyNonStreamingOutputToEntry(entry, result, false, true)
+
+	if entry.OutputMessageParsed == nil {
+		t.Error("expected OutputMessageParsed to be set when contentLoggingEnabled=true")
+	}
+}
+
+// TestApplyNonStreamingOutputToEntryVideoOutputs verifies that each video response lands in
+// its own log column. Generation, remix and retrieve all return BifrostVideoGenerationResponse,
+// so the request type is the only thing separating generation from retrieve.
+func TestApplyNonStreamingOutputToEntryVideoOutputs(t *testing.T) {
+	videoResponse := func(requestType schemas.RequestType) *schemas.BifrostResponse {
+		return &schemas.BifrostResponse{
+			VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{
+				ID:          "vid_123:openai",
+				Status:      schemas.VideoStatusQueued,
+				ExtraFields: schemas.BifrostResponseExtraFields{RequestType: requestType},
+			},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		result *schemas.BifrostResponse
+		verify func(t *testing.T, entry *logstore.Log)
+	}{
+		{
+			name:   "generation",
+			result: videoResponse(schemas.VideoGenerationRequest),
+			verify: func(t *testing.T, entry *logstore.Log) {
+				if entry.VideoGenerationOutputParsed == nil {
+					t.Fatal("expected VideoGenerationOutputParsed to be set")
+				}
+				if entry.VideoRetrieveOutputParsed != nil {
+					t.Error("expected VideoRetrieveOutputParsed to stay nil")
+				}
+				if entry.VideoGenerationOutputParsed.ID != "vid_123:openai" {
+					t.Errorf("expected provider-scoped ID, got %q", entry.VideoGenerationOutputParsed.ID)
+				}
+			},
+		},
+		{
+			name:   "remix routes to generation",
+			result: videoResponse(schemas.VideoRemixRequest),
+			verify: func(t *testing.T, entry *logstore.Log) {
+				if entry.VideoGenerationOutputParsed == nil {
+					t.Error("expected VideoGenerationOutputParsed to be set")
+				}
+			},
+		},
+		{
+			name:   "retrieve",
+			result: videoResponse(schemas.VideoRetrieveRequest),
+			verify: func(t *testing.T, entry *logstore.Log) {
+				if entry.VideoRetrieveOutputParsed == nil {
+					t.Fatal("expected VideoRetrieveOutputParsed to be set")
+				}
+				if entry.VideoGenerationOutputParsed != nil {
+					t.Error("expected VideoGenerationOutputParsed to stay nil")
+				}
+			},
+		},
+		{
+			name: "download",
+			result: &schemas.BifrostResponse{
+				VideoDownloadResponse: &schemas.BifrostVideoDownloadResponse{
+					VideoID:     "vid_123:openai",
+					ContentType: "video/mp4",
+					ExtraFields: schemas.BifrostResponseExtraFields{RequestType: schemas.VideoDownloadRequest},
+				},
+			},
+			verify: func(t *testing.T, entry *logstore.Log) {
+				if entry.VideoDownloadOutputParsed == nil {
+					t.Error("expected VideoDownloadOutputParsed to be set")
+				}
+			},
+		},
+		{
+			name: "list",
+			result: &schemas.BifrostResponse{
+				VideoListResponse: &schemas.BifrostVideoListResponse{
+					Object:      "list",
+					Data:        []schemas.VideoObject{{ID: "vid_123:openai"}},
+					ExtraFields: schemas.BifrostResponseExtraFields{RequestType: schemas.VideoListRequest},
+				},
+			},
+			verify: func(t *testing.T, entry *logstore.Log) {
+				if entry.VideoListOutputParsed == nil {
+					t.Error("expected VideoListOutputParsed to be set")
+				}
+			},
+		},
+		{
+			name: "delete",
+			result: &schemas.BifrostResponse{
+				VideoDeleteResponse: &schemas.BifrostVideoDeleteResponse{
+					ID:          "vid_123:openai",
+					Deleted:     true,
+					ExtraFields: schemas.BifrostResponseExtraFields{RequestType: schemas.VideoDeleteRequest},
+				},
+			},
+			verify: func(t *testing.T, entry *logstore.Log) {
+				if entry.VideoDeleteOutputParsed == nil {
+					t.Error("expected VideoDeleteOutputParsed to be set")
+				}
+			},
+		},
+	}
+
+	plugin := &LoggerPlugin{}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := &logstore.Log{}
+			plugin.applyNonStreamingOutputToEntry(entry, tt.result, false, true)
+			tt.verify(t, entry)
+		})
+	}
+
+	t.Run("content logging disabled", func(t *testing.T) {
+		entry := &logstore.Log{}
+		plugin.applyNonStreamingOutputToEntry(entry, videoResponse(schemas.VideoGenerationRequest), false, false)
+		if entry.VideoGenerationOutputParsed != nil {
+			t.Error("expected VideoGenerationOutputParsed to be nil when contentLoggingEnabled=false")
+		}
+	})
+}
+
+// TestGuardrailMetadataForLogReadsContextWithoutResponse verifies input blocks remain observable.
+func TestGuardrailMetadataForLogReadsContextWithoutResponse(t *testing.T) {
+	ctx := schemas.NewBifrostContext(nil, schemas.NoDeadline)
+	requireCall := schemas.BifrostGuardrailJudgeCall{
+		JudgeProvider: schemas.OpenAI,
+		JudgeModel:    "gpt-test",
+		TotalTokens:   18,
+	}
+	if !schemas.AppendGuardrailJudgeCallOnContext(ctx, requireCall) {
+		t.Fatal("failed to append guardrail judge call")
+	}
+
+	metadata := guardrailMetadataForLog(ctx, nil)
+	if metadata == nil || len(metadata.JudgeCalls) != 1 {
+		t.Fatalf("guardrail metadata = %#v; want one context judge call", metadata)
+	}
+	if metadata.JudgeCalls[0] != requireCall {
+		t.Fatalf("guardrail call = %#v; want %#v", metadata.JudgeCalls[0], requireCall)
+	}
+}
+
+// Batch claims are fenced on the runner id, so it must differ between workers
+// that could contend for the same job. In OSS SetClusterNodeID is never called,
+// so the per-process fallback is what keeps replicas sharing a database apart.
+func TestBatchRunnerID(t *testing.T) {
+	plugin := &LoggerPlugin{}
+
+	t.Run("falls back to a per-process id when no cluster node is set", func(t *testing.T) {
+		id := plugin.batchRunnerID("logging")
+		if id == "logging" || id == "logging:" {
+			t.Fatalf("runner id must not collapse to a shared constant, got %q", id)
+		}
+		if !strings.HasPrefix(id, "logging:") {
+			t.Fatalf("expected a logging: prefix, got %q", id)
+		}
+		// Distinct roles in the same process must not collide either.
+		if other := plugin.batchRunnerID("batch-sweeper"); other == id {
+			t.Fatalf("distinct prefixes produced the same runner id: %q", id)
+		}
+	})
+
+	t.Run("prefers the cluster node id when present", func(t *testing.T) {
+		clustered := &LoggerPlugin{}
+		clustered.clusterNodeID.Store("node-7")
+		if got := clustered.batchRunnerID("logging"); got != "logging:node-7" {
+			t.Fatalf("expected logging:node-7, got %q", got)
+		}
+	})
+}
+
+func TestRecordBatchJobLifecycle_CompletedSetsNextCheckAt(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:        context.Background(),
+		store:      store,
+		batchStore: bs,
+		logger:     testLogger{},
+	}
+
+	tests := []struct {
+		name       string
+		status     string
+		wantNow    bool
+		wantMinute bool
+		wantNil    bool
+	}{
+		{name: "in_progress", status: string(schemas.BatchStatusInProgress), wantMinute: true},
+		{name: "validating", status: string(schemas.BatchStatusValidating), wantMinute: true},
+		{name: "finalizing", status: string(schemas.BatchStatusFinalizing), wantMinute: true},
+		{name: "completed", status: string(schemas.BatchStatusCompleted), wantNow: true},
+		// Anthropic reports "ended"; it takes the same immediate-accounting branch.
+		{name: "ended", status: string(schemas.BatchStatusEnded), wantNow: true},
+		{name: "failed", status: string(schemas.BatchStatusFailed), wantNil: true},
+		{name: "cancelled", status: string(schemas.BatchStatusCancelled), wantNil: true},
+		{name: "expired", status: string(schemas.BatchStatusExpired), wantNil: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			batchID := "batch-" + tt.name
+			entry := &logstore.Log{
+				Provider: string(schemas.OpenAI),
+				Model:    "gpt-4o-mini",
+			}
+			retrieveResp := &schemas.BifrostBatchRetrieveResponse{
+				ID:       batchID,
+				Endpoint: string(schemas.BatchEndpointChatCompletions),
+				Status:   schemas.BatchStatus(tt.status),
+			}
+			result := &schemas.BifrostResponse{
+				BatchRetrieveResponse: retrieveResp,
+			}
+			plugin.recordBatchJobLifecycle(entry, result)
+
+			job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindBatch, "openai", batchID))
+			if err != nil {
+				t.Fatalf("GetProviderJob() error = %v", err)
+			}
+			if job.JobID != batchID {
+				t.Fatalf("expected batch_id %s, got %s", batchID, job.JobID)
+			}
+			if job.ProviderStatus != tt.status {
+				t.Fatalf("expected status %s, got %s", tt.status, job.ProviderStatus)
+			}
+
+			switch {
+			case tt.wantNow:
+				if job.NextCheckAt == nil {
+					t.Fatal("expected NextCheckAt to be set")
+				}
+				if job.NextCheckAt.After(time.Now().UTC().Add(2 * time.Second)) {
+					t.Fatalf("expected NextCheckAt to be now, got %v", job.NextCheckAt)
+				}
+			case tt.wantMinute:
+				if job.NextCheckAt == nil {
+					t.Fatal("expected NextCheckAt to be set")
+				}
+				if job.NextCheckAt.Before(time.Now().UTC().Add(50*time.Second)) ||
+					job.NextCheckAt.After(time.Now().UTC().Add(70*time.Second)) {
+					t.Fatalf("expected NextCheckAt ~1min from now, got %v (now=%v)", job.NextCheckAt, time.Now().UTC())
+				}
+			case tt.wantNil:
+				if job.NextCheckAt != nil {
+					t.Fatalf("expected NextCheckAt to be nil, got %v", *job.NextCheckAt)
+				}
+			}
+		})
+	}
+}
+
+func TestRecordBatchJobLifecycle_CreatePersistsModel(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:        context.Background(),
+		store:      store,
+		batchStore: bs,
+		logger:     testLogger{},
+	}
+
+	entry := &logstore.Log{
+		ID:       "req-create-batch",
+		Provider: string(schemas.OpenAI),
+		Model:    "gpt-4o",
+	}
+	createResp := &schemas.BifrostBatchCreateResponse{
+		ID:          "batch-create-123",
+		Status:      schemas.BatchStatusValidating,
+		InputFileID: "file-abc",
+	}
+	result := &schemas.BifrostResponse{
+		BatchCreateResponse: createResp,
+	}
+	plugin.recordBatchJobLifecycle(entry, result)
+
+	job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindBatch, "openai", "batch-create-123"))
+	if err != nil {
+		t.Fatalf("GetProviderJob() error = %v", err)
+	}
+	if job.Model != "gpt-4o" {
+		t.Fatalf("expected model %s, got %s", "gpt-4o", job.Model)
+	}
+	if job.InputFileID != "file-abc" {
+		t.Fatalf("expected input_file_id %s, got %s", "file-abc", job.InputFileID)
+	}
+	if job.AccountingStatus != cstables.ProviderJobAccountingStatusPending {
+		t.Fatalf("expected accounting_status %s, got %s", cstables.ProviderJobAccountingStatusPending, job.AccountingStatus)
+	}
+}
+
+func TestAccountBatchResults_NonResultsResponseIsNoop(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:        context.Background(),
+		store:      store,
+		batchStore: bs,
+		logger:     testLogger{},
+		// Pricing must be set or accountBatchResults returns on the nil-pricing
+		// guard and this test passes without ever reaching the check it covers.
+		pricingManager: newTestPricingManager(t),
+	}
+
+	entry := &logstore.Log{
+		ID:       "req-no-results",
+		Provider: string(schemas.OpenAI),
+		Model:    "gpt-4o-mini",
+	}
+	nonResultsResult := &schemas.BifrostResponse{
+		ListModelsResponse: &schemas.BifrostListModelsResponse{},
+	}
+	// accountBatchResults with no BatchResultsResponse should be a no-op
+	plugin.accountBatchResults(entry, nonResultsResult, nil)
+
+	// Verify no batch_jobs rows were created
+	jobs, err := bs.ListDueProviderJobs(context.Background(), cstables.ProviderJobKindBatch, "openai", time.Now().UTC().Add(time.Hour), 100)
+	if err != nil {
+		t.Fatalf("ListDueProviderJobs() error = %v", err)
+	}
+	if len(jobs) > 0 {
+		t.Fatalf("expected no batch jobs from non-batch-response, got %d", len(jobs))
+	}
+}
+
+func TestAccountBatchResults_EmptyResultsMarksUnpriceable(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:            context.Background(),
+		store:          store,
+		batchStore:     bs,
+		logger:         testLogger{},
+		pricingManager: newTestPricingManager(t),
+	}
+
+	entry := &logstore.Log{
+		ID:       "req-empty-batch-results",
+		Provider: string(schemas.OpenAI),
+		Model:    "gpt-4o-mini",
+	}
+	result := &schemas.BifrostResponse{
+		BatchResultsResponse: &schemas.BifrostBatchResultsResponse{
+			BatchID: "batch-empty-results",
+			Results: nil,
+		},
+	}
+
+	plugin.accountBatchResults(entry, result, nil)
+
+	job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindBatch, "openai", "batch-empty-results"))
+	if err != nil {
+		t.Fatalf("GetProviderJob() error = %v", err)
+	}
+	if job.AccountingStatus != cstables.ProviderJobAccountingStatusUnpriceable {
+		t.Fatalf("expected accounting_status %s, got %s", cstables.ProviderJobAccountingStatusUnpriceable, job.AccountingStatus)
+	}
+	if job.UnpriceableReason == nil || *job.UnpriceableReason != jobaccounting.UnpriceableReasonNoResults {
+		t.Fatalf("expected unpriceable_reason %s, got %#v", jobaccounting.UnpriceableReasonNoResults, job.UnpriceableReason)
+	}
+}
+
+func TestAccountBatchResults_RepeatedFetchDisplaysPriceWithoutBilling(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, bs, newTestPricingManager(t), nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+
+	newResult := func() *schemas.BifrostResponse {
+		return &schemas.BifrostResponse{
+			BatchResultsResponse: &schemas.BifrostBatchResultsResponse{
+				BatchID: "batch-repeat-fetch",
+				Results: []schemas.BatchResultItem{{
+					CustomID: "custom-1",
+					Response: &schemas.BatchResultResponse{
+						StatusCode: 200,
+						Body: map[string]interface{}{
+							"model": "gpt-4o",
+							"usage": map[string]interface{}{
+								"prompt_tokens":     100,
+								"completion_tokens": 50,
+								"total_tokens":      150,
+							},
+						},
+					},
+				}},
+			},
+		}
+	}
+
+	first := &logstore.Log{ID: "req-fetch-1", Provider: string(schemas.OpenAI), Model: "gpt-4o"}
+	plugin.accountBatchResults(first, newResult(), nil)
+
+	if first.BatchDebugParsed == nil || first.BatchDebugParsed.Accounting == nil || first.BatchDebugParsed.Accounting.Cost == nil {
+		t.Fatalf("expected first call's own row to show the settled price, got %#v", first.BatchDebugParsed)
+	}
+	wantCost := *first.BatchDebugParsed.Accounting.Cost
+	if wantCost <= 0 {
+		t.Fatalf("expected a positive settled cost, got %v", wantCost)
+	}
+	if first.Cost != nil {
+		t.Fatalf("entry.Cost must stay nil on a batch_results row, got %v", *first.Cost)
+	}
+	if first.BatchDebugParsed.Status != string(schemas.BatchStatusCompleted) {
+		t.Fatalf("expected status %q, got %q", schemas.BatchStatusCompleted, first.BatchDebugParsed.Status)
+	}
+
+	second := &logstore.Log{ID: "req-fetch-2", Provider: string(schemas.OpenAI), Model: "gpt-4o"}
+	plugin.accountBatchResults(second, newResult(), nil)
+
+	if second.BatchDebugParsed == nil || second.BatchDebugParsed.Accounting == nil || second.BatchDebugParsed.Accounting.Cost == nil {
+		t.Fatalf("expected the repeat fetch's own row to also show the settled price, got %#v", second.BatchDebugParsed)
+	}
+	if diff := *second.BatchDebugParsed.Accounting.Cost - wantCost; diff < -1e-12 || diff > 1e-12 {
+		t.Fatalf("repeat fetch price %v does not match originally settled price %v", *second.BatchDebugParsed.Accounting.Cost, wantCost)
+	}
+	if second.BatchDebugParsed.Accounting.Incomplete {
+		t.Fatal("repeat fetch must not show incomplete once the batch fully priced")
+	}
+	if second.Cost != nil {
+		t.Fatalf("entry.Cost must stay nil on the repeat fetch's row too, got %v", *second.Cost)
+	}
+	if second.BatchDebugParsed.Status != string(schemas.BatchStatusCompleted) {
+		t.Fatalf("expected mirrored status %q, got %q", schemas.BatchStatusCompleted, second.BatchDebugParsed.Status)
+	}
+
+	logs, err := store.SearchLogs(context.Background(), logstore.SearchFilters{}, logstore.PaginationOptions{Limit: 10})
+	if err != nil {
+		t.Fatalf("SearchLogs() error = %v", err)
+	}
+	aggregateRows := 0
+	for _, l := range logs.Logs {
+		if l.ID == jobaccounting.AccountingLogID(jobaccounting.ProviderJobKindBatch, schemas.OpenAI, "batch-repeat-fetch") {
+			aggregateRows++
+		}
+	}
+	if aggregateRows != 1 {
+		t.Fatalf("expected exactly 1 aggregate cost row, got %d", aggregateRows)
+	}
+}
+
+// noopBatchFetcher satisfies jobaccounting.BatchResultFetcher without touching a
+// provider: the point of the test below is that it is never reached.
+type noopBatchFetcher struct{}
+
+func (noopBatchFetcher) RetrieveBatch(context.Context, *cstables.TableProviderJob) (*schemas.BifrostBatchRetrieveResponse, error) {
+	return nil, nil
+}
+
+func (noopBatchFetcher) FetchBatchResults(context.Context, *cstables.TableProviderJob) (*schemas.BifrostBatchResultsResponse, error) {
+	return nil, nil
+}
+
+// A plugin reload can call the wiring against an instance that is already shutting
+// down. Cleanup sets the shutdown flag and cancels the sweeper under p.mu before it
+// reaches p.wg.Wait(), so a start arriving afterwards must decline rather than run
+// wg.Add concurrently with that Wait — which is a WaitGroup contract violation and
+// would leave a sweeper writing through a closed plugin.
+func TestStartBatchAccountingSweeperAfterCleanupIsRefused(t *testing.T) {
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, newTestStore(t), newFakeBatchStore(), newTestPricingManager(t), nil)
+	if err != nil {
+		t.Fatalf("Init() error = %v", err)
+	}
+	if err := plugin.Cleanup(); err != nil {
+		t.Fatalf("Cleanup() error = %v", err)
+	}
+
+	cancel := plugin.StartBatchAccountingSweeper(noopBatchFetcher{}, time.Minute, nil)
+	if cancel == nil {
+		t.Fatal("StartBatchAccountingSweeper must always return a cancel func")
+	}
+	cancel() // must be safe to call on the refused path
+
+	plugin.mu.Lock()
+	registered := plugin.batchSweeperCancel
+	plugin.mu.Unlock()
+	if registered != nil {
+		t.Fatal("no sweeper should be registered after Cleanup")
+	}
+}
+
+// The batch job row is the only durable record of who to bill: settlement can run
+// hours later from a sweeper with no request context. A virtual key alone is not
+// enough — an access profile shares one across users — so the user, team, customer
+// and the creating log row must all be captured at create time.
+func TestRecordBatchJobLifecycle_CreatePersistsRequesterIdentity(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:        context.Background(),
+		store:      store,
+		batchStore: bs,
+		logger:     testLogger{},
+	}
+
+	vkID := "vk-access-profile"
+	userID := "user-alice"
+	teamID := "team-1"
+	customerID := "customer-1"
+	entry := &logstore.Log{
+		ID:                 "req-create-batch-identity",
+		Provider:           string(schemas.OpenAI),
+		Model:              "gpt-4o",
+		SelectedKeyID:      "key-1",
+		VirtualKeyID:       &vkID,
+		UserID:             &userID,
+		TeamID:             &teamID,
+		CustomerID:         &customerID,
+		BudgetIDsParsed:    []string{"budget-1"},
+		RateLimitIDsParsed: []string{"rl-1"},
+	}
+	plugin.recordBatchJobLifecycle(entry, &schemas.BifrostResponse{
+		BatchCreateResponse: &schemas.BifrostBatchCreateResponse{
+			ID:     "batch-identity-123",
+			Status: schemas.BatchStatusValidating,
+		},
+	})
+
+	job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindBatch, "openai", "batch-identity-123"))
+	if err != nil {
+		t.Fatalf("GetProviderJob() error = %v", err)
+	}
+	if job.UserID == nil || *job.UserID != userID {
+		t.Fatalf("expected user_id %s, got %v", userID, job.UserID)
+	}
+	if job.TeamID == nil || *job.TeamID != teamID {
+		t.Fatalf("expected team_id %s, got %v", teamID, job.TeamID)
+	}
+	if job.CustomerID == nil || *job.CustomerID != customerID {
+		t.Fatalf("expected customer_id %s, got %v", customerID, job.CustomerID)
+	}
+	if job.SourceLogID == nil || *job.SourceLogID != entry.ID {
+		t.Fatalf("expected source_log_id %s, got %v", entry.ID, job.SourceLogID)
+	}
+}
+
+// newVideoLifecyclePlugin is the minimal plugin a video lifecycle record needs.
+func newVideoLifecyclePlugin(t *testing.T) (*LoggerPlugin, *fakeBatchStore) {
+	t.Helper()
+	bs := newFakeBatchStore()
+	return &LoggerPlugin{
+		ctx:        context.Background(),
+		store:      newTestStore(t),
+		batchStore: bs,
+		logger:     testLogger{},
+	}, bs
+}
+
+// The request is the only witness to duration and resolution for most providers,
+// and it is in hand exactly once — here. If it is not written down now, settlement
+// minutes later has nothing to price from.
+func TestRecordVideoJobLifecycle_CapturesRequestPricingDimensions(t *testing.T) {
+	plugin, bs := newVideoLifecyclePlugin(t)
+
+	audio := true
+	eightSeconds := "8"
+	entry := &logstore.Log{
+		ID:            "req-video-1",
+		Provider:      string(schemas.OpenAI),
+		Model:         "sora-2-pro",
+		SelectedKeyID: "key-abc",
+		ParamsParsed: &schemas.VideoGenerationParameters{
+			Seconds: &eightSeconds,
+			Size:    "1920x1080",
+			Audio:   &audio,
+		},
+	}
+	result := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{
+			ID:     "vid_abc",
+			Status: schemas.VideoStatusQueued,
+		},
+	}
+	plugin.recordVideoJobLifecycle(entry, result, schemas.VideoGenerationRequest)
+
+	job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindVideo, "openai", "vid_abc"))
+	if err != nil {
+		t.Fatalf("expected a video job row: %v", err)
+	}
+	if job.Kind != cstables.ProviderJobKindVideo {
+		t.Fatalf("kind = %q, want %q", job.Kind, cstables.ProviderJobKindVideo)
+	}
+	if job.Model != "sora-2-pro" {
+		t.Fatalf("model = %q, want sora-2-pro", job.Model)
+	}
+	if job.NextCheckAt == nil {
+		t.Fatal("a queued video must be scheduled for a poll")
+	}
+	// The sweeper pins its poll to this key. An OpenAI video id is visible only to
+	// the key that created it, so a row without one can only be polled by whatever
+	// key core happens to pick — which will be told the video does not exist.
+	if job.SelectedKeyID != "key-abc" {
+		t.Fatalf("selected key id = %q, want key-abc", job.SelectedKeyID)
+	}
+
+	dims := jobaccounting.VideoDimensionsFromJob(job)
+	if dims.Seconds == nil || *dims.Seconds != 8 {
+		t.Fatalf("seconds = %v, want 8", dims.Seconds)
+	}
+	if dims.Size != "1920x1080" {
+		t.Fatalf("size = %q, want 1920x1080", dims.Size)
+	}
+	if dims.Audio == nil || !*dims.Audio {
+		t.Fatalf("audio = %v, want true", dims.Audio)
+	}
+	if dims.RequestType != schemas.VideoGenerationRequest {
+		t.Fatalf("request type = %q, want %q", dims.RequestType, schemas.VideoGenerationRequest)
+	}
+}
+
+// A video submitted before this build was already charged at submission. Creating
+// its row on a later retrieve would hand it to the sweeper and charge it twice.
+func TestRecordVideoJobLifecycle_RetrieveDoesNotCreateRowForPreUpgradeJob(t *testing.T) {
+	plugin, bs := newVideoLifecyclePlugin(t)
+
+	entry := &logstore.Log{ID: "req-video-retrieve", Provider: string(schemas.OpenAI), Model: "sora-2-pro"}
+	result := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{
+			ID:     "vid_pre_upgrade",
+			Status: schemas.VideoStatusCompleted,
+		},
+	}
+	plugin.recordVideoJobLifecycle(entry, result, schemas.VideoRetrieveRequest)
+
+	if _, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindVideo, "openai", "vid_pre_upgrade")); err == nil {
+		t.Fatal("a retrieve must never create a job row we did not see submitted")
+	}
+}
+
+// A retrieve on a job we did submit must still advance it, without losing the
+// dimensions the submission captured.
+func TestRecordVideoJobLifecycle_RetrieveAdvancesKnownJob(t *testing.T) {
+	plugin, bs := newVideoLifecyclePlugin(t)
+
+	eightSeconds := "8"
+	entry := &logstore.Log{
+		ID:           "req-video-2",
+		Provider:     string(schemas.OpenAI),
+		Model:        "sora-2-pro",
+		ParamsParsed: &schemas.VideoGenerationParameters{Seconds: &eightSeconds, Size: "1280x720"},
+	}
+	submitted := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{ID: "vid_known", Status: schemas.VideoStatusQueued},
+	}
+	plugin.recordVideoJobLifecycle(entry, submitted, schemas.VideoGenerationRequest)
+
+	retrieved := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{ID: "vid_known", Status: schemas.VideoStatusCompleted},
+	}
+	plugin.recordVideoJobLifecycle(entry, retrieved, schemas.VideoRetrieveRequest)
+
+	job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindVideo, "openai", "vid_known"))
+	if err != nil {
+		t.Fatalf("expected the submitted job row: %v", err)
+	}
+	if job.ProviderStatus != string(schemas.VideoStatusCompleted) {
+		t.Fatalf("provider status = %q, want completed", job.ProviderStatus)
+	}
+
+	dims := jobaccounting.VideoDimensionsFromJob(job)
+	if dims.Seconds == nil || *dims.Seconds != 8 {
+		t.Fatalf("the submission's dimensions must survive a retrieve that reports none: %v", dims.Seconds)
+	}
+	if dims.Size != "1280x720" {
+		t.Fatalf("size = %q, want 1280x720", dims.Size)
+	}
+}
+
+// The retrieve path settles inline off the response the caller already fetched,
+// instead of leaving the sweeper to fetch it a second time up to a sweep interval
+// later. The submission is recorded first, then the terminal poll settles it.
+func TestAccountVideoResults_SettlesTheJobTheSubmissionRecorded(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:            context.Background(),
+		store:          store,
+		batchStore:     bs,
+		logger:         testLogger{},
+		pricingManager: newTestPricingManager(t),
+	}
+
+	eightSeconds := "8"
+	entry := &logstore.Log{
+		ID:           "req-video-inline",
+		Provider:     string(schemas.OpenAI),
+		Model:        "sora-2-pro",
+		ParamsParsed: &schemas.VideoGenerationParameters{Seconds: &eightSeconds, Size: "1280x720"},
+	}
+	submitted := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{ID: "vid_inline_wired", Status: schemas.VideoStatusQueued},
+	}
+	plugin.recordVideoJobLifecycle(entry, submitted, schemas.VideoGenerationRequest)
+
+	terminal := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{
+			ID:     "vid_inline_wired",
+			Status: schemas.VideoStatusCompleted,
+			Videos: []schemas.VideoOutput{{Type: schemas.VideoOutputTypeURL}},
+			Usage:  &schemas.VideoUsage{Cost: &schemas.BifrostCost{TotalCost: 0.75}},
+		},
+	}
+	plugin.recordVideoJobLifecycle(entry, terminal, schemas.VideoRetrieveRequest)
+	plugin.accountVideoResults(entry, terminal, nil)
+
+	job, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindVideo, "openai", "vid_inline_wired"))
+	if err != nil {
+		t.Fatalf("GetProviderJob() error = %v", err)
+	}
+	if job.AccountingStatus != cstables.ProviderJobAccountingStatusAccounted {
+		t.Fatalf("accounting_status = %s, want %s", job.AccountingStatus, cstables.ProviderJobAccountingStatusAccounted)
+	}
+}
+
+// A video submitted before this build was charged at submission; settling it now
+// would bill it twice. With no coordination row, the inline path must do nothing.
+func TestAccountVideoResults_SkipsAJobWithNoCoordinationRow(t *testing.T) {
+	store := newTestStore(t)
+	bs := newFakeBatchStore()
+	plugin := &LoggerPlugin{
+		ctx:            context.Background(),
+		store:          store,
+		batchStore:     bs,
+		logger:         testLogger{},
+		pricingManager: newTestPricingManager(t),
+	}
+
+	entry := &logstore.Log{ID: "req-video-orphan", Provider: string(schemas.OpenAI), Model: "sora-2-pro"}
+	terminal := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{
+			ID:     "vid_orphan",
+			Status: schemas.VideoStatusCompleted,
+			Videos: []schemas.VideoOutput{{Type: schemas.VideoOutputTypeURL}},
+			Usage:  &schemas.VideoUsage{Cost: &schemas.BifrostCost{TotalCost: 0.75}},
+		},
+	}
+	plugin.accountVideoResults(entry, terminal, nil)
+
+	if _, err := bs.GetProviderJob(context.Background(), cstables.ProviderJobID(cstables.ProviderJobKindVideo, "openai", "vid_orphan")); err == nil {
+		t.Fatal("inline settlement must not create a job row for a video we never saw submitted")
+	}
+}
+
+// The submission row must name the video it started, so the settlement that lands
+// minutes later is traceable back to it. No accounting block here — that is what
+// distinguishes the settlement's own cost row from this one.
+func TestRecordVideoJobLifecycle_MarksTheRequestRowWithTheVideo(t *testing.T) {
+	plugin, _ := newVideoLifecyclePlugin(t)
+
+	eightSeconds := "8"
+	entry := &logstore.Log{
+		ID:           "req-video-debug",
+		Provider:     string(schemas.OpenAI),
+		Model:        "sora-2-pro",
+		ParamsParsed: &schemas.VideoGenerationParameters{Seconds: &eightSeconds, Size: "1280x720"},
+	}
+	result := &schemas.BifrostResponse{
+		VideoGenerationResponse: &schemas.BifrostVideoGenerationResponse{
+			ID:     "vid_marked",
+			Status: schemas.VideoStatusQueued,
+		},
+	}
+	plugin.recordVideoJobLifecycle(entry, result, schemas.VideoGenerationRequest)
+
+	if entry.VideoDebugParsed == nil {
+		t.Fatal("the submission row must name the video it started")
+	}
+	if entry.VideoDebugParsed.VideoID != "vid_marked" {
+		t.Fatalf("video id = %q, want vid_marked", entry.VideoDebugParsed.VideoID)
+	}
+	if entry.VideoDebugParsed.Status != schemas.VideoStatusQueued {
+		t.Fatalf("status = %q, want queued", entry.VideoDebugParsed.Status)
+	}
+	if entry.VideoDebugParsed.Accounting != nil {
+		t.Fatal("only the settlement's aggregate cost row carries an accounting block")
+	}
+}
+
+// newEndedTraceContext builds a context whose tracer already completed the trace,
+// the state a late terminal hook observes after the transport flushed the request.
+// The root span is started first because a live trace gets its root span from the
+// transport before dispatch; ending the trace removes it from the tracer's store.
+func newTracedContext(t *testing.T) (*schemas.BifrostContext, *tracing.Tracer, string) {
+	t.Helper()
+	logger := testLogger{}
+	tracer := tracing.NewTracer(tracing.NewTraceStore(time.Minute, logger), nil, logger)
+	traceID := tracer.CreateTrace("")
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTracer, tracer)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	_, root := tracer.StartSpan(ctx, "http.request", schemas.SpanKindInternal)
+	if root == nil {
+		t.Fatal("root span was not started")
+	}
+	tracer.EndSpan(root, schemas.SpanStatusOk, "")
+	return ctx, tracer, traceID
+}
+
+// TestStoreOrEnqueueAfterInjectStillWrites pins the second drop behind maximhq/bifrost#6972.
+// When a client disconnects on a non-streaming request, the transport completes and
+// flushes the trace (EndTrace, then Inject) as soon as it has written the 499, while
+// the worker is still tearing down the upstream call. The worker's abandoned-billing
+// terminal hook then reaches storeOrEnqueueEntry AFTER the trace ended. Parking the
+// entry under the trace id would leave it for nothing but the TTL sweeper, so the
+// request is billed by governance but never gets a log row. The check is against the
+// tracer, not a timer, so it holds however late the hook lands.
+func TestStoreOrEnqueueAfterInjectStillWrites(t *testing.T) {
+	plugin := &LoggerPlugin{
+		logger:     testLogger{},
+		writeQueue: make(chan *writeQueueEntry, 10),
+	}
+	ctx, tracer, traceID := newTracedContext(t)
+
+	// The transport flushed the trace with nothing parked yet.
+	completed := tracer.EndTrace(traceID)
+	if completed == nil {
+		t.Fatal("EndTrace returned nil")
+	}
+	if err := plugin.Inject(context.Background(), completed); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+
+	// The worker's late terminal hook lands afterwards.
+	plugin.storeOrEnqueueEntry(ctx, &logstore.Log{ID: "req-abandoned", Model: "gpt-4o-mini"}, nil)
+
+	if got := len(plugin.writeQueue); got != 1 {
+		t.Fatalf("expected the late entry to be enqueued for writing, writeQueue has %d entries", got)
+	}
+	if _, parked := plugin.pendingLogsToInject.Load(traceID); parked {
+		t.Fatal("late entry was parked under an already-ended trace; nothing will ever drain it")
+	}
+}
+
+// TestStoreOrEnqueueBeforeInjectStillParks guards the fix above against over-correcting:
+// an entry stored while the trace is live must still be parked so Inject can attach
+// plugin logs and the trace's authoritative latency before it is written.
+func TestStoreOrEnqueueBeforeInjectStillParks(t *testing.T) {
+	plugin := &LoggerPlugin{
+		logger:     testLogger{},
+		writeQueue: make(chan *writeQueueEntry, 10),
+	}
+	ctx, tracer, traceID := newTracedContext(t)
+
+	plugin.storeOrEnqueueEntry(ctx, &logstore.Log{ID: "req-normal", Model: "gpt-4o-mini"}, nil)
+	if got := len(plugin.writeQueue); got != 0 {
+		t.Fatalf("entry stored while the trace is live must be parked, but writeQueue has %d entries", got)
+	}
+	completed := tracer.EndTrace(traceID)
+	if completed == nil {
+		t.Fatal("EndTrace returned nil")
+	}
+	if err := plugin.Inject(context.Background(), completed); err != nil {
+		t.Fatalf("Inject() error = %v", err)
+	}
+	if got := len(plugin.writeQueue); got != 1 {
+		t.Fatalf("Inject must drain the parked entry, writeQueue has %d entries", got)
+	}
+}
+
+// The settlement span carries the parsed breakdown when the row has one, not just
+// the flat total. Only the entry.Cost fallback was covered, so this branch could
+// lose the per-category split while the shared CostAttributes tests stayed green.
+func TestEmitAggregateLogEmitsSettlementCostBreakdown(t *testing.T) {
+	logger := testLogger{}
+	tracer := tracing.NewTracer(tracing.NewTraceStore(time.Minute, logger), nil, logger)
+	capture := &captureObsPlugin{spans: make(chan map[string]any, 1)}
+	tracer.SetObservabilityPlugins([]schemas.ObservabilityPlugin{capture}, nil)
+
+	plugin := &LoggerPlugin{ctx: context.Background()}
+	plugin.SetSettlementTracer(tracer)
+
+	// Deliberately different from TotalCost so a fallback to entry.Cost is visible.
+	flat := 9.99
+	entry := &logstore.Log{
+		ID:        "batch-cost:openai:settlement-breakdown",
+		Timestamp: time.Now().UTC(),
+		Object:    string(schemas.BatchResultsRequest),
+		Provider:  string(schemas.OpenAI),
+		Model:     "gpt-4o-mini",
+		Status:    "success",
+		Cost:      &flat,
+		TokenUsageParsed: &schemas.BifrostLLMUsage{
+			PromptTokens: 100, CompletionTokens: 50, TotalTokens: 150,
+			Cost: &schemas.BifrostCost{
+				InputCost: 0.30, OutputCost: 0.50, AdditionalCost: 0.20, TotalCost: 1.00,
+			},
+		},
+		PromptTokens:     100,
+		CompletionTokens: 50,
+		TotalTokens:      150,
+	}
+	plugin.EmitAggregateLog(context.Background(), entry)
+
+	select {
+	case attrs := <-capture.spans:
+		for key, want := range map[string]float64{
+			schemas.AttrUsageCost:             1.00,
+			schemas.AttrBifrostCostInput:      0.30,
+			schemas.AttrBifrostCostOutput:     0.50,
+			schemas.AttrBifrostCostAdditional: 0.20,
+		} {
+			got, ok := attrs[key].(float64)
+			if !ok {
+				t.Errorf("%s missing from the settlement span", key)
+				continue
+			}
+			if got != want {
+				t.Errorf("%s = %v, want %v", key, got, want)
+			}
+		}
+		// The breakdown must win; falling back to entry.Cost would show 9.99.
+		if got, _ := attrs[schemas.AttrUsageCost].(float64); got == flat {
+			t.Errorf("%s = %v: fell back to entry.Cost instead of the parsed breakdown", schemas.AttrUsageCost, got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no settlement span injected to the observability connector")
+	}
+}
+
+func TestObserveA2AEventEnqueuesCorrelatedBoundedEventRow(t *testing.T) {
+	plugin := &LoggerPlugin{writeQueue: make(chan *writeQueueEntry, 1), logger: testLogger{}}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "operation-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyName, "Validation key")
+	ctx.SetValue(schemas.BifrostContextKeyUserID, "user-1")
+	ctx.SetValue(schemas.BifrostContextKeyUserName, "Validation user")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceTeamIDs, []string{"team-1", "team-2"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceTeamNames, []string{"Team One", "Team Two"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceCustomerIDs, []string{"customer-1"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceCustomerNames, []string{"Customer One"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBusinessUnitIDs, []string{"bu-1"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBusinessUnitNames, []string{"Business Unit One"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceProjectID, "project-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceProjectName, "Project One")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBudgetIDs, []string{"budget-1"})
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceRateLimitIDs, []string{"rate-limit-1"})
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, "trace-1")
+	ctx.SetValue(schemas.BifrostContextKeyA2ADownstreamTransport, "JSONRPC")
+	ctx.SetValue(schemas.BifrostContextKeyA2AUpstreamTransport, "GRPC")
+	body := `{"kind":"status-update","taskId":"task-1"}`
+
+	plugin.ObserveA2AEvent(ctx, &schemas.BifrostA2AEvent{
+		RequestType: schemas.A2ARequestTypeSubscribeToTask,
+		AgentName:   "fixture",
+		EventType:   schemas.A2AEventTypeStatusUpdate,
+		Sequence:    2,
+		TaskID:      "task-1",
+		ContextID:   "context-1",
+		MessageID:   "message-1",
+		ArtifactID:  "artifact-1",
+		TaskState:   "working",
+		ContentType: "text/plain",
+		Body:        &body,
+	})
+
+	queued := <-plugin.writeQueue
+	require.NotNil(t, queued.agentLog)
+	entry := queued.agentLog
+	require.Equal(t, "event", entry.RecordKind)
+	require.Equal(t, "SubscribeToTask", entry.Operation)
+	require.Equal(t, "operation-1", entry.RequestID)
+	require.Equal(t, int64(2), *entry.EventSequence)
+	require.Equal(t, "status_update", *entry.EventType)
+	require.Equal(t, "fixture", entry.AgentName)
+	require.Equal(t, "vk-1", *entry.VirtualKeyID)
+	require.Equal(t, "Validation key", *entry.VirtualKeyName)
+	require.Equal(t, "user-1", *entry.UserID)
+	require.Equal(t, "Validation user", *entry.UserName)
+	require.Equal(t, []string{"team-1", "team-2"}, entry.TeamIDsParsed)
+	require.Equal(t, []string{"Team One", "Team Two"}, entry.TeamNamesParsed)
+	require.Equal(t, []string{"customer-1"}, entry.CustomerIDsParsed)
+	require.Equal(t, []string{"Customer One"}, entry.CustomerNamesParsed)
+	require.Equal(t, []string{"bu-1"}, entry.BusinessUnitIDsParsed)
+	require.Equal(t, []string{"Business Unit One"}, entry.BusinessUnitNamesParsed)
+	require.Equal(t, "project-1", *entry.ProjectID)
+	require.Equal(t, "Project One", *entry.ProjectName)
+	require.Equal(t, []string{"budget-1"}, entry.BudgetIDsParsed)
+	require.Equal(t, []string{"rate-limit-1"}, entry.RateLimitIDsParsed)
+	require.Equal(t, "trace-1", *entry.TraceID)
+	require.Equal(t, "JSONRPC", *entry.DownstreamTransport)
+	require.Equal(t, "GRPC", *entry.UpstreamTransport)
+	require.Equal(t, "task-1", *entry.TaskID)
+	require.Equal(t, "context-1", *entry.ContextID)
+	require.Equal(t, "message-1", *entry.MessageID)
+	require.Equal(t, "artifact-1", *entry.ArtifactID)
+	require.Equal(t, "working", *entry.TaskState)
+	require.Equal(t, "text/plain", *entry.ContentType)
+	require.Equal(t, body, *entry.EventBody)
+}
+
+func TestObserveA2AEventQueueFailureDoesNotPanic(t *testing.T) {
+	plugin := &LoggerPlugin{writeQueue: make(chan *writeQueueEntry), logger: testLogger{}}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "operation-1")
+	require.NotPanics(t, func() {
+		plugin.ObserveA2AEvent(ctx, &schemas.BifrostA2AEvent{Sequence: 1})
+	})
+	require.Equal(t, int64(1), plugin.droppedRequests.Load())
+}
+
+func TestSerializePluginLogsBoundedKeepsValidNewestEntries(t *testing.T) {
+	logs := []schemas.PluginLogEntry{
+		{PluginName: "fixture", Level: schemas.LogLevelInfo, Message: strings.Repeat("old", maxA2APluginLogsLen)},
+		{PluginName: "fixture", Level: schemas.LogLevelInfo, Message: "newest"},
+	}
+
+	serialized := serializePluginLogsBounded(logs, maxA2APluginLogsLen)
+	require.LessOrEqual(t, len(serialized), maxA2APluginLogsLen)
+
+	var grouped map[string][]schemas.PluginLogEntry
+	require.NoError(t, json.Unmarshal([]byte(serialized), &grouped))
+	require.Equal(t, []schemas.PluginLogEntry{logs[1]}, grouped["fixture"])
+}
+
+func TestA2AHooksApplyFinalContentPolicy(t *testing.T) {
+	requestBody := `{"jsonrpc":"2.0","method":"SendMessage"}`
+	responseBody := `{"jsonrpc":"2.0","result":{"id":"task-1"}}`
+
+	for _, test := range []struct {
+		name         string
+		plugin       *LoggerPlugin
+		wantHidden   bool
+		wantPayloads bool
+	}{
+		{name: "dropped", plugin: policyTestPlugin(nil, nil, true), wantPayloads: false},
+		{name: "hidden", plugin: policyTestPlugin(nil, boolPtr(true), true), wantHidden: true, wantPayloads: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.plugin.writeQueue = make(chan *writeQueueEntry, 1)
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-a2a-policy-"+test.name)
+			req := &schemas.BifrostA2ARequest{RequestType: schemas.A2ARequestTypeSendMessage, AgentName: "fixture", RequestBody: &requestBody}
+			_, short, err := test.plugin.PreA2AHook(ctx, req)
+			require.NoError(t, err)
+			require.Nil(t, short)
+
+			ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+			resp := &schemas.BifrostA2AResponse{ResponseBody: &responseBody, ExtraFields: schemas.BifrostA2AResponseExtraFields{A2ARequestType: schemas.A2ARequestTypeSendMessage, AgentName: "fixture"}}
+			_, _, err = test.plugin.PostA2AHook(ctx, resp, nil)
+			require.NoError(t, err)
+			entry := (<-test.plugin.writeQueue).agentLog
+			require.Equal(t, test.wantHidden, entry.ContentHidden)
+			if test.wantPayloads {
+				require.Equal(t, requestBody, *entry.RequestBody)
+				require.Equal(t, responseBody, *entry.ResponseBody)
+			} else {
+				require.Nil(t, entry.RequestBody)
+				require.Nil(t, entry.ResponseBody)
+			}
+		})
+	}
+}
+
+func TestPostA2AHookSanitizesErrorPayloadsByContentPolicy(t *testing.T) {
+	rawRequest := map[string]any{"secret": "request"}
+	rawResponse := map[string]any{"secret": "response"}
+
+	for _, test := range []struct {
+		name           string
+		plugin         *LoggerPlugin
+		shouldStoreRaw bool
+		wantRaw        bool
+	}{
+		{name: "visible raw disabled", plugin: policyTestPlugin(nil, nil, true)},
+		{name: "visible raw enabled", plugin: policyTestPlugin(nil, nil, true), shouldStoreRaw: true, wantRaw: true},
+		{name: "hidden", plugin: policyTestPlugin(nil, boolPtr(true), true), shouldStoreRaw: true},
+		{name: "dropped", plugin: policyTestPlugin(nil, nil, true), shouldStoreRaw: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			test.plugin.writeQueue = make(chan *writeQueueEntry, 1)
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-a2a-error-policy-"+test.name)
+			ctx.SetValue(schemas.BifrostContextKeyShouldStoreRawInLogs, test.shouldStoreRaw)
+			req := &schemas.BifrostA2ARequest{RequestType: schemas.A2ARequestTypeSendMessage, AgentName: "fixture"}
+			_, short, err := test.plugin.PreA2AHook(ctx, req)
+			require.NoError(t, err)
+			require.Nil(t, short)
+			if test.name == "hidden" || test.name == "dropped" {
+				ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+			}
+
+			bifrostErr := &schemas.BifrostError{ExtraFields: schemas.BifrostErrorExtraFields{RawRequest: rawRequest, RawResponse: rawResponse}}
+			resp := &schemas.BifrostA2AResponse{ExtraFields: schemas.BifrostA2AResponseExtraFields{A2ARequestType: schemas.A2ARequestTypeSendMessage, AgentName: "fixture"}}
+			_, _, err = test.plugin.PostA2AHook(ctx, resp, bifrostErr)
+			require.NoError(t, err)
+
+			entry := (<-test.plugin.writeQueue).agentLog
+			require.NotNil(t, entry.ErrorDetailsParsed)
+			if test.wantRaw {
+				require.Equal(t, rawRequest, entry.ErrorDetailsParsed.ExtraFields.RawRequest)
+				require.Equal(t, rawResponse, entry.ErrorDetailsParsed.ExtraFields.RawResponse)
+			} else {
+				require.Nil(t, entry.ErrorDetailsParsed.ExtraFields.RawRequest)
+				require.Nil(t, entry.ErrorDetailsParsed.ExtraFields.RawResponse)
+			}
+			require.Equal(t, rawRequest, bifrostErr.ExtraFields.RawRequest)
+			require.Equal(t, rawResponse, bifrostErr.ExtraFields.RawResponse)
+		})
+	}
+}
+
+func TestObserveA2AEventAppliesContentPolicy(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 1)
+	ctx := policyCtx(false, map[schemas.BifrostContextKey]bool{schemas.BifrostContextKeyGovernanceDisableContentLogging: true})
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "operation-policy")
+	body := `{"kind":"status-update"}`
+
+	plugin.ObserveA2AEvent(ctx, &schemas.BifrostA2AEvent{RequestType: schemas.A2ARequestTypeSubscribeToTask, AgentName: "fixture", Sequence: 1, Body: &body})
+
+	entry := (<-plugin.writeQueue).agentLog
+	require.Nil(t, entry.EventBody)
+	require.False(t, entry.ContentHidden)
+}
+
+// TestA2ASubscriptionLogOwnsRESTTaskID reproduces reuse of the adaptor's borrowed URL buffer before the queued log is written.
+func TestA2ASubscriptionLogOwnsRESTTaskID(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 1)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "rest-subscription")
+	var fastCtx fasthttp.RequestCtx
+	fastCtx.Request.SetRequestURI("/tasks/task-original:subscribe")
+	fastCtx.Request.Header.SetMethod(http.MethodGet)
+	var request http.Request
+	require.NoError(t, fasthttpadaptor.ConvertRequest(&fastCtx, &request, true))
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /tasks/{idAndAction}", func(w http.ResponseWriter, r *http.Request) {
+		taskID, ok := strings.CutSuffix(r.PathValue("idAndAction"), ":subscribe")
+		require.True(t, ok)
+		_, _, err := plugin.PreA2AHook(ctx, &schemas.BifrostA2ARequest{
+			RequestType:           schemas.A2ARequestTypeSubscribeToTask,
+			BifrostA2ATaskRequest: &schemas.BifrostA2ATaskRequest{TaskID: taskID},
+		})
+		require.NoError(t, err)
+		_, _, err = plugin.PostA2AHook(ctx, &schemas.BifrostA2AResponse{
+			ExtraFields: schemas.BifrostA2AResponseExtraFields{A2ARequestType: schemas.A2ARequestTypeSubscribeToTask},
+		}, nil)
+		require.NoError(t, err)
+	})
+	mux.ServeHTTP(httptest.NewRecorder(), &request)
+	// Reuse the same bytes after the request ends, while the log is still queued.
+	copy(fastCtx.RequestURI(), "/tasks/task-replaced:subscribe")
+	entry := (<-plugin.writeQueue).agentLog
+	require.NotNil(t, entry.TaskID)
+	require.Equal(t, "task-original", *entry.TaskID)
+}
+
+// BenchmarkA2ACorrelationOwnership compares retaining a borrowed value with owning its bytes.
+func BenchmarkA2ACorrelationOwnership(b *testing.B) {
+	value := "12345678-1234-1234-1234-123456789abc"
+	for _, owned := range []bool{false, true} {
+		b.Run(fmt.Sprintf("owned=%t", owned), func(b *testing.B) {
+			b.ReportAllocs()
+			var retained *string
+			for b.Loop() {
+				if owned {
+					retained = optionalBoundedA2AValue(value, 255)
+				} else {
+					bounded := clampString(value, 255)
+					retained = &bounded
+				}
+			}
+			if *retained != value {
+				b.Fatal("correlation value changed")
+			}
+		})
+	}
+}
+
+func TestA2AResponseCorrelationPreservesRequestValuesWhenResponseOmitsThem(t *testing.T) {
+	entry := &logstore.AgentLog{}
+	applyA2ARequestCorrelation(entry, &schemas.BifrostA2ARequest{
+		BifrostA2ASendMessageRequest: &schemas.BifrostA2ASendMessageRequest{
+			TaskID:    "request-task",
+			ContextID: "request-context",
+		},
+		BifrostA2APushRequest: &schemas.BifrostA2APushRequest{
+			PushConfigID: "request-config",
+			DeliveryID:   "request-delivery",
+			AttemptID:    "request-attempt",
+		},
+	})
+
+	applyA2AResponseCorrelation(entry, &schemas.BifrostA2AResponse{
+		BifrostA2ASendMessageResponse: &schemas.BifrostA2ASendMessageResponse{},
+		BifrostA2ATaskResponse:        &schemas.BifrostA2ATaskResponse{},
+		BifrostA2APushResponse:        &schemas.BifrostA2APushResponse{},
+	})
+
+	require.Equal(t, "request-task", *entry.TaskID)
+	require.Equal(t, "request-context", *entry.ContextID)
+	require.Equal(t, "request-config", *entry.PushConfigID)
+	require.Equal(t, "request-delivery", *entry.DeliveryID)
+	require.Equal(t, "request-attempt", *entry.AttemptID)
+
+	applyA2AResponseCorrelation(entry, &schemas.BifrostA2AResponse{
+		BifrostA2ASendMessageResponse: &schemas.BifrostA2ASendMessageResponse{
+			TaskID:    "response-task",
+			ContextID: "response-context",
+		},
+		BifrostA2APushResponse: &schemas.BifrostA2APushResponse{
+			PushConfigID: "response-config",
+			DeliveryID:   "response-delivery",
+			AttemptID:    "response-attempt",
+		},
+	})
+
+	require.Equal(t, "response-task", *entry.TaskID)
+	require.Equal(t, "response-context", *entry.ContextID)
+	require.Equal(t, "response-config", *entry.PushConfigID)
+	require.Equal(t, "response-delivery", *entry.DeliveryID)
+	require.Equal(t, "response-attempt", *entry.AttemptID)
+}
+
+func TestA2AHooksCaptureRequestPayload(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-a2a-payload")
+	requestBody := `{"jsonrpc":"2.0","method":"message/send"}`
+	req := &schemas.BifrostA2ARequest{
+		RequestType: schemas.A2ARequestTypeSendMessage,
+		AgentName:   "fixture",
+		RequestBody: &requestBody,
+	}
+
+	_, short, err := plugin.PreA2AHook(ctx, req)
+	if err != nil {
+		t.Fatalf("PreA2AHook() error = %v", err)
+	}
+	if short != nil {
+		t.Fatal("PreA2AHook() unexpectedly short-circuited")
+	}
+	pending, ok := plugin.pendingAgentLogs.Load(a2aPendingKey("req-a2a-payload", schemas.A2ARequestTypeSendMessage))
+	if !ok {
+		t.Fatal("missing pending A2A payload log")
+	}
+	entry, ok := pending.(*logstore.AgentLog)
+	if !ok || entry == nil {
+		t.Fatalf("pending payload log has type %T", pending)
+	}
+	if entry.RequestBody == nil || *entry.RequestBody != requestBody {
+		t.Fatalf("request body = %v, want %q", entry.RequestBody, requestBody)
+	}
+}
+
+func TestA2AHooksRecordPublicAgentCardOperationAndBody(t *testing.T) {
+	plugin := &LoggerPlugin{writeQueue: make(chan *writeQueueEntry, 1)}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-public-card")
+	req := &schemas.BifrostA2ARequest{
+		RequestType: schemas.A2ARequestTypeGetAgentCard,
+		AgentName:   "fixture",
+	}
+	_, short, err := plugin.PreA2AHook(ctx, req)
+	require.NoError(t, err)
+	require.Nil(t, short)
+	pending, ok := plugin.pendingAgentLogs.Load(a2aPendingKey("req-public-card", schemas.A2ARequestTypeGetAgentCard))
+	require.True(t, ok)
+	entry := pending.(*logstore.AgentLog)
+	require.Equal(t, "GetAgentCard", entry.Operation)
+
+	body := `{"name":"fixture","version":"1"}`
+	resp := &schemas.BifrostA2AResponse{
+		BifrostA2AGetAgentCardResponse: &schemas.BifrostA2AGetAgentCardResponse{},
+		ResponseBody:                   &body,
+		ExtraFields: schemas.BifrostA2AResponseExtraFields{
+			A2ARequestType: schemas.A2ARequestTypeGetAgentCard,
+			AgentName:      "fixture",
+		},
+	}
+	_, _, err = plugin.PostA2AHook(ctx, resp, nil)
+	require.NoError(t, err)
+	queued := <-plugin.writeQueue
+	require.NotNil(t, queued.agentLog)
+	require.Equal(t, "GetAgentCard", queued.agentLog.Operation)
+	require.Equal(t, "success", queued.agentLog.Status)
+	require.NotNil(t, queued.agentLog.ResponseBody)
+	require.Equal(t, body, *queued.agentLog.ResponseBody)
+}
+
+// TestPostA2AHookCopiesLatencyBreakdown verifies the provisional upstream and
+// overhead measured by the agent gate are copied onto the request row.
+func TestPostA2AHookCopiesLatencyBreakdown(t *testing.T) {
+	plugin := &LoggerPlugin{writeQueue: make(chan *writeQueueEntry, 1)}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-a2a-latency")
+	up, ov := int64(7), int64(3)
+	resp := &schemas.BifrostA2AResponse{
+		ExtraFields: schemas.BifrostA2AResponseExtraFields{
+			A2ARequestType:  schemas.A2ARequestTypeSendMessage,
+			AgentName:       "fixture",
+			Latency:         10,
+			UpstreamLatency: &up,
+			OverheadLatency: &ov,
+		},
+	}
+	_, _, err := plugin.PostA2AHook(ctx, resp, nil)
+	require.NoError(t, err)
+	queued := <-plugin.writeQueue
+	require.NotNil(t, queued.agentLog)
+	require.Equal(t, float64(10), *queued.agentLog.Latency)
+	require.Equal(t, float64(7), *queued.agentLog.UpstreamLatency)
+	require.Equal(t, float64(3), *queued.agentLog.OverheadLatency)
+}
+
+// TestInject_BackfillsA2ARequestRow verifies a parked A2A request row receives
+// the authoritative upstream/overhead from root-span attributes and the
+// overhead breakdown, mirroring the LLM Inject backfill.
+func TestInject_BackfillsA2ARequestRow(t *testing.T) {
+	plugin := &LoggerPlugin{logger: testLogger{}, writeQueue: make(chan *writeQueueEntry, 1)}
+	traceID := "trace-a2a-backfill"
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	provisionalUp, provisionalOv := 6.0, 4.0
+	entry := &logstore.AgentLog{
+		ID: "a2a-row", Timestamp: time.Now().UTC(), RecordKind: "request", Status: "success",
+		AgentName: "fixture", RequestID: "req-a2a-backfill",
+		UpstreamLatency: &provisionalUp, OverheadLatency: &provisionalOv,
+	}
+	plugin.storeOrEnqueueAgentEntry(ctx, entry)
+	if _, parked := plugin.pendingAgentLogsToInject.Load(traceID); !parked {
+		t.Fatal("expected entry to be parked for Inject")
+	}
+	base := time.Now().UTC()
+	trace := &schemas.Trace{
+		TraceID: traceID,
+		RootSpan: &schemas.Span{
+			Attributes: map[string]any{
+				schemas.AttrBifrostUpstreamDurationMs: 10.0,
+				schemas.AttrBifrostOverheadDurationMs: 5.0,
+			},
+		},
+		Spans: []*schemas.Span{
+			{SpanID: "s1", Kind: schemas.SpanKindPlugin, Name: "plugin.logging.a2a_prehook", StartTime: base, EndTime: base.Add(2 * time.Millisecond)},
+		},
+	}
+	require.NoError(t, plugin.Inject(context.Background(), trace))
+	queued := <-plugin.writeQueue
+	require.NotNil(t, queued.agentLog)
+	require.Equal(t, float64(10), *queued.agentLog.UpstreamLatency)
+	require.Equal(t, float64(5), *queued.agentLog.OverheadLatency)
+	require.Equal(t, float64(15), *queued.agentLog.Latency)
+	require.NotEmpty(t, queued.agentLog.OverheadBreakdownParsed)
+	if _, parked := plugin.pendingAgentLogsToInject.Load(traceID); parked {
+		t.Fatal("expected pendingAgentLogsToInject to be cleaned up after Inject")
+	}
+}
+
+func TestInject_BackfillsA2ARequestInsteadOfNewerStreamEvent(t *testing.T) {
+	plugin := &LoggerPlugin{logger: testLogger{}, writeQueue: make(chan *writeQueueEntry, 2)}
+	traceID := "trace-a2a-stream-backfill"
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	base := time.Now().UTC()
+	request := &logstore.AgentLog{ID: "request", Timestamp: base, RecordKind: "request"}
+	event := &logstore.AgentLog{ID: "event", Timestamp: base.Add(time.Millisecond), RecordKind: "event"}
+	plugin.storeOrEnqueueAgentEntry(ctx, request)
+	plugin.storeOrEnqueueAgentEntry(ctx, event)
+
+	trace := &schemas.Trace{
+		TraceID: traceID,
+		RootSpan: &schemas.Span{Attributes: map[string]any{
+			schemas.AttrBifrostUpstreamDurationMs: 10.0,
+			schemas.AttrBifrostOverheadDurationMs: 5.0,
+			schemas.AttrBifrostStreamConvertMs:    1.0,
+		}},
+		Spans: []*schemas.Span{{
+			SpanID: "s1", Kind: schemas.SpanKindPlugin, Name: "plugin.logging.a2a_prehook",
+			StartTime: base, EndTime: base.Add(2 * time.Millisecond),
+		}},
+	}
+	require.NoError(t, plugin.Inject(context.Background(), trace))
+
+	queuedRequest := (<-plugin.writeQueue).agentLog
+	queuedEvent := (<-plugin.writeQueue).agentLog
+	require.Equal(t, "request", queuedRequest.ID)
+	require.Equal(t, "event", queuedEvent.ID)
+	require.NotNil(t, queuedRequest.UpstreamLatency)
+	require.NotNil(t, queuedRequest.OverheadLatency)
+	require.Equal(t, float64(3), *queuedRequest.OverheadLatency)
+	require.Equal(t, float64(12), *queuedRequest.UpstreamLatency)
+	require.Equal(t, float64(15), *queuedRequest.Latency)
+	require.NotEmpty(t, queuedRequest.OverheadBreakdownParsed)
+	require.Nil(t, queuedEvent.UpstreamLatency)
+	require.Nil(t, queuedEvent.OverheadLatency)
+	require.Empty(t, queuedEvent.OverheadBreakdownParsed)
+}
+
+func TestA2AHooksCaptureOnlyActualOperationNames(t *testing.T) {
+	plugin := &LoggerPlugin{}
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-a2a-operations")
+
+	operations := []schemas.A2ARequestType{
+		schemas.A2ARequestTypeSendMessage,
+		schemas.A2ARequestTypeCancelTask,
+	}
+	for _, operation := range operations {
+		req := &schemas.BifrostA2ARequest{RequestType: operation, AgentName: "fixture"}
+		_, short, err := plugin.PreA2AHook(ctx, req)
+		if err != nil {
+			t.Fatalf("PreA2AHook(%s) error = %v", operation, err)
+		}
+		if short != nil {
+			t.Fatalf("PreA2AHook(%s) unexpectedly short-circuited", operation)
+		}
+
+		pending, ok := plugin.pendingAgentLogs.Load(a2aPendingKey("req-a2a-operations", operation))
+		if !ok {
+			t.Fatalf("missing pending log for %s", operation)
+		}
+		entry, ok := pending.(*logstore.AgentLog)
+		if !ok || entry == nil {
+			t.Fatalf("pending log for %s has type %T", operation, pending)
+		}
+		if entry.Operation != operation.OperationName() {
+			t.Fatalf("operation = %q, want %q", entry.Operation, operation.OperationName())
+		}
+	}
+
+	var captured []string
+	plugin.pendingAgentLogs.Range(func(_, value any) bool {
+		entry, _ := value.(*logstore.AgentLog)
+		if entry != nil {
+			captured = append(captured, entry.Operation)
+		}
+		return true
+	})
+	if len(captured) != len(operations) {
+		t.Fatalf("captured operations = %v, want exactly %d actual operations", captured, len(operations))
+	}
+	for _, operation := range captured {
+		if strings.Contains(strings.ToLower(operation), "authorize") {
+			t.Fatalf("captured synthetic authorization operation %q", operation)
+		}
+	}
+}
+
+// TestRefusalLogOutcome reproduces a synthetic zero-output refusal without changing inference results.
+func TestRefusalLogOutcome(t *testing.T) {
+	for _, reason := range []string{"refusal", "content_filter", "safety", "stop", "length", "tool_calls", "future_stop"} {
+		for _, streamed := range []bool{false, true} {
+			for _, content := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/stream=%t/content=%t", reason, streamed, content), func(t *testing.T) {
+					p := &LoggerPlugin{}
+					entry := &logstore.Log{Status: logStatusSuccess}
+					result := &schemas.BifrostResponse{ResponsesResponse: &schemas.BifrostResponsesResponse{StopReason: schemas.Ptr(reason)}}
+					if streamed {
+						p.applyStreamingOutputToEntry(entry, &streaming.ProcessedStreamResponse{Data: &streaming.AccumulatedData{FinishReason: schemas.Ptr(reason), Cost: schemas.Ptr(0.27)}}, false, content)
+						require.Equal(t, 0.27, *entry.Cost)
+					} else {
+						p.applyNonStreamingOutputToEntry(entry, result, false, content)
+					}
+					require.Equal(t, reason, *entry.StopReason)
+					require.Equal(t, reason, *result.ResponsesResponse.StopReason)
+					switch reason {
+					case "refusal", "content_filter", "safety":
+						require.Equal(t, logStatusError, entry.Status)
+						require.NotNil(t, entry.ErrorDetailsParsed)
+						require.Equal(t, "model_refusal", *entry.ErrorDetailsParsed.Error.Type)
+						require.Contains(t, entry.ErrorDetailsParsed.Error.Message, reason)
+						require.Nil(t, entry.ErrorDetailsParsed.StatusCode)
+						require.NoError(t, entry.SerializeFields())
+						require.Contains(t, entry.ErrorDetails, "model_refusal")
+					default:
+						require.Equal(t, logStatusSuccess, entry.Status)
+						require.Nil(t, entry.ErrorDetailsParsed)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestA2ARawCaptureContentPolicy verifies raw captures follow the same content policy as typed bodies.
+func TestA2ARawCaptureContentPolicy(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		plugin := policyTestPlugin(boolPtr(disabled), nil, false)
+		plugin.writeQueue = make(chan *writeQueueEntry, 1)
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "raw-policy")
+		var captures schemas.A2ARawCaptureManager
+		ctx.SetValue(schemas.A2ARawCaptureContextKey, captures.Start("capture-test"))
+		capture := schemas.GetA2ARawCapture(ctx)
+		capture.Append([]byte("request"), true)
+		capture.Append([]byte("response"), false)
+		req := &schemas.BifrostA2ARequest{RequestType: schemas.A2ARequestTypeSendMessage, AgentName: "fixture"}
+		_, _, err := plugin.PreA2AHook(ctx, req)
+		require.NoError(t, err)
+		resp := &schemas.BifrostA2AResponse{ExtraFields: schemas.BifrostA2AResponseExtraFields{A2ARequestType: req.RequestType, AgentName: req.AgentName}}
+		_, _, err = plugin.PostA2AHook(ctx, resp, nil)
+		require.NoError(t, err)
+		entry := (<-plugin.writeQueue).agentLog
+		if disabled {
+			require.Nil(t, entry.RawRequest)
+			require.Nil(t, entry.RawResponse)
+		} else {
+			require.Equal(t, "cmVxdWVzdA==", *entry.RawRequest)
+			require.Equal(t, "cmVzcG9uc2U=", *entry.RawResponse)
+		}
+	}
+}
+
+// Media an MCP tool returned is logged as a placeholder, never as its base64: for a Chat result whose
+// text is not JSON, and for a Responses result, which keeps images and files for the model.
+func TestPostMCPHookLogsToolMediaAsPlaceholders(t *testing.T) {
+	const payload = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+	text, imageURL := "3 points", "data:image/png;base64,"+payload
+	for _, tc := range []struct {
+		name        string
+		requestType schemas.MCPRequestType
+		resp        *schemas.BifrostMCPResponse
+	}{
+		{"chat", schemas.MCPRequestTypeChatToolCall, &schemas.BifrostMCPResponse{ChatMessage: &schemas.ChatMessage{
+			Role: schemas.ChatMessageRoleTool,
+			Content: &schemas.ChatMessageContent{ContentBlocks: []schemas.ChatContentBlock{
+				{Type: schemas.ChatContentBlockTypeText, Text: &text},
+				{Type: schemas.ChatContentBlockTypeImage, ImageURLStruct: &schemas.ChatInputImage{URL: imageURL}},
+			}},
+		}}},
+		{"responses", schemas.MCPRequestTypeResponsesToolCall, &schemas.BifrostMCPResponse{ResponsesMessage: &schemas.ResponsesMessage{
+			Type: schemas.Ptr(schemas.ResponsesMessageTypeFunctionCallOutput),
+			ResponsesToolMessage: &schemas.ResponsesToolMessage{
+				CallID: schemas.Ptr("call-chart"),
+				Output: &schemas.ResponsesToolMessageOutputStruct{ResponsesFunctionToolCallOutputBlocks: []schemas.ResponsesMessageContentBlock{
+					{Type: schemas.ResponsesInputMessageContentBlockTypeText, Text: &text},
+					{Type: schemas.ResponsesInputMessageContentBlockTypeImage, ResponsesInputMessageContentBlockImage: &schemas.ResponsesInputMessageContentBlockImage{ImageURL: &imageURL}},
+				}},
+			},
+		}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+			if err != nil {
+				t.Fatalf("Init() error = %v", err)
+			}
+			logID := "mcp-media-" + tc.name
+			ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+			ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-"+logID)
+			ctx.SetValue(schemas.BifrostContextKeyMCPLogID, logID)
+			toolName := "docs-chart"
+			if _, _, err := plugin.PreMCPHook(ctx, &schemas.BifrostMCPRequest{
+				RequestType: tc.requestType,
+				ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{
+					Function: schemas.ChatAssistantMessageToolCallFunction{Name: &toolName, Arguments: `{}`},
+				},
+			}); err != nil {
+				t.Fatalf("PreMCPHook() error = %v", err)
+			}
+			tc.resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: tc.requestType, ClientName: "docs", ToolName: "chart"}
+			if _, _, err := plugin.PostMCPHook(ctx, tc.resp, nil); err != nil {
+				t.Fatalf("PostMCPHook() error = %v", err)
+			}
+			if err := plugin.Cleanup(); err != nil {
+				t.Fatalf("Cleanup() error = %v", err)
+			}
+			logEntry, err := store.FindMCPToolLog(context.Background(), logID)
+			if err != nil {
+				t.Fatalf("FindMCPToolLog() error = %v", err)
+			}
+			logged, err := json.Marshal(logEntry.ResultParsed)
+			if err != nil {
+				t.Fatalf("marshal result: %v", err)
+			}
+			if strings.Contains(string(logged), payload) {
+				t.Fatalf("the logged result carries the image's base64: %s", logged)
+			}
+			if !strings.Contains(string(logged), "returned by the tool, not shown") || !strings.Contains(string(logged), text) {
+				t.Fatalf("the logged result must keep the text and name the image: %s", logged)
+			}
+		})
+	}
+}
+
+// Prompt and resource reads are logged like tool calls: the prompt name or URI, the server, the
+// method, arguments and result (blobs become placeholders, see schemas.ResourceContentsForLog).
+func TestMCPHooksLogPromptAndResourceReads(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	require.NoError(t, err)
+
+	read := func(logID string, req *schemas.BifrostMCPRequest, resp *schemas.BifrostMCPResponse) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-"+logID)
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, logID)
+		_, _, err := plugin.PreMCPHook(ctx, req)
+		require.NoError(t, err)
+		resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: req.RequestType, ClientName: req.ClientName, Latency: 7}
+		_, _, err = plugin.PostMCPHook(ctx, resp, nil)
+		require.NoError(t, err)
+	}
+
+	promptResp := &schemas.BifrostMCPResponse{BifrostMCPGetPromptResponse: &schemas.BifrostMCPGetPromptResponse{}}
+	require.NoError(t, json.Unmarshal([]byte(`{"description":"Review: +1","messages":[]}`), &promptResp.BifrostMCPGetPromptResponse.Prompt))
+	read("mcp-prompt-read", &schemas.BifrostMCPRequest{
+		RequestType:                schemas.MCPRequestTypeGetPrompt,
+		ClientName:                 "docs",
+		BifrostMCPGetPromptRequest: &schemas.BifrostMCPGetPromptRequest{Name: "docs-review", Arguments: map[string]string{"diff": "+1"}},
+	}, promptResp)
+
+	resourceResp := &schemas.BifrostMCPResponse{BifrostMCPReadResourceResponse: &schemas.BifrostMCPReadResourceResponse{}}
+	require.NoError(t, json.Unmarshal([]byte(`{"contents":[]}`), &resourceResp.BifrostMCPReadResourceResponse.Resource))
+	read("mcp-resource-read", &schemas.BifrostMCPRequest{
+		RequestType:                   schemas.MCPRequestTypeReadResource,
+		ClientName:                    "docs",
+		BifrostMCPReadResourceRequest: &schemas.BifrostMCPReadResourceRequest{URI: "file:///chart.png"},
+	}, resourceResp)
+	require.NoError(t, plugin.Cleanup())
+
+	prompt, err := store.FindMCPToolLog(context.Background(), "mcp-prompt-read")
+	require.NoError(t, err)
+	require.NotNil(t, prompt.Method)
+	require.Equal(t, "prompts/get", *prompt.Method)
+	require.Equal(t, "review", prompt.ToolName)
+	require.Equal(t, "docs", prompt.ServerLabel)
+	require.Equal(t, "success", prompt.Status)
+	require.Contains(t, fmt.Sprint(prompt.ArgumentsParsed), "diff")
+	require.Contains(t, fmt.Sprint(prompt.ResultParsed), "Review: +1")
+
+	resource, err := store.FindMCPToolLog(context.Background(), "mcp-resource-read")
+	require.NoError(t, err)
+	require.NotNil(t, resource.Method)
+	require.Equal(t, "resources/read", *resource.Method)
+	require.Equal(t, "file:///chart.png", resource.ToolName)
+	require.Equal(t, "docs", resource.ServerLabel)
+	require.Equal(t, "success", resource.Status)
+}
+
+// A read keeps its full log row when its target does not fit the tool_name column, or when a prompt
+// shares a name with a codemode tool: the column takes the target clipped to its width, the arguments
+// keep a resource's full URI, and the codemode skip applies to tool calls only.
+func TestMCPHooksLogReadsWithLongOrCodemodeNames(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	require.NoError(t, err)
+	read := func(logID string, req *schemas.BifrostMCPRequest, resp *schemas.BifrostMCPResponse) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-"+logID)
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, logID)
+		_, _, err := plugin.PreMCPHook(ctx, req)
+		require.NoError(t, err)
+		resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: req.RequestType, ClientName: req.ClientName}
+		_, _, err = plugin.PostMCPHook(ctx, resp, nil)
+		require.NoError(t, err)
+	}
+
+	longURI := "repo://docs/" + strings.Repeat("a", 240) + "é" + strings.Repeat("b", 150)
+	read("mcp-long-uri", &schemas.BifrostMCPRequest{
+		RequestType:                   schemas.MCPRequestTypeReadResource,
+		ClientName:                    "docs",
+		BifrostMCPReadResourceRequest: &schemas.BifrostMCPReadResourceRequest{URI: longURI},
+	}, &schemas.BifrostMCPResponse{BifrostMCPReadResourceResponse: &schemas.BifrostMCPReadResourceResponse{}})
+	read("mcp-codemode-named-prompt", &schemas.BifrostMCPRequest{
+		RequestType:                schemas.MCPRequestTypeGetPrompt,
+		ClientName:                 "docs",
+		BifrostMCPGetPromptRequest: &schemas.BifrostMCPGetPromptRequest{Name: "docs-executeToolCode", Arguments: map[string]string{"diff": "+1"}},
+	}, &schemas.BifrostMCPResponse{BifrostMCPGetPromptResponse: &schemas.BifrostMCPGetPromptResponse{}})
+	require.NoError(t, plugin.Cleanup())
+
+	resource, err := store.FindMCPToolLog(context.Background(), "mcp-long-uri")
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(resource.ToolName), 255, "tool_name is varchar(255)")
+	require.True(t, utf8.ValidString(resource.ToolName))
+	require.True(t, strings.HasPrefix(longURI, resource.ToolName))
+	require.Contains(t, fmt.Sprint(resource.ArgumentsParsed), longURI, "the full URI is kept in the arguments")
+
+	prompt, err := store.FindMCPToolLog(context.Background(), "mcp-codemode-named-prompt")
+	require.NoError(t, err)
+	require.NotNil(t, prompt.Method)
+	require.Equal(t, "prompts/get", *prompt.Method)
+	require.Equal(t, "executeToolCode", prompt.ToolName)
+	require.Equal(t, "docs", prompt.ServerLabel)
+	require.Contains(t, fmt.Sprint(prompt.ArgumentsParsed), "diff")
+}
+
+// On PostgreSQL, where tool_name is a real varchar(255), a resource read with a longer URI still
+// leaves its log row.
+func TestMCPHooksLogLongResourceURIOnPostgres(t *testing.T) {
+	cfg := testPostgresConnConfig()
+	openTestPostgres(t, cfg)
+	store := newTestPostgresStore(t, cfg)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	require.NoError(t, err)
+
+	logID := fmt.Sprintf("mcp-long-uri-pg-%d", time.Now().UnixNano())
+	longURI := "repo://docs/" + strings.Repeat("a", 400)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-"+logID)
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, logID)
+	req := &schemas.BifrostMCPRequest{
+		RequestType:                   schemas.MCPRequestTypeReadResource,
+		ClientName:                    "docs",
+		BifrostMCPReadResourceRequest: &schemas.BifrostMCPReadResourceRequest{URI: longURI},
+	}
+	_, _, err = plugin.PreMCPHook(ctx, req)
+	require.NoError(t, err)
+	resp := &schemas.BifrostMCPResponse{BifrostMCPReadResourceResponse: &schemas.BifrostMCPReadResourceResponse{}}
+	resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: req.RequestType, ClientName: req.ClientName}
+	_, _, err = plugin.PostMCPHook(ctx, resp, nil)
+	require.NoError(t, err)
+	require.NoError(t, plugin.Cleanup())
+
+	logged, err := store.FindMCPToolLog(context.Background(), logID)
+	require.NoError(t, err, "the read's log row must be stored")
+	require.Equal(t, longURI[:255], logged.ToolName)
+	require.Contains(t, fmt.Sprint(logged.ArgumentsParsed), longURI)
+}
+
+// BenchmarkMCPHooks measures logging one MCP call end to end through PreMCPHook and PostMCPHook: a
+// tool call, the baseline, beside the prompt and resource reads this plugin now logs too.
+func BenchmarkMCPHooks(b *testing.B) {
+	store := newTestStore(b)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = plugin.Cleanup() })
+	tool := "docs-search"
+	for _, tc := range []struct {
+		name string
+		req  *schemas.BifrostMCPRequest
+		resp *schemas.BifrostMCPResponse
+	}{
+		{"tool-call", &schemas.BifrostMCPRequest{
+			RequestType:                  schemas.MCPRequestTypeChatToolCall,
+			ChatAssistantMessageToolCall: &schemas.ChatAssistantMessageToolCall{Function: schemas.ChatAssistantMessageToolCallFunction{Name: &tool, Arguments: `{"q":"x"}`}},
+		}, &schemas.BifrostMCPResponse{ChatMessage: &schemas.ChatMessage{Role: schemas.ChatMessageRoleTool, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr(`{"ok":true}`)}}}},
+		{"prompt-get", &schemas.BifrostMCPRequest{
+			RequestType:                schemas.MCPRequestTypeGetPrompt,
+			ClientName:                 "docs",
+			BifrostMCPGetPromptRequest: &schemas.BifrostMCPGetPromptRequest{Name: "docs-review", Arguments: map[string]string{"diff": "+1"}},
+		}, &schemas.BifrostMCPResponse{BifrostMCPGetPromptResponse: &schemas.BifrostMCPGetPromptResponse{}}},
+		{"resource-read", &schemas.BifrostMCPRequest{
+			RequestType:                   schemas.MCPRequestTypeReadResource,
+			ClientName:                    "docs",
+			BifrostMCPReadResourceRequest: &schemas.BifrostMCPReadResourceRequest{URI: "file:///handbook.md"},
+		}, &schemas.BifrostMCPResponse{BifrostMCPReadResourceResponse: &schemas.BifrostMCPReadResourceResponse{}}},
+	} {
+		tc.resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: tc.req.RequestType, ClientName: "docs", ToolName: "search"}
+		b.Run(tc.name, func(b *testing.B) {
+			b.ReportAllocs()
+			for b.Loop() {
+				ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+				ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-bench")
+				ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-bench-"+tc.name)
+				if _, _, err := plugin.PreMCPHook(ctx, tc.req); err != nil {
+					b.Fatal(err)
+				}
+				if _, _, err := plugin.PostMCPHook(ctx, tc.resp, nil); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
+// A resource URI's credentials (user info, query, fragment) never reach tool_name, which is kept
+// whatever the content policy; with content logging off, they are nowhere in the row.
+// A read core moved to another server after the pre-hooks (the first owner was not reachable) is
+// logged under the server that answered, which the response names.
+func TestMCPHooksLogReadUnderTheServerThatAnswered(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	require.NoError(t, err)
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-moved-read")
+	ctx.SetValue(schemas.BifrostContextKeyMCPLogID, "mcp-moved-read")
+	req := &schemas.BifrostMCPRequest{
+		RequestType:                   schemas.MCPRequestTypeReadResource,
+		ClientName:                    "a",
+		BifrostMCPReadResourceRequest: &schemas.BifrostMCPReadResourceRequest{URI: "file:///handbook.md"},
+	}
+	_, _, err = plugin.PreMCPHook(ctx, req)
+	require.NoError(t, err)
+	resp := &schemas.BifrostMCPResponse{BifrostMCPReadResourceResponse: &schemas.BifrostMCPReadResourceResponse{}}
+	resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: req.RequestType, ClientName: "b"}
+	_, _, err = plugin.PostMCPHook(ctx, resp, nil)
+	require.NoError(t, err)
+	require.NoError(t, plugin.Cleanup())
+
+	row, err := store.FindMCPToolLog(context.Background(), "mcp-moved-read")
+	require.NoError(t, err)
+	require.Equal(t, "b", row.ServerLabel)
+}
+
+func TestMCPHooksLogResourceURIWithoutCredentials(t *testing.T) {
+	store := newTestStore(t)
+	plugin, err := Init(context.Background(), &Config{}, testLogger{}, store, nil, nil, nil)
+	require.NoError(t, err)
+	read := func(logID, uri string, contentOff bool) {
+		ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-"+logID)
+		ctx.SetValue(schemas.BifrostContextKeyMCPLogID, logID)
+		if contentOff {
+			ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+		}
+		req := &schemas.BifrostMCPRequest{
+			RequestType:                   schemas.MCPRequestTypeReadResource,
+			ClientName:                    "docs",
+			BifrostMCPReadResourceRequest: &schemas.BifrostMCPReadResourceRequest{URI: uri},
+		}
+		_, _, err := plugin.PreMCPHook(ctx, req)
+		require.NoError(t, err)
+		resp := &schemas.BifrostMCPResponse{BifrostMCPReadResourceResponse: &schemas.BifrostMCPReadResourceResponse{}}
+		resp.ExtraFields = schemas.BifrostMCPResponseExtraFields{MCPRequestType: req.RequestType, ClientName: req.ClientName}
+		_, _, err = plugin.PostMCPHook(ctx, resp, nil)
+		require.NoError(t, err)
+	}
+	read("mcp-uri-creds", "https://alice:secret@docs.example.com/a.md?token=abc#frag", true)
+	read("mcp-uri-file", "file:///handbook.md", false)
+	read("mcp-uri-comma", "file:///reports/a,b.csv", false)
+	require.NoError(t, plugin.Cleanup())
+
+	withSecret, err := store.FindMCPToolLog(context.Background(), "mcp-uri-creds")
+	require.NoError(t, err)
+	require.Equal(t, "https://docs.example.com/a.md", withSecret.ToolName)
+	row, err := json.Marshal(withSecret)
+	require.NoError(t, err)
+	require.NotContains(t, string(row), "secret")
+	require.NotContains(t, string(row), "abc")
+
+	file, err := store.FindMCPToolLog(context.Background(), "mcp-uri-file")
+	require.NoError(t, err)
+	require.Equal(t, "file:///handbook.md", file.ToolName)
+
+	// The log filters split tool names on commas, so a URI's commas are logged percent-encoded.
+	comma, err := store.FindMCPToolLog(context.Background(), "mcp-uri-comma")
+	require.NoError(t, err)
+	require.Equal(t, "file:///reports/a%2Cb.csv", comma.ToolName)
+}
+
+// endpointJobStore is the slice of the job store recordEndpointJob uses.
+type endpointJobStore struct {
+	jobaccounting.SweepStore
+	jobs map[string]*cstables.TableProviderJob
+	fail error // returned by every lookup
+}
+
+func (s *endpointJobStore) GetProviderJob(_ context.Context, id string) (*cstables.TableProviderJob, error) {
+	if s.fail != nil {
+		return nil, s.fail
+	}
+	job, ok := s.jobs[id]
+	if !ok {
+		return nil, configstore.ErrNotFound
+	}
+	return job, nil
+}
+
+func (s *endpointJobStore) UpsertProviderJob(_ context.Context, job *cstables.TableProviderJob) error {
+	if _, ok := s.jobs[job.ID]; !ok {
+		copied := *job
+		if copied.AccountingStatus == "" {
+			copied.AccountingStatus = cstables.ProviderJobAccountingStatusPending
+		}
+		s.jobs[job.ID] = &copied
+	}
+	return nil
+}
+
+func TestRelayLogRow(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 4)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-pte")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-1")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyName, "prod")
+	ctx.SetValue(schemas.BifrostContextKeyGovernanceBudgetIDs, []string{"budget-1"})
+	ctx.SetValue(schemas.BifrostContextKeyUserAgent, "claude-code/1.0.0")
+
+	_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{
+		RelayName: "tavily", Method: "POST", Path: "/search", RawQuery: "q=1", RoutePath: "/search", Billable: true,
+		Headers: map[string]string{"content-type": "application/json", "x-api-key": "tvly-secret"}, Body: []byte(`{"query":"x"}`),
+	})
+	require.NoError(t, err)
+	_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{
+		RelayName: "tavily", StatusCode: 200, Latency: 120, UpstreamLatency: 100, BytesOut: 42, Body: []byte(`{"usage":{"credits":4}}`),
+		Usage: &schemas.RelayUsage{Cost: 0.033, CostPerRequest: 0.001, CostPerUnit: 0.008, Units: schemas.Ptr(4.0), BilledUnits: schemas.Ptr(4.0)},
+	}, nil)
+	require.NoError(t, err)
+
+	entry := (<-plugin.writeQueue).endpointLog
+	require.NotNil(t, entry)
+	require.Equal(t, "req-pte", entry.RequestID)
+	require.NotEqual(t, "req-pte", entry.ID, "the row id is generated: a caller's x-request-id may repeat")
+	require.Equal(t, "/search?q=1", entry.Path)
+	require.Equal(t, logstore.RelayLogStatusSuccess, entry.Status)
+	require.InDelta(t, 0.033, *entry.Cost, 1e-12)
+	require.InDelta(t, 4, *entry.BilledUnits, 1e-12)
+	require.Equal(t, "vk-1", *entry.VirtualKeyID)
+	require.Equal(t, "prod", *entry.VirtualKeyName)
+	require.Equal(t, []string{"budget-1"}, entry.BudgetIDsParsed)
+	require.Equal(t, 120.0, *entry.Latency)
+	require.Equal(t, 100.0, *entry.UpstreamLatency, "the provisional split comes from the response until Inject backfills it")
+	require.Equal(t, 20.0, *entry.OverheadLatency)
+	require.NotNil(t, entry.UserAgent, "the calling client is recorded as on LLM and MCP rows")
+	require.Equal(t, "claude-code/1.0.0", *entry.UserAgent)
+	require.Equal(t, `{"query":"x"}`, *entry.RequestBody)
+	require.Nil(t, entry.RequestHeadersParsed, "headers are kept only when the logging headers or the route's matchers name them")
+
+	// Content logging off: the row keeps the charge and drops the bodies and headers.
+	hidden := policyTestPlugin(boolPtr(true), nil, false)
+	hidden.writeQueue = make(chan *writeQueueEntry, 1)
+	ctx = policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-hidden")
+	_, _, err = hidden.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search", RawQuery: "q=private-text", Body: []byte(`secret`)})
+	require.NoError(t, err)
+	_, _, err = hidden.PostRelayHook(ctx, &schemas.BifrostRelayResponse{StatusCode: 502}, nil)
+	require.NoError(t, err)
+	entry = (<-hidden.writeQueue).endpointLog
+	require.Nil(t, entry.RequestBody)
+	require.Equal(t, "/search", entry.Path, "query values are caller content and are dropped with it")
+	require.Equal(t, logstore.RelayLogStatusError, entry.Status)
+}
+
+// A refused or failed call has no reply to time, so the row takes the latency the error carries,
+// and failing that the time since the row was opened, as LLM rows always carry a latency.
+// An oversized User-Agent is clamped to its column, as on LLM rows, so the row is not lost at
+// insert time together with its cost and attribution.
+func TestRelayLogClampsUserAgent(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 2)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-long-ua")
+	ctx.SetValue(schemas.BifrostContextKeyUserAgent, "claude-code/1.0.0 "+strings.Repeat("x", 2*maxPersistedUserAgentLen))
+	_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search"})
+	require.NoError(t, err)
+	_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{RelayName: "tavily", StatusCode: 200}, nil)
+	require.NoError(t, err)
+	entry := (<-plugin.writeQueue).endpointLog
+	require.NotNil(t, entry.UserAgent)
+	require.LessOrEqual(t, len(*entry.UserAgent), maxPersistedUserAgentLen, "the stored user agent fits its column")
+	require.Equal(t, "Claude Code", *entry.App, "the app is still detected from the full header")
+}
+
+// A row carries the same metadata LLM and MCP rows do (the Logging Headers setting's headers, every
+// x-bf-lh-* label with its prefix stripped, the x-bf-dim-* dimensions, and the key's metadata), and
+// beside it only the headers the matched route matches on; never the reply's headers. Both are
+// metadata, so content logging being off does not drop them.
+func TestRelayLogMetadataAndMatchedHeaders(t *testing.T) {
+	// The caller's headers as the transport collected them (every x-bf-* header included), and the
+	// relayed subset the gateway builds (x-bf-* and credentials stripped), as on the wire.
+	headers := map[string]string{
+		"content-type": "application/json", "x-tenant-id": "acme", "x-other": "no", "x-bf-lh-team": "core", "x-amz-target": "Textract.GetDocumentAnalysis", "x-api-key": "tvly-secret",
+	}
+	relayed := map[string]string{"content-type": "application/json", "x-tenant-id": "acme", "x-other": "no", "x-amz-target": "Textract.AnalyzeDocument"}
+	run := func(t *testing.T, plugin *LoggerPlugin, contentOff bool) *logstore.RelayLog {
+		t.Helper()
+		plugin.writeQueue = make(chan *writeQueueEntry, 1)
+		ctx := policyCtx(false, nil)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-headers")
+		ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, headers)
+		ctx.SetValue(schemas.BifrostContextKeyDimensions, map[string]string{"environment": "staging"})
+		// The route layer hands over the values that selected the route: the relay's own extra header
+		// wins over the caller's copy (the caller sent Textract.GetDocumentAnalysis, the relay sets
+		// Textract.AnalyzeDocument). The route also matches on a credential header: kept, redacted.
+		matched := map[string]string{"x-amz-target": "Textract.AnalyzeDocument", "x-api-key": "tvly-secret"}
+		_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "textract", Method: "POST", Path: "/", RouteHeaders: matched, Headers: relayed})
+		require.NoError(t, err)
+		// Governance may run after this plugin's pre-hook: the key's metadata lands then, and its
+		// value wins over a caller label of the same name.
+		ctx.SetValue(virtualKeyMetadataContextKey, map[string]string{"cost_center": "r&d", "team": "platform"})
+		if contentOff {
+			ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, true)
+		}
+		_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{RelayName: "textract", StatusCode: 200, Headers: map[string]string{"x-amzn-requestid": "abc"}, Body: []byte(`{}`)}, nil)
+		require.NoError(t, err)
+		return (<-plugin.writeQueue).endpointLog
+	}
+	wantMetadata := map[string]any{"x-tenant-id": "acme", "team": "platform", "environment": "staging", "cost_center": "r&d"}
+	wantMatched := map[string]string{"x-amz-target": "Textract.AnalyzeDocument", "x-api-key": schemas.RedactSensitiveHeaders(map[string]string{"x-api-key": "tvly-secret"})["x-api-key"]}
+
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.loggingHeaders = &[]string{"x-tenant-*"}
+	entry := run(t, plugin, false)
+	require.Equal(t, wantMetadata, entry.MetadataParsed, "the configured pattern, the dimension, and the key's metadata merged after governance (its team wins over the caller's label)")
+	require.Equal(t, wantMatched, entry.RequestHeadersParsed, "only the headers the route matched on, with the value that selected the route, the credential redacted")
+	require.NotEqual(t, "tvly-secret", entry.RequestHeadersParsed["x-api-key"])
+	require.Nil(t, entry.ResponseHeadersParsed, "reply headers are never kept, as on LLM rows")
+
+	plugin = policyTestPlugin(nil, nil, true)
+	plugin.loggingHeaders = &[]string{"x-tenant-*"}
+	entry = run(t, plugin, true)
+	require.True(t, entry.ContentHidden)
+	require.Nil(t, entry.RequestBody, "content logging off drops the bodies")
+	require.Equal(t, wantMetadata, entry.MetadataParsed, "but not the metadata")
+	require.Equal(t, wantMatched, entry.RequestHeadersParsed, "nor the matched headers")
+
+	plugin = policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 1)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-no-headers")
+	ctx.SetValue(schemas.BifrostContextKeyRequestHeaders, map[string]string{"content-type": "application/json", "x-other": "no"})
+	_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "textract", Method: "POST", Path: "/", Headers: map[string]string{"content-type": "application/json", "x-other": "no"}})
+	require.NoError(t, err)
+	_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{RelayName: "textract", StatusCode: 200}, nil)
+	require.NoError(t, err)
+	bare := (<-plugin.writeQueue).endpointLog
+	require.Nil(t, bare.MetadataParsed, "with nothing configured and no label or dimension, no metadata")
+	require.Nil(t, bare.RequestHeadersParsed, "and with no matcher, no header")
+}
+
+func TestRelayLogRefusalRecordsLatency(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 2)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-denied")
+	_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search"})
+	require.NoError(t, err)
+	denied := &schemas.BifrostError{StatusCode: schemas.Ptr(403), Error: &schemas.ErrorField{Message: "relay 'tavily' is not allowed for virtual key 'test'"}}
+	denied.ExtraFields.Latency = 7
+	_, _, err = plugin.PostRelayHook(ctx, nil, denied)
+	require.NoError(t, err)
+	entry := (<-plugin.writeQueue).endpointLog
+	require.Equal(t, logstore.RelayLogStatusError, entry.Status)
+	require.Equal(t, 403, entry.StatusCode)
+	require.NotNil(t, entry.Latency)
+	require.Equal(t, 7.0, *entry.Latency, "the error's own latency is the row's latency")
+
+	ctx = policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-failed")
+	_, _, err = plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search"})
+	require.NoError(t, err)
+	_, _, err = plugin.PostRelayHook(ctx, nil, &schemas.BifrostError{Error: &schemas.ErrorField{Message: "dial failed"}})
+	require.NoError(t, err)
+	entry = (<-plugin.writeQueue).endpointLog
+	require.NotNil(t, entry.Latency, "an error without a latency still measures from the row's start")
+	require.GreaterOrEqual(t, *entry.Latency, 0.0)
+}
+
+// A relay row parked under its trace takes upstream, overhead and the breakdown from the root span
+// when the trace completes, exactly as LLM and A2A rows do.
+func TestInject_BackfillsRelayRow(t *testing.T) {
+	plugin := &LoggerPlugin{logger: testLogger{}, writeQueue: make(chan *writeQueueEntry, 1)}
+	traceID := "trace-relay-backfill"
+	ctx := schemas.NewBifrostContext(context.Background(), schemas.NoDeadline)
+	ctx.SetValue(schemas.BifrostContextKeyTraceID, traceID)
+	provisionalUp, provisionalOv := 6.0, 4.0
+	entry := &logstore.RelayLog{
+		ID: "relay-row", Timestamp: time.Now().UTC(), RelayName: "tavily", RequestID: "req-relay-backfill", Status: logstore.RelayLogStatusSuccess,
+		UpstreamLatency: &provisionalUp, OverheadLatency: &provisionalOv,
+	}
+	plugin.storeOrEnqueueRelayEntry(ctx, entry)
+	if _, parked := plugin.pendingRelayLogsToInject.Load(traceID); !parked {
+		t.Fatal("expected entry to be parked for Inject")
+	}
+	base := time.Now().UTC()
+	trace := &schemas.Trace{
+		TraceID: traceID,
+		RootSpan: &schemas.Span{Attributes: map[string]any{
+			schemas.AttrBifrostUpstreamDurationMs: 10.0,
+			schemas.AttrBifrostOverheadDurationMs: 5.0,
+		}},
+		Spans: []*schemas.Span{
+			{SpanID: "s1", Kind: schemas.SpanKindPlugin, Name: "plugin.governance.relays_prehook", StartTime: base, EndTime: base.Add(2 * time.Millisecond)},
+		},
+	}
+	require.NoError(t, plugin.Inject(context.Background(), trace))
+	queued := <-plugin.writeQueue
+	require.NotNil(t, queued.endpointLog)
+	require.Equal(t, float64(10), *queued.endpointLog.UpstreamLatency)
+	require.Equal(t, float64(5), *queued.endpointLog.OverheadLatency)
+	require.Equal(t, float64(15), *queued.endpointLog.Latency)
+	require.NotEmpty(t, queued.endpointLog.OverheadBreakdownParsed)
+	if _, parked := plugin.pendingRelayLogsToInject.Load(traceID); parked {
+		t.Fatal("expected pendingRelayLogsToInject to be cleaned up after Inject")
+	}
+
+	// No trace on the context: the row is written as it is.
+	direct := &LoggerPlugin{logger: testLogger{}, writeQueue: make(chan *writeQueueEntry, 1)}
+	direct.storeOrEnqueueRelayEntry(schemas.NewBifrostContext(context.Background(), schemas.NoDeadline), &logstore.RelayLog{ID: "no-trace", UpstreamLatency: &provisionalUp})
+	queued = <-direct.writeQueue
+	require.Equal(t, float64(6), *queued.endpointLog.UpstreamLatency)
+}
+
+// Content logging on a relay row follows the same decision chain as an LLM row: the plugin's
+// setting, overridden by the virtual key's or project's decision, which governance stamps after
+// this plugin's pre-hook has already captured the request. The post-hook resolves it last.
+func TestRelayLogContentPolicy(t *testing.T) {
+	run := func(t *testing.T, plugin *LoggerPlugin, decision *bool) *logstore.RelayLog {
+		t.Helper()
+		plugin.writeQueue = make(chan *writeQueueEntry, 1)
+		ctx := policyCtx(false, nil)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-policy")
+		_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{
+			RelayName: "tavily", Method: "POST", Path: "/search", RawQuery: "q=private", Headers: map[string]string{"content-type": "application/json"}, Body: []byte(`{"query":"x"}`),
+		})
+		require.NoError(t, err)
+		if decision != nil {
+			// Governance's PreRelayHook runs after ours and stamps the key's decision.
+			ctx.SetValue(schemas.BifrostContextKeyGovernanceDisableContentLogging, *decision)
+		}
+		_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{StatusCode: 200, Headers: map[string]string{"content-type": "application/json"}, Body: []byte(`{"ok":true}`)}, nil)
+		require.NoError(t, err)
+		return (<-plugin.writeQueue).endpointLog
+	}
+
+	t.Run("on by default", func(t *testing.T) {
+		entry := run(t, policyTestPlugin(nil, nil, false), nil)
+		require.False(t, entry.ContentHidden)
+		require.Equal(t, `{"query":"x"}`, *entry.RequestBody)
+		require.Equal(t, `{"ok":true}`, *entry.ResponseBody)
+		require.Equal(t, "/search?q=private", entry.Path)
+	})
+	t.Run("virtual key turns it off after the request was captured", func(t *testing.T) {
+		entry := run(t, policyTestPlugin(nil, nil, false), boolPtr(true))
+		require.True(t, entry.ContentHidden, "the row says it carries no content")
+		require.Nil(t, entry.RequestBody)
+		require.Nil(t, entry.ResponseBody)
+		require.Equal(t, "/search", entry.Path, "query values are caller content")
+		require.Equal(t, 200, entry.StatusCode, "metadata is still recorded")
+	})
+	t.Run("virtual key turns it back on when the plugin has it off", func(t *testing.T) {
+		entry := run(t, policyTestPlugin(boolPtr(true), nil, false), boolPtr(false))
+		require.False(t, entry.ContentHidden)
+		require.Equal(t, `{"query":"x"}`, *entry.RequestBody)
+	})
+	t.Run("retention in object storage keeps the bodies hidden for offload", func(t *testing.T) {
+		entry := run(t, policyTestPlugin(boolPtr(true), boolPtr(true), true), nil)
+		require.True(t, entry.ContentHidden, "the row is never revealed")
+		require.Equal(t, `{"query":"x"}`, *entry.RequestBody, "the hybrid store offloads the bodies and keeps none on the row")
+		require.Equal(t, `{"ok":true}`, *entry.ResponseBody)
+		require.Equal(t, "/search", entry.Path, "query values are caller content")
+	})
+	t.Run("retention without object storage keeps nothing", func(t *testing.T) {
+		entry := run(t, policyTestPlugin(boolPtr(true), boolPtr(true), false), nil)
+		require.True(t, entry.ContentHidden)
+		require.Nil(t, entry.RequestBody)
+		require.Nil(t, entry.ResponseBody)
+	})
+}
+
+// TestTextBodyKeepsTextCutMidRune pins that a text body whose capture ended inside a multi-byte
+// character (a stream cut at the capture bound, or a caller that disconnected) keeps the text before
+// that character, while a binary body is still dropped.
+func TestTextBodyKeepsTextCutMidRune(t *testing.T) {
+	cut := append([]byte("data: héllo wörld "), []byte("é")[:1]...)
+	got := textBody(cut)
+	require.NotNil(t, got, "a text capture cut mid-character is kept")
+	require.Equal(t, "data: héllo wörld ", *got)
+	require.Nil(t, textBody([]byte{0xff, 0xfb, 0x90, 0x00, 0xc3}), "a binary body is not kept")
+	whole := textBody([]byte(`{"ok":true}`))
+	require.NotNil(t, whole)
+	require.Equal(t, `{"ok":true}`, *whole)
+}
+
+// TestRelayLogKeepsWholeBody pins that a relay row keeps each text body in full, as LLM, MCP and
+// A2A rows do, and drops only a binary body.
+func TestRelayLogKeepsWholeBody(t *testing.T) {
+	plugin := policyTestPlugin(nil, nil, false)
+	plugin.writeQueue = make(chan *writeQueueEntry, 1)
+	ctx := policyCtx(false, nil)
+	ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-whole-body")
+	request := `{"text":"` + strings.Repeat("a", 100*1024) + `"}`
+	_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{
+		RelayName: "tts", Method: "POST", Path: "/speak", Headers: map[string]string{"content-type": "application/json"}, Body: []byte(request),
+	})
+	require.NoError(t, err)
+	_, _, err = plugin.PostRelayHook(ctx, &schemas.BifrostRelayResponse{StatusCode: 200, Headers: map[string]string{"content-type": "audio/mpeg"}, Body: []byte{0xff, 0xfb, 0x90, 0x00, 0xc3}}, nil)
+	require.NoError(t, err)
+	entry := (<-plugin.writeQueue).endpointLog
+	require.NotNil(t, entry.RequestBody)
+	require.Equal(t, len(request), len(*entry.RequestBody), "a text body over 64 KB is kept whole")
+	require.Nil(t, entry.ResponseBody, "a binary body is not kept")
+}
+
+// A streamed relay reply has no body to log until core/relay buffers it as it forwards bytes, so
+// PreRelayHook stamps the resolved content policy onto the context as a plain bool
+// (BifrostContextKeyRelayContentLoggingEnabledByDefault) for core/relay to read before it opens
+// the stream, the same shape bifrost.go uses for BifrostContextKeyShouldStoreRawInLogs on the LLM path.
+func TestRelayLogStampsContentCaptureSignal(t *testing.T) {
+	t.Run("on by default", func(t *testing.T) {
+		plugin := policyTestPlugin(nil, nil, false)
+		plugin.writeQueue = make(chan *writeQueueEntry, 1)
+		ctx := policyCtx(false, nil)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-capture-on")
+		_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search"})
+		require.NoError(t, err)
+		capture, _ := ctx.Value(schemas.BifrostContextKeyRelayContentLoggingEnabledByDefault).(bool)
+		require.True(t, capture)
+	})
+	t.Run("off when the plugin disables content logging", func(t *testing.T) {
+		plugin := policyTestPlugin(boolPtr(true), nil, false)
+		plugin.writeQueue = make(chan *writeQueueEntry, 1)
+		ctx := policyCtx(false, nil)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-capture-off")
+		_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search"})
+		require.NoError(t, err)
+		capture, _ := ctx.Value(schemas.BifrostContextKeyRelayContentLoggingEnabledByDefault).(bool)
+		require.False(t, capture)
+	})
+	for _, tc := range []struct {
+		name                 string
+		retain               *bool
+		objectStorageEnabled bool
+		want                 bool
+	}{
+		{"retention with object storage keeps hidden content", boolPtr(true), true, true},
+		{"retention without object storage keeps nothing", boolPtr(true), false, false},
+		{"no retention keeps nothing", nil, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			plugin := policyTestPlugin(boolPtr(true), tc.retain, tc.objectStorageEnabled)
+			plugin.writeQueue = make(chan *writeQueueEntry, 1)
+			ctx := policyCtx(false, nil)
+			ctx.SetValue(schemas.BifrostContextKeyRequestID, "req-capture-retained")
+			_, _, err := plugin.PreRelayHook(ctx, &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search"})
+			require.NoError(t, err)
+			retained, _ := ctx.Value(schemas.BifrostContextKeyRelayContentRetainedWhenDisabled).(bool)
+			require.Equal(t, tc.want, retained)
+		})
+	}
+}
+
+// BenchmarkRelayLogHooks measures the logging cost of one relay call on the request path: the
+// pre-hook capture and the post-hook that completes and queues the row.
+func BenchmarkRelayLogHooks(b *testing.B) {
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.writeQueue = make(chan *writeQueueEntry, 1024)
+	done := make(chan struct{})
+	go func() {
+		for range plugin.writeQueue {
+		}
+		close(done)
+	}()
+	req := &schemas.BifrostRelayRequest{RelayName: "tavily", Method: "POST", Path: "/search", RoutePath: "/search", Billable: true,
+		Headers: map[string]string{"content-type": "application/json"}, Body: []byte(`{"query":"x"}`)}
+	resp := &schemas.BifrostRelayResponse{RelayName: "tavily", StatusCode: 200, Latency: 120, UpstreamLatency: 100, BytesOut: 42, Body: []byte(`{"usage":{"credits":4}}`),
+		Usage: &schemas.RelayUsage{Cost: 0.033, CostPerRequest: 0.001, CostPerUnit: 0.008, Units: schemas.Ptr(4.0), BilledUnits: schemas.Ptr(4.0)}}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		ctx := policyCtx(false, nil)
+		ctx.SetValue(schemas.BifrostContextKeyRequestID, "bench")
+		if _, _, err := plugin.PreRelayHook(ctx, req); err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err := plugin.PostRelayHook(ctx, resp, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+	b.StopTimer()
+	close(plugin.writeQueue)
+	<-done
+}
+
+func TestRelayLogQueryRedaction(t *testing.T) {
+	got := redactQuery("q=private-search&api_key=sk-123&access_token=tok&page=2&Signature=abc&flag")
+	require.NotContains(t, got, "sk-123")
+	require.NotContains(t, got, "tok&")
+	require.NotContains(t, got, "abc")
+	require.Contains(t, got, "q=private-search", "ordinary parameters are kept")
+	require.Contains(t, got, "page=2")
+	require.True(t, strings.HasSuffix(got, "&flag"), "a parameter without a value is kept as is")
+}
+
+func TestRelayJobRowDedupesIdempotentStarts(t *testing.T) {
+	store := &endpointJobStore{jobs: map[string]*cstables.TableProviderJob{}}
+	plugin := policyTestPlugin(nil, nil, true)
+	plugin.batchStore = store
+	job := &schemas.RelayJobHandle{ID: "j-1", IntervalSeconds: 30, Params: `{"job":{}}`}
+
+	first := &logstore.RelayLog{ID: "req-1", RequestID: "req-1", RelayName: "textract", BudgetIDsParsed: []string{"budget-1"}}
+	plugin.recordEndpointJob(first, job)
+	require.Len(t, store.jobs, 1)
+	var row *cstables.TableProviderJob
+	for _, r := range store.jobs {
+		row = r
+	}
+	require.Equal(t, "textract", row.Provider)
+	require.Equal(t, cstables.ProviderJobKindRelay, row.Kind)
+	require.Equal(t, "j-1", schemas.RelayUpstreamJobID(row.JobID))
+	require.Equal(t, `["budget-1"]`, *row.BudgetIDs)
+	require.Equal(t, "req-1", *row.SourceLogID)
+
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-2", RequestID: "req-2", RelayName: "textract"}, job)
+	require.Len(t, store.jobs, 1, "a retried start while the job is open records nothing new")
+
+	row.AccountingStatus = cstables.ProviderJobAccountingStatusAccounted
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-3", RequestID: "req-3", RelayName: "textract"}, job)
+	require.Len(t, store.jobs, 2, "an id reused after settlement is a new job")
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-4", RequestID: "req-4", RelayName: "textract"}, job)
+	require.Len(t, store.jobs, 2, "a retried start of the reused job dedupes against its slot")
+
+	store.fail = errors.New("database is down")
+	plugin.recordEndpointJob(&logstore.RelayLog{ID: "req-5", RequestID: "req-5", RelayName: "textract"}, &schemas.RelayJobHandle{ID: "j-2", Params: `{"job":{}}`})
+	require.Len(t, store.jobs, 2, "a lookup error records nothing rather than risk a duplicate row")
+}
