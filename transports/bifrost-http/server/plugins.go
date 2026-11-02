@@ -9,6 +9,7 @@ import (
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/plugins/compat"
 	"github.com/maximhq/bifrost/plugins/governance"
+	"github.com/maximhq/bifrost/plugins/halflife"
 	"github.com/maximhq/bifrost/plugins/logging"
 	"github.com/maximhq/bifrost/plugins/maxim"
 	"github.com/maximhq/bifrost/plugins/modelcatalogresolver"
@@ -192,6 +193,13 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 	case modelcatalogresolver.PluginName:
 		return modelcatalogresolver.Init(bifrostConfig.ModelCatalog, logger)
 
+	case halflife.PluginName:
+		halflifeConfig, err := MarshalPluginConfig[halflife.Config](pluginConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal halflife plugin config: %w", err)
+		}
+		return halflife.Init(ctx, halflifeConfig, logger)
+
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)
 	}
@@ -358,6 +366,17 @@ func (s *BifrostHTTPServer) loadBuiltinPlugins(ctx context.Context) error {
 	// including post_builtin ones like the enterprise load balancer (which would otherwise run
 	// after this builtin and never get a chance to pick the provider first).
 	s.Config.SetPluginOrderInfo(modelcatalogresolver.PluginName, schemas.Ptr(schemas.PluginPlacementPostBuiltin), schemas.Ptr(math.MaxInt))
+
+	// 11. Halflife (if configured in PluginConfigs). Placed first overall: post-hooks run in
+	// reverse, so its PostLLMHook and HTTPTransportPostHook run last and see exactly what the
+	// client receives, including semantic cache hits that short-circuit later plugins.
+	halflifeConfig := s.getPluginConfig(halflife.PluginName)
+	if halflifeConfig != nil && halflifeConfig.Enabled {
+		s.registerPluginWithStatus(ctx, halflife.PluginName, nil, halflifeConfig.Config, false)
+	} else {
+		s.markPluginDisabled(halflife.PluginName)
+	}
+	s.Config.SetPluginOrderInfo(halflife.PluginName, schemas.Ptr(schemas.PluginPlacementPreBuiltin), schemas.Ptr(math.MinInt))
 
 	return nil
 }

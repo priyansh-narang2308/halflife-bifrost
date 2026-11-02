@@ -20,6 +20,7 @@ require (
 	github.com/maximhq/bifrost/framework v1.11.1
 	github.com/maximhq/bifrost/plugins/compat v0.5.3
 	github.com/maximhq/bifrost/plugins/governance v1.11.1
+	github.com/maximhq/bifrost/plugins/halflife v0.1.0
 	github.com/maximhq/bifrost/plugins/logging v1.11.1
 	github.com/maximhq/bifrost/plugins/maxim v1.7.14
 	github.com/maximhq/bifrost/plugins/modelcatalogresolver v1.1.14
@@ -239,3 +240,5 @@ require (
 	gorm.io/driver/clickhouse v0.7.0 // indirect
 	gorm.io/driver/postgres v1.6.0 // indirect
 )
+
+replace github.com/maximhq/bifrost/plugins/halflife => ../plugins/halflife
