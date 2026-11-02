@@ -25,8 +25,10 @@ const PluginName = "halflife"
 
 // Response headers. HeaderReport carries the report ID on every captured
 // response. HeaderStatus says on every response whether its answer will be
-// audited: "queued", or "not-audited; reason=<reason>" (failed, streaming,
-// unsupported, verifier or queue-full).
+// audited: "queued" (a new report), "cached" (served from the semantic cache;
+// the report is that of the answer that filled the entry), or
+// "not-audited; reason=<reason>" (failed, streaming, unsupported, verifier or
+// queue-full).
 const (
 	HeaderReport = "X-Halflife-Report"
 	HeaderStatus = "X-Halflife-Status"
@@ -53,13 +55,16 @@ type Plugin struct {
 	// sink receives each finalized capture and reports whether it was
 	// accepted for audit. It runs on the request path, so it must not block.
 	sink func(*Capture) bool
+	// links resolves cache hits to the report of the answer they replay.
+	links *cacheLinks
 
-	captured, skippedFailed, skippedStreaming, skippedUnsupported, skippedVerifier atomic.Uint64
+	cachedHits, captured, skippedFailed, skippedStreaming, skippedUnsupported, skippedVerifier atomic.Uint64
 }
 
 // Stats counts finalized requests by outcome.
 type Stats struct {
-	Captured           uint64
+	Captured           uint64 // new reports
+	CachedHits         uint64 // cache hits resolved to an existing report
 	SkippedFailed      uint64
 	SkippedStreaming   uint64
 	SkippedUnsupported uint64
@@ -92,7 +97,7 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if logger == nil {
 		logger = bifrost.NewNoOpLogger()
 	}
-	p := &Plugin{config: cfg, logger: logger}
+	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks)}
 	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.auditPlaceholder)
 	p.sink = p.pool.submit
 	verifier := cfg.VerifierVirtualKey
@@ -111,6 +116,7 @@ func (p *Plugin) PoolStats() PoolStats { return p.pool.stats() }
 func (p *Plugin) Stats() Stats {
 	return Stats{
 		Captured:           p.captured.Load(),
+		CachedHits:         p.cachedHits.Load(),
 		SkippedFailed:      p.skippedFailed.Load(),
 		SkippedStreaming:   p.skippedStreaming.Load(),
 		SkippedUnsupported: p.skippedUnsupported.Load(),
@@ -211,7 +217,7 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 	if s == nil || resp == nil {
 		return nil
 	}
-	c, reason, ok := s.finalize(resp.StatusCode, newReportID)
+	c, reason, ok := s.finalize(resp.StatusCode)
 	if !ok {
 		return nil
 	}
@@ -221,13 +227,28 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		if c.RequestID == "" {
 			c.RequestID = strings.Clone(headerValue(resp.Headers, "X-Bifrost-Request-Id"))
 		}
+		if p.resolveCachedHit(s, c) {
+			return nil
+		}
+		c.ReportID = newReportID()
+		s.setReport(c.ReportID, false)
 		p.captured.Add(1)
 		p.logger.Debug("halflife: captured %s answer from %s/%s (%d bytes, fallback=%t) report=%s request=%s vk=%s",
 			c.RequestType, c.Provider, c.Model, len(c.Answer), c.IsFallback, c.ReportID, c.RequestID, c.VirtualKeyID)
+		// Link before queueing: once queued, the audit may finish (and act
+		// on the entry) before this hook returns.
+		linked := c.CacheID != "" && p.links.add(c.CacheID, c.ReportID, c.VirtualKeyID)
 		if !p.sink(c) {
 			// No report will exist, so the client gets no report header.
 			s.drop()
+			if linked {
+				p.links.remove(c.CacheID)
+			}
 			p.logger.Warn("halflife: audit queue full, report %s dropped", c.ReportID)
+			return nil
+		}
+		if linked {
+			p.logger.Debug("halflife: report %s covers cache entry %s", c.ReportID, c.CacheID)
 		}
 	case SkipFailed:
 		p.skippedFailed.Add(1)
@@ -241,6 +262,28 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		p.logger.Debug("halflife: verifier request not audited")
 	}
 	return nil
+}
+
+// resolveCachedHit handles an answer served from the semantic cache whose
+// entry Halflife already has a report for: the request gets that report and
+// no new audit. It reports whether it did. A hit is audited as a new answer
+// when its entry has no report (filled before this process started, or its
+// report was dropped) or when the report belongs to another tenant, which
+// only happens with the cache's identity scoping turned off: one tenant must
+// never be pointed at another tenant's report.
+func (p *Plugin) resolveCachedHit(s *slot, c *Capture) bool {
+	if !c.CacheHit || c.CacheID == "" {
+		return false
+	}
+	link, ok := p.links.get(c.CacheID)
+	if !ok || link.tenant != c.VirtualKeyID {
+		return false
+	}
+	s.setReport(link.reportID, true)
+	p.cachedHits.Add(1)
+	p.logger.Debug("halflife: %s cache hit on entry %s, report=%s request=%s vk=%s",
+		c.CacheHitType, c.CacheID, link.reportID, c.RequestID, c.VirtualKeyID)
+	return true
 }
 
 // HTTPTransportResponseHeadersHook tells the client whether its answer will

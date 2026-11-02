@@ -36,6 +36,13 @@ type Capture struct {
 	Question       string                // last user message of the request
 	Answer         string                // assistant text of the first choice
 	Truncated      bool                  // Question or Answer was cut to its size cap
+
+	// The semantic cache entry behind this answer, when the semantic_cache
+	// plugin looked the request up: on a miss, the entry the answer is
+	// written to; on a hit, the entry it was served from.
+	CacheID      string
+	CacheHit     bool
+	CacheHitType string // "direct" or "semantic" on a hit
 }
 
 // SkipReason says why a request produced no Capture.
@@ -89,7 +96,8 @@ type slot struct {
 	pending   *Capture
 	reason    SkipReason
 	finalized bool
-	reportID  string // set when the request is captured; read by the response-headers hook
+	reportID  string // the answer's report; read by the response-headers hook
+	cached    bool   // reportID belongs to the answer that filled the cache entry served here
 	dropped   bool   // captured, but the audit queue was full
 }
 
@@ -118,9 +126,8 @@ func (s *slot) record(c *Capture, reason SkipReason) {
 }
 
 // finalize returns the request's outcome exactly once; ok is false for every
-// later call. A capture is given a report ID from newID, which the
-// response-headers hook then reads via report.
-func (s *slot) finalize(statusCode int, newID func() string) (c *Capture, reason SkipReason, ok bool) {
+// later call. The caller then attaches a report with setReport, or drop.
+func (s *slot) finalize(statusCode int) (c *Capture, reason SkipReason, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.finalized {
@@ -137,10 +144,16 @@ func (s *slot) finalize(statusCode int, newID func() string) (c *Capture, reason
 	c = s.pending
 	c.Question = s.question
 	c.Truncated = c.Truncated || s.truncated
-	c.ReportID = newID()
-	s.reportID = c.ReportID
 	s.pending = nil
 	return c, SkipNone, true
+}
+
+// setReport records the report the response-headers hook announces. cached
+// says it is the report of an earlier answer, served again from the cache.
+func (s *slot) setReport(id string, cached bool) {
+	s.mu.Lock()
+	s.reportID, s.cached = id, cached
+	s.mu.Unlock()
 }
 
 // drop withdraws the report ID when the capture could not be queued.
@@ -157,13 +170,16 @@ func (s *slot) report() string {
 	return s.reportID
 }
 
-// status returns the X-Halflife-Status value: "queued" with a report, or
-// "not-audited; reason=<reason>". It is "" while the outcome is still open,
+// status returns the X-Halflife-Status value: "queued" with a new report,
+// "cached" with the report of the answer that filled the cache entry served,
+// or "not-audited; reason=<reason>". It is "" while the outcome is still open,
 // which is the case for a stream whose post-hooks have not run yet.
 func (s *slot) status() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
+	case s.reportID != "" && s.cached:
+		return statusCached
 	case s.reportID != "":
 		return statusQueued
 	case s.dropped:
@@ -177,6 +193,7 @@ func (s *slot) status() string {
 // Values of the X-Halflife-Status header.
 const (
 	statusQueued     = "queued"
+	statusCached     = "cached"
 	statusNotAudited = "not-audited; reason="
 )
 
@@ -217,7 +234,7 @@ func captureFromResponse(resp *schemas.BifrostResponse) (*Capture, SkipReason) {
 	}
 	answer, truncated := clip(text, maxAnswerBytes)
 	ri := extras.RoutingInfo
-	return &Capture{
+	c := &Capture{
 		RequestType:    extras.RequestType,
 		Provider:       ri.Provider,
 		Model:          strings.Clone(ri.Model),
@@ -225,7 +242,17 @@ func captureFromResponse(resp *schemas.BifrostResponse) (*Capture, SkipReason) {
 		IsFallback:     ri.IsFallback,
 		Answer:         answer,
 		Truncated:      truncated,
-	}, SkipNone
+	}
+	// The semantic cache stamps this in its own hooks, which run before
+	// Halflife's PostLLMHook.
+	if cd := extras.CacheDebug; cd != nil && cd.CacheID != nil {
+		c.CacheID = strings.Clone(*cd.CacheID)
+		c.CacheHit = cd.CacheHit
+		if cd.HitType != nil {
+			c.CacheHitType = strings.Clone(*cd.HitType)
+		}
+	}
+	return c, SkipNone
 }
 
 func chatAnswer(r *schemas.BifrostChatResponse) (string, bool) {
