@@ -3,6 +3,7 @@ package halflife
 import (
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/maximhq/bifrost/core/schemas"
@@ -18,6 +19,15 @@ const (
 // Capture is one completed answer, copied out of the gateway's pooled objects
 // so it stays valid after the request has been served.
 type Capture struct {
+	ReportID   string    // Halflife's ID for the audit report, sent to the client as X-Halflife-Report
+	RequestID  string    // the gateway's request ID (X-Bifrost-Request-Id), linking the report to Bifrost's logs
+	CapturedAt time.Time // when the request finished
+
+	// The governance virtual key that made the request: the tenant. Its ID and
+	// name only, never the key's secret value (the x-bf-vk header).
+	VirtualKeyID   string
+	VirtualKeyName string
+
 	RequestType    schemas.RequestType
 	Provider       schemas.ModelProvider // provider that served the answer
 	Model          string                // model that served the answer
@@ -58,6 +68,7 @@ type slot struct {
 	pending   *Capture
 	reason    SkipReason
 	finalized bool
+	reportID  string // set when the request is captured; read by the response-headers hook
 }
 
 func slotFrom(ctx *schemas.BifrostContext) *slot {
@@ -84,9 +95,10 @@ func (s *slot) record(c *Capture, reason SkipReason) {
 	s.pending, s.reason = c, reason
 }
 
-// finalize returns the request's capture exactly once. ok is false for every
-// later call, and when the request ended without an auditable answer.
-func (s *slot) finalize(statusCode int) (c *Capture, reason SkipReason, ok bool) {
+// finalize returns the request's outcome exactly once; ok is false for every
+// later call. A capture is given a report ID from newID, which the
+// response-headers hook then reads via report.
+func (s *slot) finalize(statusCode int, newID func() string) (c *Capture, reason SkipReason, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.finalized {
@@ -102,8 +114,31 @@ func (s *slot) finalize(statusCode int) (c *Capture, reason SkipReason, ok bool)
 	c = s.pending
 	c.Question = s.question
 	c.Truncated = c.Truncated || s.truncated
+	c.ReportID = newID()
+	s.reportID = c.ReportID
 	s.pending = nil
 	return c, SkipNone, true
+}
+
+// report returns the report ID, or "" when the request was not captured.
+func (s *slot) report() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reportID
+}
+
+// identify records who made the request and which gateway request it is.
+// Governance's PreLLMHook (which runs after Halflife's) has resolved the
+// virtual key by the time PostLLMHook runs.
+func identify(c *Capture, ctx *schemas.BifrostContext) {
+	c.RequestID = ctxString(ctx, schemas.BifrostContextKeyRequestID)
+	c.VirtualKeyID = ctxString(ctx, schemas.BifrostContextKeyGovernanceVirtualKeyID)
+	c.VirtualKeyName = ctxString(ctx, schemas.BifrostContextKeyGovernanceVirtualKeyName)
+}
+
+func ctxString(ctx *schemas.BifrostContext, key schemas.BifrostContextKey) string {
+	v, _ := ctx.Value(key).(string)
+	return strings.Clone(v)
 }
 
 // captureFromResponse copies the auditable parts of resp. It returns

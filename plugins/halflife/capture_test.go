@@ -2,12 +2,14 @@ package halflife
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 	"unsafe"
 
+	"github.com/google/uuid"
 	"github.com/maximhq/bifrost/core/schemas"
 )
 
@@ -36,6 +38,12 @@ func newRequest(t *testing.T, p *Plugin) *request {
 	for k, v := range r.transport.GetUserValues() {
 		r.core.SetValue(k, v)
 	}
+	// What the transport (request ID, raw key header) and governance
+	// (resolved virtual key) put on the core context.
+	r.core.SetValue(schemas.BifrostContextKeyRequestID, "req-1")
+	r.core.SetValue(schemas.BifrostContextKeyVirtualKey, "sk-bf-secret-value")
+	r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-smoke")
+	r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyName, "Smoke test app")
 	return r
 }
 
@@ -63,13 +71,30 @@ func (r *request) attempt(req *schemas.BifrostRequest, resp *schemas.BifrostResp
 	scoped.ReleasePluginScope()
 }
 
-func (r *request) finish(status int) {
+// finish runs the transport post-hook and then the response-headers hook, in
+// the gateway's order for buffered responses, and returns the final headers.
+func (r *request) finish(status int) map[string]string {
 	r.t.Helper()
 	scoped := r.scoped(r.transport)
 	if err := r.p.HTTPTransportPostHook(scoped, &schemas.HTTPRequest{}, &schemas.HTTPResponse{StatusCode: status}); err != nil {
 		r.t.Fatalf("HTTPTransportPostHook: %v", err)
 	}
 	scoped.ReleasePluginScope()
+	return r.headers(status)
+}
+
+func (r *request) headers(status int) map[string]string {
+	r.t.Helper()
+	meta := &schemas.HTTPResponseMetadata{StatusCode: status, Headers: map[string]string{
+		"Content-Type":                  "application/json",
+		"Access-Control-Expose-Headers": "x-bifrost-request-id, x-request-id",
+	}}
+	scoped := r.scoped(r.transport)
+	if err := r.p.HTTPTransportResponseHeadersHook(scoped, &schemas.HTTPRequest{}, meta); err != nil {
+		r.t.Fatalf("HTTPTransportResponseHeadersHook: %v", err)
+	}
+	scoped.ReleasePluginScope()
+	return meta.Headers
 }
 
 // recordingPlugin returns a plugin whose sink appends to the returned slice.
@@ -123,10 +148,16 @@ func TestCaptureSuccessfulRequest(t *testing.T) {
 		t.Fatalf("captures = %d, want 1", len(*got))
 	}
 	c := (*got)[0]
-	want := Capture{RequestType: schemas.ChatCompletionRequest, Provider: schemas.OpenAI, Model: "ok", RequestedModel: "fail-500",
+	if c.CapturedAt.IsZero() || !strings.HasPrefix(c.ReportID, "hlr_") {
+		t.Errorf("identity not assigned: report=%q at=%v", c.ReportID, c.CapturedAt)
+	}
+	generated := *c
+	generated.ReportID, generated.CapturedAt = "", time.Time{}
+	want := Capture{RequestID: "req-1", VirtualKeyID: "vk-smoke", VirtualKeyName: "Smoke test app",
+		RequestType: schemas.ChatCompletionRequest, Provider: schemas.OpenAI, Model: "ok", RequestedModel: "fail-500",
 		Question: "How much is Acme Pro?", Answer: "Acme Pro costs $20."}
-	if *c != want {
-		t.Errorf("capture = %+v\nwant      %+v", *c, want)
+	if generated != want {
+		t.Errorf("capture = %+v\nwant      %+v", generated, want)
 	}
 	if s := p.Stats(); s != (Stats{Captured: 1}) {
 		t.Errorf("stats = %+v", s)
@@ -351,5 +382,99 @@ func TestConcurrentRequestsAreIsolated(t *testing.T) {
 		if qi != ai || c.IsFallback != (qi%3 == 0) {
 			t.Errorf("mixed capture: %+v", c)
 		}
+	}
+}
+
+func TestReportHeader(t *testing.T) {
+	p, got := recordingPlugin(t)
+	r := newRequest(t, p)
+	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+	h := r.finish(200)
+	id := (*got)[0].ReportID
+	if h[HeaderReport] != id {
+		t.Errorf("%s = %q, want %q", HeaderReport, h[HeaderReport], id)
+	}
+	if h["Access-Control-Expose-Headers"] != "x-bifrost-request-id, x-request-id, x-halflife-report" {
+		t.Errorf("expose = %q", h["Access-Control-Expose-Headers"])
+	}
+	if h := r.headers(200); h["Access-Control-Expose-Headers"] != "x-bifrost-request-id, x-request-id, x-halflife-report" {
+		t.Errorf("header hook run twice: expose = %q", h["Access-Control-Expose-Headers"])
+	}
+
+	// No report, no header: failed, streaming, unsupported, and no slot.
+	for name, run := range map[string]func(r *request){
+		"failed":      func(r *request) { r.attempt(chatReq("q"), nil, errAttempt) },
+		"unsupported": func(r *request) { r.attempt(chatReq("q"), &schemas.BifrostResponse{}, nil) },
+		"streaming": func(r *request) {
+			r.core.SetValue(schemas.BifrostContextKeyStreamStartTime, time.Now())
+			r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+		},
+	} {
+		r := newRequest(t, p)
+		run(r)
+		if h := r.finish(200); h[HeaderReport] != "" || len(h) != 2 {
+			t.Errorf("%s: headers = %v", name, h)
+		}
+	}
+	meta := &schemas.HTTPResponseMetadata{StatusCode: 200, Headers: map[string]string{}}
+	if err := p.HTTPTransportResponseHeadersHook(newCtx(), nil, meta); err != nil || len(meta.Headers) != 0 {
+		t.Errorf("no slot: %v %v", err, meta.Headers)
+	}
+}
+
+// For streaming, the gateway runs the headers hook before the stream's
+// post-hooks, so there is nothing to report yet.
+func TestReportHeaderBeforeFinalize(t *testing.T) {
+	p, _ := recordingPlugin(t)
+	r := newRequest(t, p)
+	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+	if h := r.headers(200); h[HeaderReport] != "" {
+		t.Errorf("header set before finalize: %v", h)
+	}
+}
+
+func TestRequestIDFallsBackToResponseHeader(t *testing.T) {
+	p, got := recordingPlugin(t)
+	r := newRequest(t, p)
+	r.core.ClearValue(schemas.BifrostContextKeyRequestID)
+	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+	scoped := r.scoped(r.transport)
+	resp := &schemas.HTTPResponse{StatusCode: 200, Headers: map[string]string{"x-bifrost-request-id": "from-header"}}
+	if err := p.HTTPTransportPostHook(scoped, &schemas.HTTPRequest{}, resp); err != nil {
+		t.Fatal(err)
+	}
+	if (*got)[0].RequestID != "from-header" {
+		t.Errorf("request id = %q", (*got)[0].RequestID)
+	}
+}
+
+// The x-bf-vk header value is a credential; only the resolved key's ID and
+// name may be recorded.
+func TestVirtualKeySecretNeverRecorded(t *testing.T) {
+	p, got := recordingPlugin(t)
+	r := newRequest(t, p)
+	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+	r.finish(200)
+	if dump := fmt.Sprintf("%+v", *(*got)[0]); strings.Contains(dump, "sk-bf-secret-value") {
+		t.Errorf("capture contains the virtual key secret: %s", dump)
+	}
+}
+
+func TestReportIDsUniqueAndTimeOrdered(t *testing.T) {
+	const n = 10000
+	ids := make([]string, n)
+	seen := make(map[string]bool, n)
+	for i := range ids {
+		ids[i] = newReportID()
+		if seen[ids[i]] {
+			t.Fatalf("duplicate id %s", ids[i])
+		}
+		seen[ids[i]] = true
+	}
+	if !slices.IsSorted(ids) {
+		t.Error("ids are not in creation order")
+	}
+	if u, err := uuid.Parse(strings.TrimPrefix(ids[0], "hlr_")); err != nil || u.Version() != 7 {
+		t.Errorf("id %s: %v, version %d", ids[0], err, u.Version())
 	}
 }

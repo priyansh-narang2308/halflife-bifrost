@@ -9,7 +9,11 @@ package halflife
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
+	"time"
+
+	"github.com/google/uuid"
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
@@ -17,6 +21,18 @@ import (
 
 // PluginName is the name the gateway registers and configures the plugin by.
 const PluginName = "halflife"
+
+// HeaderReport carries the report ID on every captured response.
+const HeaderReport = "X-Halflife-Report"
+
+// newReportID returns a time-ordered ID (UUIDv7), so reports sort by creation.
+func newReportID() string {
+	id, err := uuid.NewV7()
+	if err != nil { // only if the system clock or entropy source fails
+		id = uuid.New()
+	}
+	return "hlr_" + id.String()
+}
 
 // Plugin implements schemas.LLMPlugin and schemas.HTTPTransportPlugin.
 // It is registered once per process; per-request state lives in a slot on the
@@ -121,6 +137,9 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 		s.record(nil, SkipFailed)
 	default:
 		c, reason := captureFromResponse(resp)
+		if c != nil {
+			identify(c, ctx)
+		}
 		// Core layers IsFallback onto RoutingInfo only after post-hooks run, so
 		// read the attempt's fallback index instead (0 = primary).
 		if idx, _ := ctx.Value(schemas.BifrostContextKeyFallbackIndex).(int); c != nil && idx > 0 {
@@ -151,15 +170,19 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 	if s == nil || resp == nil {
 		return nil
 	}
-	c, reason, ok := s.finalize(resp.StatusCode)
+	c, reason, ok := s.finalize(resp.StatusCode, newReportID)
 	if !ok {
 		return nil
 	}
 	switch reason {
 	case SkipNone:
+		c.CapturedAt = time.Now().UTC()
+		if c.RequestID == "" {
+			c.RequestID = strings.Clone(headerValue(resp.Headers, "X-Bifrost-Request-Id"))
+		}
 		p.captured.Add(1)
-		p.logger.Debug("halflife: captured %s answer from %s/%s (%d bytes, fallback=%t)",
-			c.RequestType, c.Provider, c.Model, len(c.Answer), c.IsFallback)
+		p.logger.Debug("halflife: captured %s answer from %s/%s (%d bytes, fallback=%t) report=%s request=%s vk=%s",
+			c.RequestType, c.Provider, c.Model, len(c.Answer), c.IsFallback, c.ReportID, c.RequestID, c.VirtualKeyID)
 		p.sink(c)
 	case SkipFailed:
 		p.skippedFailed.Add(1)
@@ -172,8 +195,43 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 	return nil
 }
 
-func (p *Plugin) HTTPTransportResponseHeadersHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponseMetadata) error {
+// HTTPTransportResponseHeadersHook tells the client where the audit report
+// for this answer will be. For buffered responses the gateway runs it after
+// HTTPTransportPostHook, so the capture decision has been made. Streaming
+// responses get no header: they are not captured.
+func (p *Plugin) HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
+	s := slotFrom(ctx)
+	if s == nil || resp == nil || resp.Headers == nil {
+		return nil
+	}
+	id := s.report()
+	if id == "" {
+		return nil
+	}
+	resp.Headers[HeaderReport] = id
+	// Let browser clients (such as the dashboard) read the header cross-origin.
+	if key, v, found := headerEntry(resp.Headers, "Access-Control-Expose-Headers"); found && !strings.Contains(strings.ToLower(v), strings.ToLower(HeaderReport)) {
+		resp.Headers[key] = v + ", " + strings.ToLower(HeaderReport)
+	}
 	return nil
+}
+
+// headerEntry finds a header case-insensitively and returns its stored key.
+func headerEntry(h map[string]string, name string) (key, value string, found bool) {
+	if v, ok := h[name]; ok {
+		return name, v, true
+	}
+	for k, v := range h {
+		if strings.EqualFold(k, name) {
+			return k, v, true
+		}
+	}
+	return "", "", false
+}
+
+func headerValue(h map[string]string, name string) string {
+	_, v, _ := headerEntry(h, name)
+	return v
 }
 
 func (p *Plugin) HTTPTransportStreamChunkHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, chunk *schemas.BifrostStreamChunk) (*schemas.BifrostStreamChunk, error) {

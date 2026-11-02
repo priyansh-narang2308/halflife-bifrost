@@ -2,7 +2,10 @@ module github.com/maximhq/bifrost/plugins/halflife
 
 go 1.27.3
 
-require github.com/maximhq/bifrost/core v1.14.1
+require (
+	github.com/google/uuid v1.6.0
+	github.com/maximhq/bifrost/core v1.14.1
+)
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -40,7 +43,6 @@ require (
 	github.com/fasthttp/websocket v1.5.12 // indirect
 	github.com/golang-jwt/jwt/v5 v5.3.1 // indirect
 	github.com/google/jsonschema-go v0.4.2 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/klauspost/compress v1.20.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
