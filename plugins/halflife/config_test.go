@@ -7,13 +7,13 @@ import (
 )
 
 func TestConfigDefaults(t *testing.T) {
-	got := Config{TavilyRelay: "  "}.withDefaults()
+	got := Config{TavilyRelay: "  ", VerifierVirtualKey: " \t"}.withDefaults()
 	want := Config{QueueSize: DefaultQueueSize, Workers: DefaultWorkers, MaxClaimsPerResponse: DefaultMaxClaimsPerResponse, TavilyRelay: DefaultTavilyRelay,
 		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds}
 	if got != want {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
-	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2}
+	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier"}
 	if got := set.withDefaults(); got != set {
 		t.Errorf("withDefaults() changed explicit values: %+v", got)
 	}
@@ -49,11 +49,11 @@ func TestConfigValidate(t *testing.T) {
 // The gateway hands plugin config over as JSON from config.json.
 func TestConfigJSON(t *testing.T) {
 	var c Config
-	raw := `{"queue_size":32,"workers":4,"max_claims_per_response":7,"tavily_relay":"tv","audit_timeout_seconds":30,"drain_timeout_seconds":3}`
+	raw := `{"queue_size":32,"workers":4,"max_claims_per_response":7,"tavily_relay":"tv","audit_timeout_seconds":30,"drain_timeout_seconds":3,"verifier_virtual_key":"vk-v"}`
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		t.Fatal(err)
 	}
-	if c != (Config{QueueSize: 32, Workers: 4, MaxClaimsPerResponse: 7, TavilyRelay: "tv", AuditTimeoutSeconds: 30, DrainTimeoutSeconds: 3}) {
+	if c != (Config{QueueSize: 32, Workers: 4, MaxClaimsPerResponse: 7, TavilyRelay: "tv", AuditTimeoutSeconds: 30, DrainTimeoutSeconds: 3, VerifierVirtualKey: "vk-v"}) {
 		t.Errorf("decoded %+v", c)
 	}
 	out, _ := json.Marshal(Config{})

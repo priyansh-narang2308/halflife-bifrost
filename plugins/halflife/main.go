@@ -23,8 +23,14 @@ import (
 // PluginName is the name the gateway registers and configures the plugin by.
 const PluginName = "halflife"
 
-// HeaderReport carries the report ID on every captured response.
-const HeaderReport = "X-Halflife-Report"
+// Response headers. HeaderReport carries the report ID on every captured
+// response. HeaderStatus says on every response whether its answer will be
+// audited: "queued", or "not-audited; reason=<reason>" (failed, streaming,
+// unsupported, verifier or queue-full).
+const (
+	HeaderReport = "X-Halflife-Report"
+	HeaderStatus = "X-Halflife-Status"
+)
 
 // newReportID returns a time-ordered ID (UUIDv7), so reports sort by creation.
 func newReportID() string {
@@ -48,7 +54,7 @@ type Plugin struct {
 	// accepted for audit. It runs on the request path, so it must not block.
 	sink func(*Capture) bool
 
-	captured, skippedFailed, skippedStreaming, skippedUnsupported atomic.Uint64
+	captured, skippedFailed, skippedStreaming, skippedUnsupported, skippedVerifier atomic.Uint64
 }
 
 // Stats counts finalized requests by outcome.
@@ -57,6 +63,7 @@ type Stats struct {
 	SkippedFailed      uint64
 	SkippedStreaming   uint64
 	SkippedUnsupported uint64
+	SkippedVerifier    uint64
 }
 
 // auditPlaceholder stands in for the verifier until it exists: it only marks
@@ -88,8 +95,12 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	p := &Plugin{config: cfg, logger: logger}
 	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.auditPlaceholder)
 	p.sink = p.pool.submit
-	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s)",
-		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay)
+	verifier := cfg.VerifierVirtualKey
+	if verifier == "" {
+		verifier = "none"
+	}
+	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s)",
+		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier)
 	return p, nil
 }
 
@@ -103,6 +114,7 @@ func (p *Plugin) Stats() Stats {
 		SkippedFailed:      p.skippedFailed.Load(),
 		SkippedStreaming:   p.skippedStreaming.Load(),
 		SkippedUnsupported: p.skippedUnsupported.Load(),
+		SkippedVerifier:    p.skippedVerifier.Load(),
 	}
 }
 
@@ -149,10 +161,17 @@ func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostReq
 // slot. Halflife runs last among post-hooks, so this is the response the
 // client receives for this attempt. For streams it runs once per chunk; those
 // requests are only marked.
+//
+// Recursion guard: the verifier's own calls through the gateway carry the
+// verifier virtual key and are marked, never captured. Tavily searches go
+// through a Bifrost relay, which never reaches these hooks (Halflife is not a
+// RelayPlugin), and in-process calls that skip the HTTP transport have no slot.
 func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
 	s := slotFrom(ctx)
 	switch {
 	case s == nil:
+	case p.config.VerifierVirtualKey != "" && ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID) == p.config.VerifierVirtualKey:
+		s.record(nil, SkipVerifier)
 	case ctx.Value(schemas.BifrostContextKeyStreamStartTime) != nil:
 		s.record(nil, SkipStreaming)
 	case bifrostErr != nil || resp == nil:
@@ -207,7 +226,7 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 			c.RequestType, c.Provider, c.Model, len(c.Answer), c.IsFallback, c.ReportID, c.RequestID, c.VirtualKeyID)
 		if !p.sink(c) {
 			// No report will exist, so the client gets no report header.
-			s.clearReport()
+			s.drop()
 			p.logger.Warn("halflife: audit queue full, report %s dropped", c.ReportID)
 		}
 	case SkipFailed:
@@ -217,29 +236,52 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		p.logger.Debug("halflife: streaming response not audited")
 	case SkipUnsupported:
 		p.skippedUnsupported.Add(1)
+	case SkipVerifier:
+		p.skippedVerifier.Add(1)
+		p.logger.Debug("halflife: verifier request not audited")
 	}
 	return nil
 }
 
-// HTTPTransportResponseHeadersHook tells the client where the audit report
-// for this answer will be. For buffered responses the gateway runs it after
-// HTTPTransportPostHook, so the capture decision has been made. Streaming
-// responses get no header: they are not captured.
+// HTTPTransportResponseHeadersHook tells the client whether its answer will
+// be audited and, if so, where the report will be. For buffered responses the
+// gateway runs it after HTTPTransportPostHook, so the outcome is known. For
+// streams it runs before the stream's post-hooks; a stream is never audited
+// in M1, so it is reported as such from its content type.
 func (p *Plugin) HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
 	s := slotFrom(ctx)
 	if s == nil || resp == nil || resp.Headers == nil {
 		return nil
 	}
-	id := s.report()
-	if id == "" {
+	status := s.status()
+	if status == "" && strings.HasPrefix(strings.ToLower(headerValue(resp.Headers, "Content-Type")), "text/event-stream") {
+		status = statusNotAudited + SkipStreaming.String()
+	}
+	if status == "" {
 		return nil
 	}
-	resp.Headers[HeaderReport] = id
-	// Let browser clients (such as the dashboard) read the header cross-origin.
-	if key, v, found := headerEntry(resp.Headers, "Access-Control-Expose-Headers"); found && !strings.Contains(strings.ToLower(v), strings.ToLower(HeaderReport)) {
-		resp.Headers[key] = v + ", " + strings.ToLower(HeaderReport)
+	resp.Headers[HeaderStatus] = status
+	expose(resp.Headers, HeaderStatus)
+	if id := s.report(); id != "" {
+		resp.Headers[HeaderReport] = id
+		expose(resp.Headers, HeaderReport)
 	}
 	return nil
+}
+
+// expose lets browser clients (such as the dashboard) read a header
+// cross-origin, when the gateway already sends an expose list.
+func expose(h map[string]string, name string) {
+	key, v, found := headerEntry(h, "Access-Control-Expose-Headers")
+	if !found {
+		return
+	}
+	for _, e := range strings.Split(v, ",") {
+		if strings.EqualFold(strings.TrimSpace(e), name) {
+			return
+		}
+	}
+	h[key] = v + ", " + strings.ToLower(name)
 }
 
 // headerEntry finds a header case-insensitively and returns its stored key.

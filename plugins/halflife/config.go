@@ -36,6 +36,11 @@ type Config struct {
 	// DrainTimeoutSeconds is how long shutdown waits for queued audits before
 	// cancelling them.
 	DrainTimeoutSeconds int `json:"drain_timeout_seconds,omitempty"`
+	// VerifierVirtualKey is the ID (not the secret value) of the governance
+	// virtual key Halflife's verifier uses for its own LLM calls through the
+	// gateway. Requests made with it are never audited: auditing the
+	// verifier's answers would recurse. Empty disables the guard.
+	VerifierVirtualKey string `json:"verifier_virtual_key,omitempty"`
 }
 
 func (c Config) auditTimeout() time.Duration {
@@ -62,6 +67,7 @@ func (c Config) withDefaults() Config {
 	if c.DrainTimeoutSeconds == 0 {
 		c.DrainTimeoutSeconds = DefaultDrainTimeoutSeconds
 	}
+	c.VerifierVirtualKey = strings.TrimSpace(c.VerifierVirtualKey)
 	c.TavilyRelay = strings.TrimSpace(c.TavilyRelay)
 	if c.TavilyRelay == "" {
 		c.TavilyRelay = DefaultTavilyRelay

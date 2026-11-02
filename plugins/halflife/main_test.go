@@ -107,7 +107,8 @@ func TestHTTPHooksPassThrough(t *testing.T) {
 		t.Errorf("hooks modified request: %+v", req)
 	}
 	meta := &schemas.HTTPResponseMetadata{StatusCode: 200, Headers: map[string]string{}}
-	if err := p.HTTPTransportResponseHeadersHook(ctx, req, meta); err != nil || len(meta.Headers) != 0 {
+	// The only header Halflife adds here: the request produced no answer.
+	if err := p.HTTPTransportResponseHeadersHook(ctx, req, meta); err != nil || len(meta.Headers) != 1 || meta.Headers[HeaderStatus] != "not-audited; reason=failed" {
 		t.Errorf("ResponseHeadersHook: %v, headers %v", err, meta.Headers)
 	}
 	chunk := &schemas.BifrostStreamChunk{}

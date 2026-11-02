@@ -46,7 +46,28 @@ const (
 	SkipFailed                 // no attempt succeeded, or the final HTTP status is not 2xx
 	SkipStreaming              // streaming responses are not audited yet
 	SkipUnsupported            // request type without auditable text (embeddings, images, ...)
+	SkipVerifier               // made with the verifier's own virtual key; auditing it would recurse
 )
+
+func (r SkipReason) String() string {
+	switch r {
+	case SkipNone:
+		return "none"
+	case SkipFailed:
+		return "failed"
+	case SkipStreaming:
+		return "streaming"
+	case SkipUnsupported:
+		return "unsupported"
+	case SkipVerifier:
+		return "verifier"
+	}
+	return "unknown"
+}
+
+// sticky reports whether a reason holds for every attempt of a request, so a
+// later attempt can't replace it. Both depend on the request, not the attempt.
+func (r SkipReason) sticky() bool { return r == SkipStreaming || r == SkipVerifier }
 
 // slotKey is the context key for a request's slot.
 type slotKey struct{}
@@ -69,6 +90,7 @@ type slot struct {
 	reason    SkipReason
 	finalized bool
 	reportID  string // set when the request is captured; read by the response-headers hook
+	dropped   bool   // captured, but the audit queue was full
 }
 
 func slotFrom(ctx *schemas.BifrostContext) *slot {
@@ -89,8 +111,8 @@ func (s *slot) setQuestion(q string, truncated bool) {
 func (s *slot) record(c *Capture, reason SkipReason) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.reason == SkipStreaming {
-		return // a streaming request stays streaming across attempts
+	if s.reason.sticky() {
+		return
 	}
 	s.pending, s.reason = c, reason
 }
@@ -109,6 +131,7 @@ func (s *slot) finalize(statusCode int, newID func() string) (c *Capture, reason
 	case s.reason != SkipNone:
 		return nil, s.reason, true
 	case s.pending == nil || statusCode < 200 || statusCode > 299:
+		s.reason = SkipFailed
 		return nil, SkipFailed, true
 	}
 	c = s.pending
@@ -120,10 +143,10 @@ func (s *slot) finalize(statusCode int, newID func() string) (c *Capture, reason
 	return c, SkipNone, true
 }
 
-// clearReport withdraws the report ID when the capture could not be queued.
-func (s *slot) clearReport() {
+// drop withdraws the report ID when the capture could not be queued.
+func (s *slot) drop() {
 	s.mu.Lock()
-	s.reportID = ""
+	s.reportID, s.dropped = "", true
 	s.mu.Unlock()
 }
 
@@ -133,6 +156,29 @@ func (s *slot) report() string {
 	defer s.mu.Unlock()
 	return s.reportID
 }
+
+// status returns the X-Halflife-Status value: "queued" with a report, or
+// "not-audited; reason=<reason>". It is "" while the outcome is still open,
+// which is the case for a stream whose post-hooks have not run yet.
+func (s *slot) status() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	switch {
+	case s.reportID != "":
+		return statusQueued
+	case s.dropped:
+		return statusNotAudited + "queue-full"
+	case s.finalized || s.reason.sticky():
+		return statusNotAudited + s.reason.String()
+	}
+	return ""
+}
+
+// Values of the X-Halflife-Status header.
+const (
+	statusQueued     = "queued"
+	statusNotAudited = "not-audited; reason="
+)
 
 // identify records who made the request and which gateway request it is.
 // Governance's PreLLMHook (which runs after Halflife's) has resolved the

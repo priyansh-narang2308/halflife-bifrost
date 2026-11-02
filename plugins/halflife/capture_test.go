@@ -391,30 +391,15 @@ func TestReportHeader(t *testing.T) {
 	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
 	h := r.finish(200)
 	id := (*got)[0].ReportID
-	if h[HeaderReport] != id {
-		t.Errorf("%s = %q, want %q", HeaderReport, h[HeaderReport], id)
+	if h[HeaderReport] != id || h[HeaderStatus] != "queued" {
+		t.Errorf("%s = %q, want %q; %s = %q", HeaderReport, h[HeaderReport], id, HeaderStatus, h[HeaderStatus])
 	}
-	if h["Access-Control-Expose-Headers"] != "x-bifrost-request-id, x-request-id, x-halflife-report" {
+	const exposed = "x-bifrost-request-id, x-request-id, x-halflife-status, x-halflife-report"
+	if h["Access-Control-Expose-Headers"] != exposed {
 		t.Errorf("expose = %q", h["Access-Control-Expose-Headers"])
 	}
-	if h := r.headers(200); h["Access-Control-Expose-Headers"] != "x-bifrost-request-id, x-request-id, x-halflife-report" {
+	if h := r.headers(200); h["Access-Control-Expose-Headers"] != exposed {
 		t.Errorf("header hook run twice: expose = %q", h["Access-Control-Expose-Headers"])
-	}
-
-	// No report, no header: failed, streaming, unsupported, and no slot.
-	for name, run := range map[string]func(r *request){
-		"failed":      func(r *request) { r.attempt(chatReq("q"), nil, errAttempt) },
-		"unsupported": func(r *request) { r.attempt(chatReq("q"), &schemas.BifrostResponse{}, nil) },
-		"streaming": func(r *request) {
-			r.core.SetValue(schemas.BifrostContextKeyStreamStartTime, time.Now())
-			r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
-		},
-	} {
-		r := newRequest(t, p)
-		run(r)
-		if h := r.finish(200); h[HeaderReport] != "" || len(h) != 2 {
-			t.Errorf("%s: headers = %v", name, h)
-		}
 	}
 	meta := &schemas.HTTPResponseMetadata{StatusCode: 200, Headers: map[string]string{}}
 	if err := p.HTTPTransportResponseHeadersHook(newCtx(), nil, meta); err != nil || len(meta.Headers) != 0 {
@@ -422,14 +407,104 @@ func TestReportHeader(t *testing.T) {
 	}
 }
 
-// For streaming, the gateway runs the headers hook before the stream's
-// post-hooks, so there is nothing to report yet.
-func TestReportHeaderBeforeFinalize(t *testing.T) {
+// Every response that is not audited says so and why, and carries no report.
+func TestStatusHeaderWhenNotAudited(t *testing.T) {
+	p, got := recordingPlugin(t)
+	p.config.VerifierVirtualKey = "vk-verifier"
+	for _, tc := range []struct {
+		name   string
+		run    func(r *request)
+		status int
+		want   string
+	}{
+		{"failed", func(r *request) { r.attempt(chatReq("q"), nil, errAttempt) }, 500, "not-audited; reason=failed"},
+		{"non-2xx", func(r *request) { r.attempt(chatReq("q"), chatResp("a", "ok"), nil) }, 502, "not-audited; reason=failed"},
+		{"unsupported", func(r *request) { r.attempt(chatReq("q"), &schemas.BifrostResponse{}, nil) }, 200, "not-audited; reason=unsupported"},
+		{"streaming", func(r *request) {
+			r.core.SetValue(schemas.BifrostContextKeyStreamStartTime, time.Now())
+			r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+		}, 200, "not-audited; reason=streaming"},
+		{"verifier", func(r *request) {
+			r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-verifier")
+			r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+		}, 200, "not-audited; reason=verifier"},
+	} {
+		r := newRequest(t, p)
+		tc.run(r)
+		h := r.finish(tc.status)
+		if h[HeaderStatus] != tc.want || h[HeaderReport] != "" || h["Access-Control-Expose-Headers"] != "x-bifrost-request-id, x-request-id, x-halflife-status" {
+			t.Errorf("%s: headers = %v", tc.name, h)
+		}
+	}
+	if len(*got) != 0 {
+		t.Errorf("captured %d", len(*got))
+	}
+	if s := p.Stats(); s != (Stats{SkippedFailed: 2, SkippedUnsupported: 1, SkippedStreaming: 1, SkippedVerifier: 1}) {
+		t.Errorf("stats = %+v", s)
+	}
+}
+
+// For streams the gateway runs the headers hook before the stream's
+// post-hooks, so the slot has no outcome yet; the content type decides.
+func TestStatusHeaderBeforeFinalize(t *testing.T) {
 	p, _ := recordingPlugin(t)
 	r := newRequest(t, p)
 	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
-	if h := r.headers(200); h[HeaderReport] != "" {
-		t.Errorf("header set before finalize: %v", h)
+	if h := r.headers(200); h[HeaderReport] != "" || h[HeaderStatus] != "" {
+		t.Errorf("buffered, before finalize: %v", h)
+	}
+	r = newRequest(t, p)
+	meta := &schemas.HTTPResponseMetadata{StatusCode: 200, Headers: map[string]string{"Content-Type": "text/event-stream; charset=utf-8"}}
+	scoped := r.scoped(r.transport)
+	if err := p.HTTPTransportResponseHeadersHook(scoped, nil, meta); err != nil || meta.Headers[HeaderStatus] != "not-audited; reason=streaming" || meta.Headers[HeaderReport] != "" {
+		t.Errorf("stream: %v %v", err, meta.Headers)
+	}
+	scoped.ReleasePluginScope()
+}
+
+// The recursion guard: the verifier's own requests are never captured, on
+// any attempt, whether they stream or not. Other tenants are unaffected.
+func TestVerifierTrafficNeverAudited(t *testing.T) {
+	p, got := recordingPlugin(t)
+	p.config.VerifierVirtualKey = "vk-verifier"
+	verifier := func() *request {
+		r := newRequest(t, p)
+		r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-verifier")
+		r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyName, "Halflife verifier")
+		return r
+	}
+	r := verifier()
+	r.attempt(chatReq("extract claims"), chatResp("[]", "ok"), nil)
+	r.finish(200)
+	r = verifier() // primary fails, fallback succeeds
+	r.attempt(chatReq("extract claims"), nil, errAttempt)
+	r.attempt(chatReq("extract claims"), chatResp("[]", "ok"), nil)
+	r.finish(200)
+	r = verifier()
+	r.core.SetValue(schemas.BifrostContextKeyStreamStartTime, time.Now())
+	r.attempt(chatReq("extract claims"), chatResp("[]", "ok"), nil)
+	r.finish(200)
+	if len(*got) != 0 || p.Stats() != (Stats{SkippedVerifier: 3}) {
+		t.Fatalf("verifier: captured %d, stats %+v", len(*got), p.Stats())
+	}
+
+	r = newRequest(t, p) // vk-smoke
+	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+	if h := r.finish(200); len(*got) != 1 || h[HeaderStatus] != "queued" {
+		t.Errorf("tenant request: captured %d, headers %v", len(*got), h)
+	}
+}
+
+// With no verifier key configured, the guard matches nothing, not requests
+// without a virtual key.
+func TestVerifierGuardDisabledByDefault(t *testing.T) {
+	p, got := recordingPlugin(t)
+	r := newRequest(t, p)
+	r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "")
+	r.attempt(chatReq("q"), chatResp("a", "ok"), nil)
+	r.finish(200)
+	if len(*got) != 1 || p.Stats().SkippedVerifier != 0 {
+		t.Errorf("captured %d, stats %+v", len(*got), p.Stats())
 	}
 }
 

@@ -248,6 +248,9 @@ func TestPluginQueuesCapturesForAudit(t *testing.T) {
 	if headers[0][HeaderReport] == "" || headers[1][HeaderReport] == "" || headers[2][HeaderReport] != "" {
 		t.Errorf("report headers = %q %q %q", headers[0][HeaderReport], headers[1][HeaderReport], headers[2][HeaderReport])
 	}
+	if headers[1][HeaderStatus] != "queued" || headers[2][HeaderStatus] != "not-audited; reason=queue-full" {
+		t.Errorf("status headers = %q %q", headers[1][HeaderStatus], headers[2][HeaderStatus])
+	}
 	close(gate)
 	if err := p.Cleanup(); err != nil {
 		t.Fatal(err)
