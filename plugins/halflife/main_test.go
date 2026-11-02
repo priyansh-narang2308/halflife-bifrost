@@ -14,6 +14,7 @@ func newPlugin(t *testing.T) *Plugin {
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
+	t.Cleanup(func() { p.Cleanup() })
 	return p
 }
 

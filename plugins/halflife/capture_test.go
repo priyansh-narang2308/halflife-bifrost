@@ -103,7 +103,7 @@ func recordingPlugin(t *testing.T) (*Plugin, *[]*Capture) {
 	p := newPlugin(t)
 	var mu sync.Mutex
 	got := &[]*Capture{}
-	p.sink = func(c *Capture) { mu.Lock(); *got = append(*got, c); mu.Unlock() }
+	p.sink = func(c *Capture) bool { mu.Lock(); *got = append(*got, c); mu.Unlock(); return true }
 	return p, got
 }
 

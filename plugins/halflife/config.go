@@ -3,6 +3,7 @@ package halflife
 import (
 	"fmt"
 	"strings"
+	"time"
 )
 
 // Defaults applied by Init when a field is left at its zero value.
@@ -11,6 +12,8 @@ const (
 	DefaultWorkers              = 2
 	DefaultMaxClaimsPerResponse = 5
 	DefaultTavilyRelay          = "tavily"
+	DefaultAuditTimeoutSeconds  = 60
+	DefaultDrainTimeoutSeconds  = 5
 )
 
 // Config is the plugin's configuration, read from the "halflife" entry of the
@@ -28,6 +31,18 @@ type Config struct {
 	// TavilyRelay is the name of the Bifrost relay that forwards evidence
 	// searches to Tavily, so their cost is governed and attributed by Bifrost.
 	TavilyRelay string `json:"tavily_relay,omitempty"`
+	// AuditTimeoutSeconds bounds one audit, end to end.
+	AuditTimeoutSeconds int `json:"audit_timeout_seconds,omitempty"`
+	// DrainTimeoutSeconds is how long shutdown waits for queued audits before
+	// cancelling them.
+	DrainTimeoutSeconds int `json:"drain_timeout_seconds,omitempty"`
+}
+
+func (c Config) auditTimeout() time.Duration {
+	return time.Duration(c.AuditTimeoutSeconds) * time.Second
+}
+func (c Config) drainTimeout() time.Duration {
+	return time.Duration(c.DrainTimeoutSeconds) * time.Second
 }
 
 // withDefaults returns a copy of c with zero fields set to their defaults.
@@ -40,6 +55,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.MaxClaimsPerResponse == 0 {
 		c.MaxClaimsPerResponse = DefaultMaxClaimsPerResponse
+	}
+	if c.AuditTimeoutSeconds == 0 {
+		c.AuditTimeoutSeconds = DefaultAuditTimeoutSeconds
+	}
+	if c.DrainTimeoutSeconds == 0 {
+		c.DrainTimeoutSeconds = DefaultDrainTimeoutSeconds
 	}
 	c.TavilyRelay = strings.TrimSpace(c.TavilyRelay)
 	if c.TavilyRelay == "" {
@@ -57,6 +78,10 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: workers must be between 1 and 64, got %d", c.Workers)
 	case c.MaxClaimsPerResponse < 1 || c.MaxClaimsPerResponse > 20:
 		return fmt.Errorf("halflife: max_claims_per_response must be between 1 and 20, got %d", c.MaxClaimsPerResponse)
+	case c.AuditTimeoutSeconds < 1 || c.AuditTimeoutSeconds > 600:
+		return fmt.Errorf("halflife: audit_timeout_seconds must be between 1 and 600, got %d", c.AuditTimeoutSeconds)
+	case c.DrainTimeoutSeconds < 1 || c.DrainTimeoutSeconds > 60:
+		return fmt.Errorf("halflife: drain_timeout_seconds must be between 1 and 60, got %d", c.DrainTimeoutSeconds)
 	}
 	return nil
 }

@@ -120,6 +120,13 @@ func (s *slot) finalize(statusCode int, newID func() string) (c *Capture, reason
 	return c, SkipNone, true
 }
 
+// clearReport withdraws the report ID when the capture could not be queued.
+func (s *slot) clearReport() {
+	s.mu.Lock()
+	s.reportID = ""
+	s.mu.Unlock()
+}
+
 // report returns the report ID, or "" when the request was not captured.
 func (s *slot) report() string {
 	s.mu.Lock()

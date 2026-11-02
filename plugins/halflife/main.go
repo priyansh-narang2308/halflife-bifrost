@@ -9,6 +9,7 @@ package halflife
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -42,9 +43,10 @@ type Plugin struct {
 	logger schemas.Logger
 	closed atomic.Bool
 
-	// sink receives each finalized capture. It runs on the request path, so it
-	// must not block.
-	sink func(*Capture)
+	pool *pool
+	// sink receives each finalized capture and reports whether it was
+	// accepted for audit. It runs on the request path, so it must not block.
+	sink func(*Capture) bool
 
 	captured, skippedFailed, skippedStreaming, skippedUnsupported atomic.Uint64
 }
@@ -55,6 +57,13 @@ type Stats struct {
 	SkippedFailed      uint64
 	SkippedStreaming   uint64
 	SkippedUnsupported uint64
+}
+
+// auditPlaceholder stands in for the verifier until it exists: it only marks
+// that the capture reached a worker.
+func (p *Plugin) auditPlaceholder(_ context.Context, c *Capture) error {
+	p.logger.Debug("halflife: audit report=%s (no verifier yet)", c.ReportID)
+	return nil
 }
 
 var (
@@ -76,10 +85,16 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if logger == nil {
 		logger = bifrost.NewNoOpLogger()
 	}
+	p := &Plugin{config: cfg, logger: logger}
+	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.auditPlaceholder)
+	p.sink = p.pool.submit
 	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s)",
 		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay)
-	return &Plugin{config: cfg, logger: logger, sink: func(*Capture) {}}, nil
+	return p, nil
 }
+
+// PoolStats returns the audit queue's counters.
+func (p *Plugin) PoolStats() PoolStats { return p.pool.stats() }
 
 // Stats returns the outcome counters since Init.
 func (p *Plugin) Stats() Stats {
@@ -97,10 +112,17 @@ func (p *Plugin) GetName() string { return PluginName }
 // Config returns the effective configuration, defaults included.
 func (p *Plugin) Config() Config { return p.config }
 
-// Cleanup is called on gateway shutdown. It is safe to call more than once.
+// Cleanup is called on gateway shutdown. It stops accepting captures, waits
+// up to the drain timeout for queued audits, then cancels the rest. It is
+// safe to call more than once.
 func (p *Plugin) Cleanup() error {
-	if p.closed.CompareAndSwap(false, true) {
-		p.logger.Info("halflife: stopped")
+	if !p.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	drained := p.pool.close(p.config.drainTimeout())
+	p.logger.Info("halflife: stopped (%s)", p.pool.stats())
+	if !drained {
+		return fmt.Errorf("halflife: audit workers still running after shutdown")
 	}
 	return nil
 }
@@ -183,7 +205,11 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		p.captured.Add(1)
 		p.logger.Debug("halflife: captured %s answer from %s/%s (%d bytes, fallback=%t) report=%s request=%s vk=%s",
 			c.RequestType, c.Provider, c.Model, len(c.Answer), c.IsFallback, c.ReportID, c.RequestID, c.VirtualKeyID)
-		p.sink(c)
+		if !p.sink(c) {
+			// No report will exist, so the client gets no report header.
+			s.clearReport()
+			p.logger.Warn("halflife: audit queue full, report %s dropped", c.ReportID)
+		}
 	case SkipFailed:
 		p.skippedFailed.Add(1)
 	case SkipStreaming:
