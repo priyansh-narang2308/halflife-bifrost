@@ -2,9 +2,9 @@
 // stale claims, re-verifies them with Tavily through a governed Bifrost relay,
 // and attributes the verification spend to the tenant that made the request.
 //
-// This version is the skeleton: every hook passes its input through
-// unchanged. Response capture, auditing and cache freshness are added on top
-// of these hooks.
+// Hooks never change traffic: every hook returns its input unchanged. The
+// plugin only observes, copying each completed answer out of the request
+// (see capture.go) for auditing off the request path.
 package halflife
 
 import (
@@ -19,11 +19,26 @@ import (
 const PluginName = "halflife"
 
 // Plugin implements schemas.LLMPlugin and schemas.HTTPTransportPlugin.
-// It is registered once per process and holds no per-request state.
+// It is registered once per process; per-request state lives in a slot on the
+// request's context.
 type Plugin struct {
 	config Config
 	logger schemas.Logger
 	closed atomic.Bool
+
+	// sink receives each finalized capture. It runs on the request path, so it
+	// must not block.
+	sink func(*Capture)
+
+	captured, skippedFailed, skippedStreaming, skippedUnsupported atomic.Uint64
+}
+
+// Stats counts finalized requests by outcome.
+type Stats struct {
+	Captured           uint64
+	SkippedFailed      uint64
+	SkippedStreaming   uint64
+	SkippedUnsupported uint64
 }
 
 var (
@@ -47,7 +62,17 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	}
 	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s)",
 		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay)
-	return &Plugin{config: cfg, logger: logger}, nil
+	return &Plugin{config: cfg, logger: logger, sink: func(*Capture) {}}, nil
+}
+
+// Stats returns the outcome counters since Init.
+func (p *Plugin) Stats() Stats {
+	return Stats{
+		Captured:           p.captured.Load(),
+		SkippedFailed:      p.skippedFailed.Load(),
+		SkippedStreaming:   p.skippedStreaming.Load(),
+		SkippedUnsupported: p.skippedUnsupported.Load(),
+	}
 }
 
 // GetName returns PluginName.
@@ -71,11 +96,38 @@ func (p *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostReq
 	return nil
 }
 
-func (p *Plugin) PreLLMHook(_ *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+// PreLLMHook records the caller's question; it is the only hook that sees the
+// request in Bifrost's typed form.
+func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
+	if s := slotFrom(ctx); s != nil {
+		if q, ok := questionFromRequest(req); ok {
+			s.setQuestion(clip(q, maxQuestionBytes))
+		}
+	}
 	return req, nil, nil
 }
 
-func (p *Plugin) PostLLMHook(_ *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
+// PostLLMHook copies the answer of a successful attempt into the request's
+// slot. Halflife runs last among post-hooks, so this is the response the
+// client receives for this attempt. For streams it runs once per chunk; those
+// requests are only marked.
+func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
+	s := slotFrom(ctx)
+	switch {
+	case s == nil:
+	case ctx.Value(schemas.BifrostContextKeyStreamStartTime) != nil:
+		s.record(nil, SkipStreaming)
+	case bifrostErr != nil || resp == nil:
+		s.record(nil, SkipFailed)
+	default:
+		c, reason := captureFromResponse(resp)
+		// Core layers IsFallback onto RoutingInfo only after post-hooks run, so
+		// read the attempt's fallback index instead (0 = primary).
+		if idx, _ := ctx.Value(schemas.BifrostContextKeyFallbackIndex).(int); c != nil && idx > 0 {
+			c.IsFallback = true
+		}
+		s.record(c, reason)
+	}
 	return resp, bifrostErr, nil
 }
 
@@ -86,11 +138,37 @@ func (p *Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.
 	return nil, nil
 }
 
-func (p *Plugin) HTTPTransportPreHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+// HTTPTransportPreHook opens the request's slot. The gateway copies context
+// values set here into the core context, so the LLM hooks find the same slot.
+func (p *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	ctx.SetValue(slotKey{}, &slot{})
 	return nil, nil
 }
 
-func (p *Plugin) HTTPTransportPostHook(_ *schemas.BifrostContext, _ *schemas.HTTPRequest, _ *schemas.HTTPResponse) error {
+// HTTPTransportPostHook finalizes the request's capture, once.
+func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest, resp *schemas.HTTPResponse) error {
+	s := slotFrom(ctx)
+	if s == nil || resp == nil {
+		return nil
+	}
+	c, reason, ok := s.finalize(resp.StatusCode)
+	if !ok {
+		return nil
+	}
+	switch reason {
+	case SkipNone:
+		p.captured.Add(1)
+		p.logger.Debug("halflife: captured %s answer from %s/%s (%d bytes, fallback=%t)",
+			c.RequestType, c.Provider, c.Model, len(c.Answer), c.IsFallback)
+		p.sink(c)
+	case SkipFailed:
+		p.skippedFailed.Add(1)
+	case SkipStreaming:
+		p.skippedStreaming.Add(1)
+		p.logger.Debug("halflife: streaming response not audited")
+	case SkipUnsupported:
+		p.skippedUnsupported.Add(1)
+	}
 	return nil
 }
 
