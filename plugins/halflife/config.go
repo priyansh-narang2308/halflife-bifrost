@@ -14,6 +14,8 @@ const (
 	DefaultTavilyRelay          = "tavily"
 	DefaultAuditTimeoutSeconds  = 60
 	DefaultDrainTimeoutSeconds  = 5
+
+	maxCacheTTLSeconds = 30 * 24 * 3600
 )
 
 // Config is the plugin's configuration, read from the "halflife" entry of the
@@ -41,6 +43,11 @@ type Config struct {
 	// gateway. Requests made with it are never audited: auditing the
 	// verifier's answers would recurse. Empty disables the guard.
 	VerifierVirtualKey string `json:"verifier_virtual_key,omitempty"`
+	// CacheTTLSeconds caps how long Bifrost's semantic cache keeps an answer
+	// written through Halflife, so a stale answer cannot outlive it even if
+	// no audit flags it. A shorter per-request x-bf-cache-ttl still wins.
+	// Zero leaves the cache's own TTL in place.
+	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
 }
 
 func (c Config) auditTimeout() time.Duration {
@@ -48,6 +55,9 @@ func (c Config) auditTimeout() time.Duration {
 }
 func (c Config) drainTimeout() time.Duration {
 	return time.Duration(c.DrainTimeoutSeconds) * time.Second
+}
+func (c Config) cacheTTL() time.Duration {
+	return time.Duration(c.CacheTTLSeconds) * time.Second
 }
 
 // withDefaults returns a copy of c with zero fields set to their defaults.
@@ -88,6 +98,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: audit_timeout_seconds must be between 1 and 600, got %d", c.AuditTimeoutSeconds)
 	case c.DrainTimeoutSeconds < 1 || c.DrainTimeoutSeconds > 60:
 		return fmt.Errorf("halflife: drain_timeout_seconds must be between 1 and 60, got %d", c.DrainTimeoutSeconds)
+	case c.CacheTTLSeconds < 0 || c.CacheTTLSeconds > maxCacheTTLSeconds:
+		return fmt.Errorf("halflife: cache_ttl_seconds must be between 0 and %d, got %d", maxCacheTTLSeconds, c.CacheTTLSeconds)
 	}
 	return nil
 }

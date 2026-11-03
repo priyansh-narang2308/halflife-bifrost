@@ -124,6 +124,13 @@ func (r reply) hit() string {
 // core pipeline, and returns what the client gets.
 func (st *stack) ask(vk, question string) reply {
 	st.t.Helper()
+	return st.askWith(vk, question, nil)
+}
+
+// askWith is ask with extra request context, as the transport sets it from
+// x-bf-* headers.
+func (st *stack) askWith(vk, question string, set func(*schemas.BifrostContext)) reply {
+	st.t.Helper()
 	transport := newCtx()
 	name := PluginName
 	scoped := transport.WithPluginScope(&name)
@@ -138,6 +145,9 @@ func (st *stack) ask(vk, question string) reply {
 	}
 	core.SetValue(schemas.BifrostContextKeyRequestID, uuid.NewString())
 	core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, vk)
+	if set != nil {
+		set(core)
+	}
 	resp, bErr := st.client.ChatCompletionRequest(core, &schemas.BifrostChatRequest{
 		Provider: schemas.OpenAI, Model: "gpt-4o-mini",
 		Input: []schemas.ChatMessage{{Role: schemas.ChatMessageRoleUser, Content: &schemas.ChatMessageContent{ContentStr: schemas.Ptr(question)}}},
@@ -176,6 +186,28 @@ type gatedStore struct {
 	mu     sync.Mutex
 	gate   chan struct{}
 	queued atomic.Int32 // writes waiting at the gate
+	stored sync.Map     // entry id -> metadata of every write that reached the store
+}
+
+// expiresIn is how far past now the stored entry id expires.
+func (g *gatedStore) expiresIn(t *testing.T, id string) time.Duration {
+	t.Helper()
+	m, ok := g.stored.Load(id)
+	if !ok {
+		t.Fatalf("entry %s was never written", id)
+	}
+	var at int64
+	switch v := m.(map[string]any)["expires_at"].(type) {
+	case int64:
+		at = v
+	case int:
+		at = int64(v)
+	case float64:
+		at = int64(v)
+	default:
+		t.Fatalf("expires_at = %T %v", v, v)
+	}
+	return time.Until(time.Unix(at, 0))
 }
 
 // hold makes every later Add wait until open is called.
@@ -218,6 +250,7 @@ func (g *gatedStore) Add(ctx context.Context, namespace, id string, embedding []
 			return ctx.Err()
 		}
 	}
+	g.stored.Store(id, metadata)
 	return g.VectorStore.Add(ctx, namespace, id, embedding, metadata)
 }
 

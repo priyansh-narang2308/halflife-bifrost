@@ -18,6 +18,7 @@ import (
 
 	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/plugins/semanticcache"
 )
 
 // PluginName is the name the gateway registers and configures the plugin by.
@@ -104,9 +105,16 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if verifier == "" {
 		verifier = "none"
 	}
-	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s)",
-		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier)
+	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s cache_ttl=%s)",
+		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, cacheTTLLabel(cfg.cacheTTL()))
 	return p, nil
+}
+
+func cacheTTLLabel(ttl time.Duration) string {
+	if ttl <= 0 {
+		return "cache-default"
+	}
+	return ttl.String()
 }
 
 // PoolStats returns the audit queue's counters.
@@ -153,14 +161,30 @@ func (p *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostReq
 }
 
 // PreLLMHook records the caller's question; it is the only hook that sees the
-// request in Bifrost's typed form.
+// request in Bifrost's typed form. It also caps the semantic cache TTL: the
+// cache reads it in its PostLLMHook, before spawning the write, and Halflife's
+// PreLLMHook runs before every other plugin's hooks.
 func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
 	if s := slotFrom(ctx); s != nil {
 		if q, ok := questionFromRequest(req); ok {
 			s.setQuestion(clip(q, maxQuestionBytes))
 		}
 	}
+	p.capCacheTTL(ctx)
 	return req, nil, nil
+}
+
+// capCacheTTL sets the cache TTL to Halflife's, unless the request already
+// asks for a shorter one.
+func (p *Plugin) capCacheTTL(ctx *schemas.BifrostContext) {
+	ttl := p.config.cacheTTL()
+	if ttl <= 0 {
+		return
+	}
+	if cur, ok := ctx.Value(semanticcache.CacheTTLKey).(time.Duration); ok && cur > 0 && cur <= ttl {
+		return
+	}
+	ctx.SetValue(semanticcache.CacheTTLKey, ttl)
 }
 
 // PostLLMHook copies the answer of a successful attempt into the request's
