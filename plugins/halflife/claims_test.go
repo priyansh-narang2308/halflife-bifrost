@@ -61,6 +61,11 @@ func extractingVerifier(t *testing.T, mod func(*Config), replies ...gwReply) (*v
 	return v, f, g
 }
 
+func judgeReply(j judgement) gwReply {
+	b, _ := json.Marshal(j)
+	return gwReply{content: string(b)}
+}
+
 func extractionReply(t *testing.T, claims ...extractedClaim) gwReply {
 	t.Helper()
 	if claims == nil {
@@ -433,7 +438,9 @@ func vagueReply(int) (*SearchResponse, error) {
 }
 
 func TestPipelineSearchesWithPolicyAndAttribution(t *testing.T) {
-	v, f, g := extractingVerifier(t, nil, extractionReply(t, priceClaim, storageClaim))
+	v, f, g := extractingVerifier(t, nil, extractionReply(t, priceClaim, storageClaim),
+		judgeReply(judgement{Verdict: judgeContradicts, CurrentValue: "$59 per month", Quote: "Pro is $59 per month.", Source: 1}),
+		judgeReply(judgement{Verdict: judgeInsufficient}))
 	f.reply = func(n int) (*SearchResponse, error) {
 		if n == 2 {
 			return vagueReply(n)
@@ -445,7 +452,7 @@ func TestPipelineSearchesWithPolicyAndAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Outcome != OutcomeEvidenceFound || len(r.Claims) != 2 || len(f.calls) != 2 || g.calls() != 1 {
+	if r.Outcome != OutcomeEvidenceFound || len(r.Claims) != 2 || len(f.calls) != 2 || g.calls() != 3 {
 		t.Fatalf("outcome=%s claims=%d searches=%d llm=%d", r.Outcome, len(r.Claims), len(f.calls), g.calls())
 	}
 	call := f.calls[0]
@@ -467,6 +474,17 @@ func TestPipelineSearchesWithPolicyAndAttribution(t *testing.T) {
 	}
 	if r.Claims[1].Evidence.Credits != 2 {
 		t.Errorf("storage credits = %v, want search + extract", r.Claims[1].Evidence.Credits)
+	}
+	// The price comparator found $49 ≠ $59 with no sign $49 ever held; the
+	// storage evidence said nothing. The report takes the worse verdict.
+	if c := r.Claims[0]; c.Verdict != VerdictContradicted || c.Comparison == nil || c.Comparison.Kind != KindPrice || !c.Quote.Verified {
+		t.Errorf("price verdict %s (%s) comparison %+v quote %+v", c.Verdict, c.VerdictReason, c.Comparison, c.Quote)
+	}
+	if c := r.Claims[1]; c.Verdict != VerdictUnverifiable || c.FreshnessScore != nil {
+		t.Errorf("storage verdict %s (%s) score %v", c.Verdict, c.VerdictReason, c.FreshnessScore)
+	}
+	if r.Verdict != VerdictContradicted {
+		t.Errorf("report verdict %s", r.Verdict)
 	}
 }
 

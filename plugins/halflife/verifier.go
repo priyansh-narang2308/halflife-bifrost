@@ -51,7 +51,7 @@ type verifier struct {
 	boosted    map[string]bool     // categories raised one priority level
 	domains    map[string][]string // category -> preferred domains
 	extract    bool                // Extract the best page when snippets are thin
-	reports    *reportStore
+	reports    reports
 	memo       *searchMemo
 	logger     schemas.Logger
 	sleep      func(context.Context, time.Duration) error
@@ -60,7 +60,7 @@ type verifier struct {
 
 // newVerifier resolves each verifier key's secret (env.VAR allowed). It fails
 // if one is missing, naming the variable, never a value.
-func newVerifier(cfg Config, reports *reportStore, logger schemas.Logger) (*verifier, error) {
+func newVerifier(cfg Config, store reports, logger schemas.Logger) (*verifier, error) {
 	cutoffs, err := newCutoffTable(cfg.ModelCutoffs)
 	if err != nil {
 		return nil, err
@@ -74,7 +74,7 @@ func newVerifier(cfg Config, reports *reportStore, logger schemas.Logger) (*veri
 		boosted:    make(map[string]bool, len(cfg.PriorityBoostCategories)),
 		domains:    cfg.PreferredDomains,
 		extract:    !cfg.DisableExtract,
-		reports:    reports,
+		reports:    store,
 		memo:       newSearchMemo(searchMemoSize, searchMemoTTL),
 		logger:     logger,
 		sleep:      sleepCtx,
@@ -127,6 +127,7 @@ func (v *verifier) llmFor(tenant string) (*LLM, verifierKey, bool) {
 // audit is the outcome of one answer's verification.
 type audit struct {
 	outcome    string
+	verdict    string
 	claims     []ReportClaim
 	extraction *LLMResult
 	err        error
@@ -149,11 +150,14 @@ func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 	now := time.Now().UTC()
 	v.reports.update(c.ReportID, func(r *Report) {
 		r.Status, r.Outcome, r.Claims, r.Extraction, r.CompletedAt = ReportComplete, a.outcome, a.claims, a.extraction, &now
+		if a.verdict != "" {
+			r.Verdict = a.verdict
+		}
 		if a.err != nil {
 			r.Error = a.err.Error()
 		}
 	})
-	v.logger.Debug("halflife: report %s complete: outcome=%s claims=%d", c.ReportID, a.outcome, len(a.claims))
+	v.logger.Debug("halflife: report %s complete: outcome=%s verdict=%s claims=%d", c.ReportID, a.outcome, a.verdict, len(a.claims))
 	if a.outcome == OutcomeSearchFailed || a.outcome == OutcomeExtractionFailed {
 		return false, a.err
 	}
@@ -177,7 +181,7 @@ func (v *verifier) runHeuristic(ctx context.Context, c *Capture) audit {
 	return audit{outcome: outcomeOf([]ReportClaim{claim}, err), claims: []ReportClaim{claim}, err: err}
 }
 
-// runExtracted is the model path: extract, filter, rank, then search.
+// runExtracted is the model path: extract, filter, rank, search, then judge.
 func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 	llm, key, ok := v.llmFor(c.VirtualKeyID)
 	if !ok {
@@ -191,7 +195,7 @@ func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 	case err != nil:
 		return audit{outcome: OutcomeExtractionFailed, extraction: res, err: err}
 	case len(extracted) == 0:
-		return audit{outcome: OutcomeNoClaim, extraction: res}
+		return audit{outcome: OutcomeNoClaim, verdict: VerdictNotChecked, extraction: res}
 	}
 
 	now := v.now()
@@ -223,13 +227,34 @@ func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 				firstErr = err
 			}
 		}
-	}
-	for i := range claims {
-		if claims[i].Status == ClaimPending { // SKIP
-			claims[i].Status, claims[i].StatusReason = ClaimNotChecked, "priority SKIP: "+claims[i].PriorityReason
+		if rc.Status == ClaimChecked && !spent {
+			spent = v.judge(ctx, llm, rc) != nil // only a 402 is returned
 		}
 	}
-	return audit{outcome: outcomeOf(claims, firstErr), claims: claims, extraction: res, err: firstErr}
+	for i := range claims {
+		rc := &claims[i]
+		if rc.Status == ClaimPending { // SKIP
+			rc.Status, rc.StatusReason = ClaimNotChecked, "priority SKIP: "+rc.PriorityReason
+		}
+		if rc.Verdict == "" {
+			rc.Verdict, rc.VerdictReason = VerdictNotChecked, notCheckedReason(rc)
+		}
+		assess(rc, v.domains[rc.Category])
+	}
+	return audit{outcome: outcomeOf(claims, firstErr), verdict: reportVerdict(claims), claims: claims, extraction: res, err: firstErr}
+}
+
+// notCheckedReason says why a claim has no verdict.
+func notCheckedReason(rc *ReportClaim) string {
+	switch rc.Status {
+	case ClaimRejected:
+		return "rejected by the span check: " + rc.StatusReason
+	case ClaimFailed:
+		return "search failed: " + rc.StatusReason
+	case ClaimChecked:
+		return "verifier budget spent before the judge (402)"
+	}
+	return rc.StatusReason
 }
 
 // classify turns an extracted claim into a report claim: span check, then

@@ -14,7 +14,7 @@ type Report struct {
 	RequestID   string     `json:"request_id"` // the gateway request (X-Bifrost-Request-Id) whose answer this audits
 	Status      string     `json:"status"`     // queued, running or complete
 	Outcome     string     `json:"outcome,omitempty"`
-	Verdict     string     `json:"verdict"` // not_judged: M1 collects evidence but judges nothing
+	Verdict     string     `json:"verdict"` // the claims' worst verdict; not_judged on the keyword path, which has no judge
 	CreatedAt   time.Time  `json:"created_at"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
 
@@ -68,6 +68,7 @@ type ReportAnswer struct {
 	IsFallback     bool   `json:"is_fallback"`
 	Question       string `json:"question,omitempty"`
 	Text           string `json:"text"`
+	TextRedacted   bool   `json:"text_redacted,omitempty"` // question and text left out of the persistent store (persist_answer_text off)
 	Truncated      bool   `json:"truncated,omitempty"`
 	CacheID        string `json:"cache_id,omitempty"`
 }
@@ -94,6 +95,32 @@ type ReportClaim struct {
 	// Search is the request sent to Tavily, policy included.
 	Search   *SearchRequest `json:"search,omitempty"`
 	Evidence *ReportSources `json:"evidence,omitempty"`
+
+	// What the evidence says (judge.go): the verdict, why, and the quotes
+	// it rests on, each checked against the source it cites.
+	Verdict       string       `json:"verdict,omitempty"`
+	VerdictReason string       `json:"verdict_reason,omitempty"`
+	ObservedValue string       `json:"observed_value,omitempty"` // the current value, as the judge read it from the evidence
+	Quote         *ReportQuote `json:"quote,omitempty"`
+	HistoryQuote  *ReportQuote `json:"history_quote,omitempty"` // shows the claimed value held before; required for OUTDATED
+	OtherQuote    *ReportQuote `json:"other_quote,omitempty"`   // the other side of a CONFLICTING verdict
+	Comparison    *Comparison  `json:"comparison,omitempty"`    // the typed comparator's result, when one applied
+	Judge         *LLMResult   `json:"judge,omitempty"`
+
+	// How strong the evidence is, and the heuristic score from verdict and
+	// strength (strength.go). Never a probability.
+	Strength       string `json:"strength,omitempty"`
+	StrengthReason string `json:"strength_reason,omitempty"`
+	FreshnessScore *int   `json:"freshness_score,omitempty"`
+}
+
+// ReportQuote is a passage the judge cited, and whether it was found
+// verbatim in that source.
+type ReportQuote struct {
+	Text     string `json:"text"`
+	Source   int    `json:"source"` // index into evidence.sources; -1 when none was cited
+	URL      string `json:"url,omitempty"`
+	Verified bool   `json:"verified"`
 }
 
 // ReportSources is the evidence found for the claim, and what it cost.
@@ -142,6 +169,25 @@ func (c ReportClaim) clone() ReportClaim {
 		}
 		c.Search = &s
 	}
+	for _, q := range []**ReportQuote{&c.Quote, &c.HistoryQuote, &c.OtherQuote} {
+		if *q != nil {
+			cp := **q
+			*q = &cp
+		}
+	}
+	if c.Comparison != nil {
+		cp := *c.Comparison
+		c.Comparison = &cp
+	}
+	if c.Judge != nil {
+		j := *c.Judge
+		j.GatewayRequestIDs = append([]string{}, c.Judge.GatewayRequestIDs...)
+		c.Judge = &j
+	}
+	if c.FreshnessScore != nil {
+		n := *c.FreshnessScore
+		c.FreshnessScore = &n
+	}
 	if c.Evidence != nil {
 		ev := *c.Evidence
 		ev.Sources = append(make([]ReportSource, 0, len(c.Evidence.Sources)), c.Evidence.Sources...) // keep [] as [] in JSON
@@ -170,7 +216,8 @@ func (r *Report) clone() Report {
 }
 
 // reportStore keeps the most recent reports in memory, evicting the oldest
-// once full. Reports are lost on restart (a persistent store is later work).
+// once full. On its own (no report_store_path) reports are lost on restart;
+// sqliteReports uses it for reports still in flight.
 type reportStore struct {
 	mu    sync.Mutex
 	max   int
@@ -228,6 +275,8 @@ func (s *reportStore) remove(id string) {
 		delete(s.byID, id)
 	}
 }
+
+func (s *reportStore) close() error { return nil }
 
 func (s *reportStore) len() int {
 	s.mu.Lock()

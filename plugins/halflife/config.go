@@ -21,6 +21,7 @@ const (
 	DefaultGatewayURL              = "http://127.0.0.1:8080" // Bifrost's default listen address
 	DefaultSearchMaxResults        = 5
 	DefaultReportStoreSize         = 10000
+	DefaultReportRetentionHours    = 30 * 24
 	DefaultVerifierMaxTokens       = 1024
 
 	maxVerifierModels = 4
@@ -78,8 +79,18 @@ type Config struct {
 	Verifiers []VerifierKey `json:"verifiers,omitempty"`
 	// SearchMaxResults is how many sources one evidence search asks for.
 	SearchMaxResults int `json:"search_max_results,omitempty"`
-	// ReportStoreSize bounds the reports kept in memory; the oldest go first.
+	// ReportStoreSize bounds the reports kept, in memory and in the
+	// persistent store; the oldest go first.
 	ReportStoreSize int `json:"report_store_size,omitempty"`
+	// ReportStorePath, when set, is a SQLite file where completed reports
+	// are kept across restarts, with each claim and source as rows.
+	ReportStorePath string `json:"report_store_path,omitempty"`
+	// ReportRetentionHours deletes stored reports older than this.
+	ReportRetentionHours int `json:"report_retention_hours,omitempty"`
+	// PersistAnswerText keeps the question and answer text in the
+	// persistent store. Off by default: the claims, spans and evidence are
+	// kept, the full answer is not.
+	PersistAnswerText bool `json:"persist_answer_text,omitempty"`
 	// VerifierModels are the models the verifier's own LLM calls use, as
 	// "provider/model": the first is asked, the rest are sent as Bifrost
 	// request fallbacks. The calls go through this gateway with the tenant's
@@ -127,6 +138,11 @@ type VerifierKey struct {
 func (c Config) auditTimeout() time.Duration {
 	return time.Duration(c.AuditTimeoutSeconds) * time.Second
 }
+
+func (c Config) reportRetention() time.Duration {
+	return time.Duration(c.ReportRetentionHours) * time.Hour
+}
+
 func (c Config) drainTimeout() time.Duration {
 	return time.Duration(c.DrainTimeoutSeconds) * time.Second
 }
@@ -169,6 +185,10 @@ func (c Config) withDefaults() Config {
 	if c.SearchMaxResults == 0 {
 		c.SearchMaxResults = DefaultSearchMaxResults
 	}
+	if c.ReportRetentionHours == 0 {
+		c.ReportRetentionHours = DefaultReportRetentionHours
+	}
+	c.ReportStorePath = strings.TrimSpace(c.ReportStorePath)
 	if c.ReportStoreSize == 0 {
 		c.ReportStoreSize = DefaultReportStoreSize
 	}
@@ -228,6 +248,10 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: search_max_results must be between 1 and 20, got %d", c.SearchMaxResults)
 	case c.ReportStoreSize < 1 || c.ReportStoreSize > 1_000_000:
 		return fmt.Errorf("halflife: report_store_size must be between 1 and 1000000, got %d", c.ReportStoreSize)
+	case c.ReportRetentionHours < 1 || c.ReportRetentionHours > 10*365*24:
+		return fmt.Errorf("halflife: report_retention_hours must be between 1 and 87600, got %d", c.ReportRetentionHours)
+	case strings.ContainsAny(c.ReportStorePath, "?#"):
+		return fmt.Errorf("halflife: report_store_path must be a file path, got %q", c.ReportStorePath)
 	case c.VerifierMaxTokens < 64 || c.VerifierMaxTokens > 16384:
 		return fmt.Errorf("halflife: verifier_max_tokens must be between 64 and 16384, got %d", c.VerifierMaxTokens)
 	case len(c.PriorityBoostCategories) > len(claimCategories):

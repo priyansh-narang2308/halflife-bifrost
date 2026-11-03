@@ -335,7 +335,7 @@ func TestPluginReportLifecycle(t *testing.T) {
 	p.sink = func(*Capture) bool { return false }
 	r = newRequest(t, p)
 	r.attempt(chatReq("q"), chatResp("Acme Cloud Pro costs $49 per month.", "ok"), nil)
-	if h := r.finish(200); h[HeaderReport] != "" || p.reports.len() != 1 {
-		t.Errorf("dropped capture: header %q, reports %d", h[HeaderReport], p.reports.len())
+	if h := r.finish(200); h[HeaderReport] != "" || p.reports.(*reportStore).len() != 1 {
+		t.Errorf("dropped capture: header %q, reports %d", h[HeaderReport], p.reports.(*reportStore).len())
 	}
 }

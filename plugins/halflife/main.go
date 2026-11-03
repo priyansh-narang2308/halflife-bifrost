@@ -61,8 +61,9 @@ type Plugin struct {
 	// verify audits an answer, completes its report and says whether the
 	// answer is stale.
 	verify func(context.Context, *Capture) (stale bool, err error)
-	// reports holds the audit report of every queued answer.
-	reports *reportStore
+	// reports holds the audit report of every queued answer, in memory and,
+	// with report_store_path, in SQLite once complete.
+	reports reports
 	// verifierKeys are the virtual key IDs whose requests are never audited.
 	verifierKeys map[string]bool
 	// inv evicts stale answers from the semantic cache.
@@ -115,10 +116,14 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if logger == nil {
 		logger = bifrost.NewNoOpLogger()
 	}
-	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks),
-		reports: newReportStore(cfg.ReportStoreSize), verifierKeys: cfg.verifierKeyIDs()}
+	store, err := openReports(cfg, logger)
+	if err != nil {
+		return nil, err
+	}
+	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks), reports: store, verifierKeys: cfg.verifierKeyIDs()}
 	v, err := newVerifier(cfg, p.reports, logger)
 	if err != nil {
+		store.close()
 		return nil, err
 	}
 	p.verify = v.verify
@@ -129,9 +134,24 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if verifier == "" {
 		verifier = "none"
 	}
-	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s verifier_models=%d cache_ttl=%s)",
-		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, len(cfg.VerifierModels), cacheTTLLabel(cfg.cacheTTL()))
+	reportStore := "memory"
+	if cfg.ReportStorePath != "" {
+		reportStore = "sqlite"
+	}
+	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s verifier_models=%d cache_ttl=%s report_store=%s)",
+		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, len(cfg.VerifierModels), cacheTTLLabel(cfg.cacheTTL()), reportStore)
 	return p, nil
+}
+
+// openReports returns the in-memory store, or the SQLite one when
+// report_store_path is set.
+func openReports(cfg Config, logger schemas.Logger) (reports, error) {
+	if cfg.ReportStorePath == "" {
+		return newReportStore(cfg.ReportStoreSize), nil
+	}
+	return openSQLiteReports(cfg.ReportStorePath, cfg.ReportStoreSize, cfg.reportRetention(), cfg.PersistAnswerText, func(id string, err error) {
+		logger.Warn("halflife: report %s not persisted (kept in memory): %v", id, err)
+	})
 }
 
 func cacheTTLLabel(ttl time.Duration) string {
@@ -176,6 +196,9 @@ func (p *Plugin) Cleanup() error {
 	}
 	drained := p.pool.close(p.config.drainTimeout())
 	p.inv.close()
+	if err := p.reports.close(); err != nil {
+		p.logger.Warn("halflife: closing the report store: %v", err)
+	}
 	p.logger.Info("halflife: stopped (%s)", p.pool.stats())
 	if !drained {
 		return fmt.Errorf("halflife: audit workers still running after shutdown")

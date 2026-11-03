@@ -12,13 +12,14 @@ func TestConfigDefaults(t *testing.T) {
 	want := Config{QueueSize: DefaultQueueSize, Workers: DefaultWorkers, MaxClaimsPerResponse: DefaultMaxClaimsPerResponse, TavilyRelay: DefaultTavilyRelay,
 		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds,
 		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds, GatewayURL: DefaultGatewayURL, Verifiers: []VerifierKey{},
-		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize,
+		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize, ReportRetentionHours: DefaultReportRetentionHours,
 		VerifierModels: []string{}, VerifierMaxTokens: DefaultVerifierMaxTokens}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
 	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier",
 		CacheTTLSeconds: 600, CacheWriteSettleSeconds: 45, GatewayURL: "https://gw.example:8443", SearchMaxResults: 3, ReportStoreSize: 50,
+		ReportStorePath: "/var/lib/halflife/reports.db", ReportRetentionHours: 24, PersistAnswerText: true,
 		Verifiers:      []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME"}},
 		VerifierModels: []string{"openrouter/a:free", "openrouter/b:free"}, VerifierMaxTokens: 512, VerifierReasoningEffort: "low"}
 	if got := set.withDefaults(); !reflect.DeepEqual(got, set) {
@@ -69,6 +70,9 @@ func TestConfigValidate(t *testing.T) {
 		"domains for unknown category": {func(c *Config) { c.PreferredDomains = map[string][]string{"weather": {"x.dev"}} }, "preferred_domains key"},
 		"domain is a URL":              {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {"https://go.dev"}} }, "bare domains"},
 		"empty domain":                 {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {""}} }, "bare domains"},
+		"no retention":                 {func(c *Config) { c.ReportRetentionHours = -1 }, "report_retention_hours"},
+		"retention over ten years":     {func(c *Config) { c.ReportRetentionHours = 87601 }, "report_retention_hours"},
+		"store path with a query":      {func(c *Config) { c.ReportStorePath = "reports.db?mode=memory" }, "report_store_path"},
 		"tenant verifies itself":       {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
 	} {
 		c := ok
