@@ -255,9 +255,31 @@ func (p *Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.
 
 // HTTPTransportPreHook opens the request's slot. The gateway copies context
 // values set here into the core context, so the LLM hooks find the same slot.
-func (p *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
-	ctx.SetValue(slotKey{}, &slot{})
+func (p *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
+	if inferenceRequest(req) {
+		ctx.SetValue(slotKey{}, &slot{})
+	}
 	return nil, nil
+}
+
+// nonInferencePrefixes are POST routes that run the transport hooks but never
+// produce an answer to audit: relays (including Halflife's own Tavily
+// searches), MCP, and the management API.
+var nonInferencePrefixes = []string{"/relay/", "/mcp", "/api/"}
+
+// inferenceRequest reports whether req can produce an auditable answer, and so
+// gets a slot and an X-Halflife-Status header. Every completion route is a
+// POST; GETs (model lists, health, the UI) are not.
+func inferenceRequest(req *schemas.HTTPRequest) bool {
+	if req == nil || !strings.EqualFold(req.Method, "POST") {
+		return false
+	}
+	for _, prefix := range nonInferencePrefixes {
+		if strings.HasPrefix(req.Path, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // HTTPTransportPostHook finalizes the request's capture, once.

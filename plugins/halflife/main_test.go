@@ -125,3 +125,39 @@ func TestCleanupIdempotent(t *testing.T) {
 		}
 	}
 }
+
+// Only inference requests get a slot, and so an X-Halflife-Status header:
+// relayed Tavily searches, MCP, management calls and GETs are never answers.
+func TestStatusHeaderOnlyOnInferenceRoutes(t *testing.T) {
+	p, _ := recordingPlugin(t)
+	for _, tc := range []struct {
+		method, path string
+		marked       bool
+	}{
+		{"POST", "/v1/chat/completions", true},
+		{"POST", "/openai/v1/chat/completions", true},
+		{"POST", "/anthropic/v1/messages", true},
+		{"post", "/v1/responses", true},
+		{"POST", "/relay/tavily/search", false},
+		{"POST", "/mcp", false},
+		{"POST", "/api/governance/virtual-keys", false},
+		{"GET", "/v1/models", false},
+		{"GET", "/health", false},
+	} {
+		ctx := newCtx()
+		req := &schemas.HTTPRequest{Method: tc.method, Path: tc.path}
+		if _, err := p.HTTPTransportPreHook(ctx, req); err != nil {
+			t.Fatal(err)
+		}
+		if err := p.HTTPTransportPostHook(ctx, req, &schemas.HTTPResponse{StatusCode: 200}); err != nil {
+			t.Fatal(err)
+		}
+		meta := &schemas.HTTPResponseMetadata{StatusCode: 200, Headers: map[string]string{}}
+		if err := p.HTTPTransportResponseHeadersHook(ctx, req, meta); err != nil {
+			t.Fatal(err)
+		}
+		if _, got := meta.Headers[HeaderStatus]; got != tc.marked {
+			t.Errorf("%s %s: status header %v, want %v (%v)", tc.method, tc.path, got, tc.marked, meta.Headers)
+		}
+	}
+}
