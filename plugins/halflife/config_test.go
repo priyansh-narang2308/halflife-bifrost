@@ -9,11 +9,12 @@ import (
 func TestConfigDefaults(t *testing.T) {
 	got := Config{TavilyRelay: "  ", VerifierVirtualKey: " \t"}.withDefaults()
 	want := Config{QueueSize: DefaultQueueSize, Workers: DefaultWorkers, MaxClaimsPerResponse: DefaultMaxClaimsPerResponse, TavilyRelay: DefaultTavilyRelay,
-		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds}
+		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds,
+		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds}
 	if got != want {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
-	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier", CacheTTLSeconds: 600}
+	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier", CacheTTLSeconds: 600, CacheWriteSettleSeconds: 45}
 	if got := set.withDefaults(); got != set {
 		t.Errorf("withDefaults() changed explicit values: %+v", got)
 	}
@@ -28,16 +29,18 @@ func TestConfigValidate(t *testing.T) {
 		mutate func(*Config)
 		field  string
 	}{
-		"queue too small":  {func(c *Config) { c.QueueSize = -1 }, "queue_size"},
-		"queue too large":  {func(c *Config) { c.QueueSize = 65537 }, "queue_size"},
-		"no workers":       {func(c *Config) { c.Workers = -1 }, "workers"},
-		"too many workers": {func(c *Config) { c.Workers = 65 }, "workers"},
-		"claims too few":   {func(c *Config) { c.MaxClaimsPerResponse = -1 }, "max_claims_per_response"},
-		"claims too many":  {func(c *Config) { c.MaxClaimsPerResponse = 21 }, "max_claims_per_response"},
-		"audit timeout":    {func(c *Config) { c.AuditTimeoutSeconds = 601 }, "audit_timeout_seconds"},
-		"drain timeout":    {func(c *Config) { c.DrainTimeoutSeconds = -1 }, "drain_timeout_seconds"},
-		"negative ttl":     {func(c *Config) { c.CacheTTLSeconds = -1 }, "cache_ttl_seconds"},
-		"ttl too long":     {func(c *Config) { c.CacheTTLSeconds = 30*24*3600 + 1 }, "cache_ttl_seconds"},
+		"queue too small":                        {func(c *Config) { c.QueueSize = -1 }, "queue_size"},
+		"queue too large":                        {func(c *Config) { c.QueueSize = 65537 }, "queue_size"},
+		"no workers":                             {func(c *Config) { c.Workers = -1 }, "workers"},
+		"too many workers":                       {func(c *Config) { c.Workers = 65 }, "workers"},
+		"claims too few":                         {func(c *Config) { c.MaxClaimsPerResponse = -1 }, "max_claims_per_response"},
+		"claims too many":                        {func(c *Config) { c.MaxClaimsPerResponse = 21 }, "max_claims_per_response"},
+		"audit timeout":                          {func(c *Config) { c.AuditTimeoutSeconds = 601 }, "audit_timeout_seconds"},
+		"drain timeout":                          {func(c *Config) { c.DrainTimeoutSeconds = -1 }, "drain_timeout_seconds"},
+		"settle under the cache's write timeout": {func(c *Config) { c.CacheWriteSettleSeconds = 30 }, "cache_write_settle_seconds"},
+		"settle too long":                        {func(c *Config) { c.CacheWriteSettleSeconds = 601 }, "cache_write_settle_seconds"},
+		"negative ttl":                           {func(c *Config) { c.CacheTTLSeconds = -1 }, "cache_ttl_seconds"},
+		"ttl too long":                           {func(c *Config) { c.CacheTTLSeconds = 30*24*3600 + 1 }, "cache_ttl_seconds"},
 	} {
 		c := ok
 		tc.mutate(&c)
@@ -51,11 +54,11 @@ func TestConfigValidate(t *testing.T) {
 // The gateway hands plugin config over as JSON from config.json.
 func TestConfigJSON(t *testing.T) {
 	var c Config
-	raw := `{"queue_size":32,"workers":4,"max_claims_per_response":7,"tavily_relay":"tv","audit_timeout_seconds":30,"drain_timeout_seconds":3,"verifier_virtual_key":"vk-v","cache_ttl_seconds":90}`
+	raw := `{"queue_size":32,"workers":4,"max_claims_per_response":7,"tavily_relay":"tv","audit_timeout_seconds":30,"drain_timeout_seconds":3,"verifier_virtual_key":"vk-v","cache_ttl_seconds":90,"cache_write_settle_seconds":40}`
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		t.Fatal(err)
 	}
-	if c != (Config{QueueSize: 32, Workers: 4, MaxClaimsPerResponse: 7, TavilyRelay: "tv", AuditTimeoutSeconds: 30, DrainTimeoutSeconds: 3, VerifierVirtualKey: "vk-v", CacheTTLSeconds: 90}) {
+	if c != (Config{QueueSize: 32, Workers: 4, MaxClaimsPerResponse: 7, TavilyRelay: "tv", AuditTimeoutSeconds: 30, DrainTimeoutSeconds: 3, VerifierVirtualKey: "vk-v", CacheTTLSeconds: 90, CacheWriteSettleSeconds: 40}) {
 		t.Errorf("decoded %+v", c)
 	}
 	out, _ := json.Marshal(Config{})

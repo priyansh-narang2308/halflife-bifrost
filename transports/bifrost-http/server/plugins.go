@@ -198,7 +198,21 @@ func loadBuiltinPlugin(ctx context.Context, name string, pluginConfig any, bifro
 		if err != nil {
 			return nil, fmt.Errorf("failed to marshal halflife plugin config: %w", err)
 		}
-		return halflife.Init(ctx, halflifeConfig, logger)
+		plugin, err := halflife.Init(ctx, halflifeConfig, logger)
+		if err != nil {
+			return nil, err
+		}
+		// Stale answers are evicted through the semantic cache plugin, looked
+		// up at eviction time because it can be loaded, reloaded or removed
+		// after Halflife.
+		plugin.SetCacheEvictor(func(cacheID string) error {
+			cache, err := lib.FindPluginAs[interface{ ClearCacheForCacheID(string) error }](bifrostConfig, semanticcache.PluginName)
+			if err != nil {
+				return err
+			}
+			return cache.ClearCacheForCacheID(cacheID)
+		})
+		return plugin, nil
 
 	default:
 		return nil, fmt.Errorf("unknown built-in plugin: %s", name)

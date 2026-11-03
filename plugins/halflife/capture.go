@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/plugins/semanticcache"
 )
 
 // Size caps for copied text. Longer text is cut on a rune boundary and the
@@ -43,6 +44,9 @@ type Capture struct {
 	CacheID      string
 	CacheHit     bool
 	CacheHitType string // "direct" or "semantic" on a hit
+	// CacheKey is the request's x-bf-cache-key partition, "" for the cache's
+	// default key. Entries are only ever served within their partition.
+	CacheKey string
 }
 
 // SkipReason says why a request produced no Capture.
@@ -204,6 +208,7 @@ func identify(c *Capture, ctx *schemas.BifrostContext) {
 	c.RequestID = ctxString(ctx, schemas.BifrostContextKeyRequestID)
 	c.VirtualKeyID = ctxString(ctx, schemas.BifrostContextKeyGovernanceVirtualKeyID)
 	c.VirtualKeyName = ctxString(ctx, schemas.BifrostContextKeyGovernanceVirtualKeyName)
+	c.CacheKey = ctxString(ctx, semanticcache.CacheKey)
 }
 
 func ctxString(ctx *schemas.BifrostContext, key schemas.BifrostContextKey) string {

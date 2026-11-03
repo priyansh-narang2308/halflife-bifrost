@@ -14,6 +14,9 @@ const (
 	DefaultTavilyRelay          = "tavily"
 	DefaultAuditTimeoutSeconds  = 60
 	DefaultDrainTimeoutSeconds  = 5
+	// The semantic cache's write timeout (semanticcache.CacheSetTimeout, 30s)
+	// plus a margin.
+	DefaultCacheWriteSettleSeconds = 35
 
 	maxCacheTTLSeconds = 30 * 24 * 3600
 )
@@ -48,6 +51,12 @@ type Config struct {
 	// no audit flags it. A shorter per-request x-bf-cache-ttl still wins.
 	// Zero leaves the cache's own TTL in place.
 	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
+	// CacheWriteSettleSeconds bounds how long after a response the semantic
+	// cache may still be writing it (its write timeout is 30s). An answer
+	// found stale within this window is deleted now and again once the
+	// window closes; until then its cache partition bypasses the cache, so
+	// a write landing after the first delete is never served.
+	CacheWriteSettleSeconds int `json:"cache_write_settle_seconds,omitempty"`
 }
 
 func (c Config) auditTimeout() time.Duration {
@@ -55,6 +64,9 @@ func (c Config) auditTimeout() time.Duration {
 }
 func (c Config) drainTimeout() time.Duration {
 	return time.Duration(c.DrainTimeoutSeconds) * time.Second
+}
+func (c Config) cacheWriteSettle() time.Duration {
+	return time.Duration(c.CacheWriteSettleSeconds) * time.Second
 }
 func (c Config) cacheTTL() time.Duration {
 	return time.Duration(c.CacheTTLSeconds) * time.Second
@@ -77,6 +89,9 @@ func (c Config) withDefaults() Config {
 	if c.DrainTimeoutSeconds == 0 {
 		c.DrainTimeoutSeconds = DefaultDrainTimeoutSeconds
 	}
+	if c.CacheWriteSettleSeconds == 0 {
+		c.CacheWriteSettleSeconds = DefaultCacheWriteSettleSeconds
+	}
 	c.VerifierVirtualKey = strings.TrimSpace(c.VerifierVirtualKey)
 	c.TavilyRelay = strings.TrimSpace(c.TavilyRelay)
 	if c.TavilyRelay == "" {
@@ -98,6 +113,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: audit_timeout_seconds must be between 1 and 600, got %d", c.AuditTimeoutSeconds)
 	case c.DrainTimeoutSeconds < 1 || c.DrainTimeoutSeconds > 60:
 		return fmt.Errorf("halflife: drain_timeout_seconds must be between 1 and 60, got %d", c.DrainTimeoutSeconds)
+	case c.CacheWriteSettleSeconds < 31 || c.CacheWriteSettleSeconds > 600:
+		return fmt.Errorf("halflife: cache_write_settle_seconds must be between 31 and 600 (the cache writes for up to 30s), got %d", c.CacheWriteSettleSeconds)
 	case c.CacheTTLSeconds < 0 || c.CacheTTLSeconds > maxCacheTTLSeconds:
 		return fmt.Errorf("halflife: cache_ttl_seconds must be between 0 and %d, got %d", maxCacheTTLSeconds, c.CacheTTLSeconds)
 	}

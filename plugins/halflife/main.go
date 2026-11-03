@@ -58,6 +58,10 @@ type Plugin struct {
 	sink func(*Capture) bool
 	// links resolves cache hits to the report of the answer they replay.
 	links *cacheLinks
+	// verify decides whether an audited answer is stale.
+	verify func(context.Context, *Capture) (stale bool, err error)
+	// inv evicts stale answers from the semantic cache.
+	inv *invalidator
 
 	cachedHits, captured, skippedFailed, skippedStreaming, skippedUnsupported, skippedVerifier atomic.Uint64
 }
@@ -70,13 +74,28 @@ type Stats struct {
 	SkippedStreaming   uint64
 	SkippedUnsupported uint64
 	SkippedVerifier    uint64
+	Invalidated        uint64 // stale answers evicted from the semantic cache
+	BypassedRequests   uint64 // requests sent past the cache while an eviction settles
 }
 
-// auditPlaceholder stands in for the verifier until it exists: it only marks
-// that the capture reached a worker.
-func (p *Plugin) auditPlaceholder(_ context.Context, c *Capture) error {
-	p.logger.Debug("halflife: audit report=%s (no verifier yet)", c.ReportID)
+// audit runs on a pool worker: verify the answer, and evict it from the
+// semantic cache if it is stale.
+func (p *Plugin) audit(ctx context.Context, c *Capture) error {
+	stale, err := p.verify(ctx, c)
+	if err != nil {
+		return err
+	}
+	if stale {
+		p.invalidate(c)
+	}
 	return nil
+}
+
+// verifyPlaceholder stands in for the verifier until it exists: it only marks
+// that the capture reached a worker, and finds nothing stale.
+func (p *Plugin) verifyPlaceholder(_ context.Context, c *Capture) (bool, error) {
+	p.logger.Debug("halflife: audit report=%s (no verifier yet)", c.ReportID)
+	return false, nil
 }
 
 var (
@@ -99,7 +118,9 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 		logger = bifrost.NewNoOpLogger()
 	}
 	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks)}
-	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.auditPlaceholder)
+	p.verify = p.verifyPlaceholder
+	p.inv = newInvalidator(cfg.cacheWriteSettle(), logger)
+	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.audit)
 	p.sink = p.pool.submit
 	verifier := cfg.VerifierVirtualKey
 	if verifier == "" {
@@ -129,6 +150,8 @@ func (p *Plugin) Stats() Stats {
 		SkippedStreaming:   p.skippedStreaming.Load(),
 		SkippedUnsupported: p.skippedUnsupported.Load(),
 		SkippedVerifier:    p.skippedVerifier.Load(),
+		Invalidated:        p.inv.invalidated.Load(),
+		BypassedRequests:   p.inv.bypassed.Load(),
 	}
 }
 
@@ -146,6 +169,7 @@ func (p *Plugin) Cleanup() error {
 		return nil
 	}
 	drained := p.pool.close(p.config.drainTimeout())
+	p.inv.close()
 	p.logger.Info("halflife: stopped (%s)", p.pool.stats())
 	if !drained {
 		return fmt.Errorf("halflife: audit workers still running after shutdown")
@@ -171,6 +195,7 @@ func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostReq
 		}
 	}
 	p.capCacheTTL(ctx)
+	p.inv.bypassIfPending(ctx)
 	return req, nil, nil
 }
 

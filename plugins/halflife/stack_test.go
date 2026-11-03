@@ -187,6 +187,17 @@ type gatedStore struct {
 	gate   chan struct{}
 	queued atomic.Int32 // writes waiting at the gate
 	stored sync.Map     // entry id -> metadata of every write that reached the store
+	// chromem-go reads its document map in Delete without the lock its Add
+	// takes (chromem-go v0.7.0, collection.go), so a delete racing a write is a
+	// data race in the test store itself. Writes and deletes are serialized
+	// here; Redis, the gateway's store, needs no such help.
+	writeMu sync.Mutex
+}
+
+func (g *gatedStore) Delete(ctx context.Context, namespace, id string) error {
+	g.writeMu.Lock()
+	defer g.writeMu.Unlock()
+	return g.VectorStore.Delete(ctx, namespace, id)
 }
 
 // expiresIn is how far past now the stored entry id expires.
@@ -250,6 +261,8 @@ func (g *gatedStore) Add(ctx context.Context, namespace, id string, embedding []
 			return ctx.Err()
 		}
 	}
+	g.writeMu.Lock()
+	defer g.writeMu.Unlock()
 	g.stored.Store(id, metadata)
 	return g.VectorStore.Add(ctx, namespace, id, embedding, metadata)
 }
