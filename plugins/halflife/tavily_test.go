@@ -96,7 +96,7 @@ func TestTavilyExtractRequestContract(t *testing.T) {
 	f := newFakeRelay(t)
 	f.reply = relayReply(200, `{"results":[{"url":"https://e.com","raw_content":"page"}],"failed_results":[{"url":"https://bad","error":"Failed to fetch url"}],"usage":{"credits":0}}`)
 	tv := NewTavily(f.srv.URL, "tavily", "k", nil)
-	got, err := tv.Extract(context.Background(), []string{"https://e.com", "https://bad"}, Attribution{})
+	got, err := tv.Extract(context.Background(), ExtractRequest{URLs: []string{"https://e.com", "https://bad"}}, Attribution{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestTavilyExtractRequestContract(t *testing.T) {
 		t.Errorf("decoded %+v", got)
 	}
 	for _, n := range []int{0, 21} {
-		if _, err := tv.Extract(context.Background(), make([]string, n), Attribution{}); err == nil {
+		if _, err := tv.Extract(context.Background(), ExtractRequest{URLs: make([]string, n)}, Attribution{}); err == nil {
 			t.Errorf("%d URLs accepted", n)
 		}
 	}
@@ -191,7 +191,7 @@ func TestTavilyRelayContract(t *testing.T) {
 		t.Errorf("advanced search: %+v %v", s, err)
 	}
 	urls := []string{"https://a.example/1", "https://a.example/2", "https://a.example/3", "https://a.example/4", "https://a.example/5", "https://a.example/mock-fail"}
-	if e, err := tv.Extract(ctx, urls, Attribution{}); err != nil || len(e.Results) != 5 || len(e.FailedResults) != 1 || e.Usage.Credits != 1 {
+	if e, err := tv.Extract(ctx, ExtractRequest{URLs: urls}, Attribution{}); err != nil || len(e.Results) != 5 || len(e.FailedResults) != 1 || e.Usage.Credits != 1 {
 		t.Errorf("extract: %+v %v", e, err)
 	}
 	var te *TavilyError

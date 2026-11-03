@@ -87,6 +87,23 @@ type Config struct {
 	VerifierModels []string `json:"verifier_models,omitempty"`
 	// VerifierMaxTokens caps each verifier LLM reply, reasoning included.
 	VerifierMaxTokens int `json:"verifier_max_tokens,omitempty"`
+	// ModelCutoffs maps the model that answered ("provider/model" or
+	// "model", a trailing "*" matching a prefix) to its knowledge cutoff, as
+	// "YYYY", "YYYY-MM" or "YYYY-MM-DD". Verification priority measures how
+	// old the answer's information is from it; unknown models are assumed
+	// 18 months old. None are built in: vendors publish cutoffs
+	// inconsistently, so the operator supplies the ones they trust.
+	ModelCutoffs map[string]string `json:"model_cutoffs,omitempty"`
+	// PriorityBoostCategories raises claims of these categories one
+	// priority level (e.g. price, law: costly when wrong).
+	PriorityBoostCategories []string `json:"priority_boost_categories,omitempty"`
+	// PreferredDomains maps a claim category to domains its searches prefer
+	// (include_domains_mode "prefer": boosted, never exclusive), e.g.
+	// {"version": ["go.dev", "github.com"]}.
+	PreferredDomains map[string][]string `json:"preferred_domains,omitempty"`
+	// DisableExtract turns off the one Tavily Extract per claim made when
+	// the search snippets don't mention the claim's subject and value.
+	DisableExtract bool `json:"disable_extract,omitempty"`
 	// VerifierReasoningEffort, when set, is sent with each verifier LLM call
 	// as reasoning.effort: none, minimal, low, medium or high. Empty sends
 	// nothing, because models without reasoning may reject the parameter.
@@ -164,6 +181,24 @@ func (c Config) withDefaults() Config {
 	}
 	c.VerifierModels = models
 	c.VerifierReasoningEffort = strings.TrimSpace(c.VerifierReasoningEffort)
+	if c.PriorityBoostCategories != nil {
+		cats := make([]string, len(c.PriorityBoostCategories))
+		for i, cat := range c.PriorityBoostCategories {
+			cats[i] = strings.TrimSpace(cat)
+		}
+		c.PriorityBoostCategories = cats
+	}
+	if c.PreferredDomains != nil {
+		domains := make(map[string][]string, len(c.PreferredDomains))
+		for cat, ds := range c.PreferredDomains {
+			clean := make([]string, len(ds))
+			for i, d := range ds {
+				clean[i] = strings.ToLower(strings.TrimSpace(d))
+			}
+			domains[strings.TrimSpace(cat)] = clean
+		}
+		c.PreferredDomains = domains
+	}
 	verifiers := make([]VerifierKey, len(c.Verifiers))
 	for i, v := range c.Verifiers {
 		verifiers[i] = VerifierKey{Tenant: strings.TrimSpace(v.Tenant), VirtualKeyID: strings.TrimSpace(v.VirtualKeyID), VirtualKey: strings.TrimSpace(v.VirtualKey)}
@@ -195,6 +230,8 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: report_store_size must be between 1 and 1000000, got %d", c.ReportStoreSize)
 	case c.VerifierMaxTokens < 64 || c.VerifierMaxTokens > 16384:
 		return fmt.Errorf("halflife: verifier_max_tokens must be between 64 and 16384, got %d", c.VerifierMaxTokens)
+	case len(c.PriorityBoostCategories) > len(claimCategories):
+		return fmt.Errorf("halflife: priority_boost_categories lists %d categories; there are %d", len(c.PriorityBoostCategories), len(claimCategories))
 	case len(c.VerifierModels) > maxVerifierModels:
 		return fmt.Errorf("halflife: verifier_models takes at most %d models, got %d", maxVerifierModels, len(c.VerifierModels))
 	}
@@ -202,6 +239,24 @@ func (c Config) validate() error {
 	case "", "none", "minimal", "low", "medium", "high":
 	default:
 		return fmt.Errorf("halflife: verifier_reasoning_effort must be none, minimal, low, medium or high, got %q", c.VerifierReasoningEffort)
+	}
+	if _, err := newCutoffTable(c.ModelCutoffs); err != nil {
+		return err
+	}
+	for i, cat := range c.PriorityBoostCategories {
+		if !isCategory(cat) {
+			return fmt.Errorf("halflife: priority_boost_categories[%d] must be one of %s, got %q", i, strings.Join(claimCategories, ", "), cat)
+		}
+	}
+	for cat, domains := range c.PreferredDomains {
+		if !isCategory(cat) {
+			return fmt.Errorf("halflife: preferred_domains key must be one of %s, got %q", strings.Join(claimCategories, ", "), cat)
+		}
+		for _, d := range domains {
+			if d == "" || strings.ContainsAny(d, "/: ") {
+				return fmt.Errorf("halflife: preferred_domains[%s] must hold bare domains like go.dev, got %q", cat, d)
+			}
+		}
 	}
 	for i, m := range c.VerifierModels {
 		if provider, model, ok := strings.Cut(m, "/"); !ok || provider == "" || model == "" {
@@ -224,6 +279,15 @@ func (c Config) validate() error {
 		seen[v.Tenant] = true
 	}
 	return nil
+}
+
+func isCategory(c string) bool {
+	for _, k := range claimCategories {
+		if c == k {
+			return true
+		}
+	}
+	return false
 }
 
 // verifierKeyIDs returns every key whose requests the recursion guard skips.

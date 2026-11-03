@@ -1,0 +1,17 @@
+{
+  "_comment": "A priced answer: two current claims, settled history, advice, and one claim whose value drifted from the answer.",
+  "question": "How much does Acme Cloud Pro cost?",
+  "answer": "**Acme Cloud Pro** costs $49 per month and includes 100 GB of storage. Acme Cloud was founded in 2015 by Jordan Lee.\n\nYou should compare plans before buying.",
+  "extraction": {"claims": [
+    {"text": "Acme Cloud Pro costs $49 per month.", "span": "Acme Cloud Pro costs $49 per month", "subject": "Acme Cloud Pro", "attribute": "monthly price", "asserted_value": "$49 per month", "category": "price", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"},
+    {"text": "Acme Cloud Pro includes 100 GB of storage.", "span": "includes 100 GB of storage", "subject": "Acme Cloud Pro", "attribute": "included storage", "asserted_value": "100 GB", "category": "other", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"},
+    {"text": "Acme Cloud was founded in 2015 by Jordan Lee.", "span": "Acme Cloud was founded in 2015 by Jordan Lee", "subject": "Acme Cloud", "attribute": "founding year and founder", "asserted_value": "2015", "category": "event", "temporal_scope": "HISTORICAL", "as_of": "2015", "volatility_band": "NEVER"},
+    {"text": "Acme Cloud Pro costs $45 per month.", "span": "Acme Cloud Pro costs $49 per month", "subject": "Acme Cloud Pro", "attribute": "monthly price", "asserted_value": "$45", "category": "price", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"}
+  ]},
+  "want": [
+    {"status": "checked", "scope": "CURRENT", "priority": "HIGH"},
+    {"status": "checked", "scope": "CURRENT", "priority": "HIGH"},
+    {"status": "not_checked", "scope": "HISTORICAL", "priority": "SKIP", "reason": "priority SKIP: historical"},
+    {"status": "rejected", "reason": "asserted value is not in the span"}
+  ]
+}

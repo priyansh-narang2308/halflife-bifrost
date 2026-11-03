@@ -50,13 +50,32 @@ type Attribution struct {
 
 // SearchRequest is the subset of Tavily Search parameters Halflife uses.
 type SearchRequest struct {
-	Query          string   `json:"query"`
-	SearchDepth    string   `json:"search_depth"` // basic when empty
-	MaxResults     int      `json:"max_results,omitempty"`
-	Topic          string   `json:"topic,omitempty"`
-	TimeRange      string   `json:"time_range,omitempty"`
-	IncludeDomains []string `json:"include_domains,omitempty"`
-	MaxAgeHours    int      `json:"max_age_hours,omitempty"`
+	Query       string `json:"query"`
+	SearchDepth string `json:"search_depth"` // basic when empty
+	MaxResults  int    `json:"max_results,omitempty"`
+	Topic       string `json:"topic,omitempty"`      // general, news or finance
+	TimeRange   string `json:"time_range,omitempty"` // day, week, month or year
+	// IncludeDomains with IncludeDomainsMode "prefer" boosts those domains
+	// without excluding others (Tavily refuses the mode without domains).
+	IncludeDomains     []string `json:"include_domains,omitempty"`
+	IncludeDomainsMode string   `json:"include_domains_mode,omitempty"`
+	ExactMatch         bool     `json:"exact_match,omitempty"` // only results containing the query's quoted phrase
+	ChunksPerSource    int      `json:"chunks_per_source,omitempty"`
+	// IncludePublishedDate asks for each result's published_date (beta).
+	IncludePublishedDate bool `json:"include_published_date,omitempty"`
+	// MaxAgeHours is the oldest cached page copy Tavily may serve; 0 means
+	// always fetch live, nil leaves Tavily's default. Non-paying plans may
+	// refuse it under load with 434.
+	MaxAgeHours *int `json:"max_age_hours,omitempty"`
+}
+
+// ExtractRequest is the subset of Tavily Extract parameters Halflife uses.
+type ExtractRequest struct {
+	URLs []string `json:"urls"`
+	// Query, when set, makes Tavily return the page's most relevant chunks
+	// instead of the whole page.
+	Query           string `json:"query,omitempty"`
+	ChunksPerSource int    `json:"chunks_per_source,omitempty"` // 1-5, only with Query
 }
 
 // SearchResult is one source returned by Search.
@@ -129,6 +148,10 @@ func (e *TavilyError) Retryable() bool {
 // Nothing should be retried until the limit changes.
 func (e *TavilyError) OutOfCredits() bool { return e.Status == 432 || e.Status == 433 }
 
+// LiveFetchRefused reports Tavily's 434: a non-paying plan refused a live
+// fetch (max_age_hours) under load; the same search without it may succeed.
+func (e *TavilyError) LiveFetchRefused() bool { return e.Status == 434 }
+
 // Search runs one Tavily search through the relay.
 func (t *Tavily) Search(ctx context.Context, req SearchRequest, attr Attribution) (*SearchResponse, error) {
 	if strings.TrimSpace(req.Query) == "" {
@@ -151,11 +174,15 @@ func (t *Tavily) Search(ctx context.Context, req SearchRequest, attr Attribution
 }
 
 // Extract fetches the given pages through the relay at basic depth.
-func (t *Tavily) Extract(ctx context.Context, urls []string, attr Attribution) (*ExtractResponse, error) {
-	if len(urls) == 0 || len(urls) > 20 {
-		return nil, fmt.Errorf("tavily relay: extract takes 1 to 20 URLs, got %d", len(urls))
+func (t *Tavily) Extract(ctx context.Context, req ExtractRequest, attr Attribution) (*ExtractResponse, error) {
+	if len(req.URLs) == 0 || len(req.URLs) > 20 {
+		return nil, fmt.Errorf("tavily relay: extract takes 1 to 20 URLs, got %d", len(req.URLs))
 	}
-	body := map[string]any{"urls": urls, "extract_depth": "basic", "include_usage": true}
+	body := struct {
+		ExtractRequest
+		ExtractDepth string `json:"extract_depth"`
+		IncludeUsage bool   `json:"include_usage"`
+	}{req, "basic", true}
 	var out ExtractResponse
 	id, err := t.post(ctx, "extract", body, attr, &out)
 	if err != nil {

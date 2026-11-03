@@ -1,0 +1,13 @@
+{
+  "_comment": "A version claim saying 'latest', and a span the extractor paraphrased instead of copying.",
+  "question": "What is the latest Go release?",
+  "answer": "The latest stable version of Go is 1.25, released in August 2025.",
+  "extraction": {"claims": [
+    {"text": "The latest stable version of Go is 1.25.", "span": "The latest stable version of Go is 1.25", "subject": "Go", "attribute": "latest stable version", "asserted_value": "1.25", "category": "version", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"},
+    {"text": "Go 1.25 is the newest Go release.", "span": "Go 1.25 is the newest release", "subject": "Go", "attribute": "latest version", "asserted_value": "1.25", "category": "version", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"}
+  ]},
+  "want": [
+    {"status": "checked", "scope": "CURRENT", "priority": "HIGH", "reason": ""},
+    {"status": "rejected", "reason": "span is not in the answer"}
+  ]
+}

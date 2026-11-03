@@ -1,0 +1,19 @@
+{
+  "_comment": "Scope overrides: a mislabelled former role, a future plan, a definition, and a dated present-tense figure.",
+  "question": "Tell me about Initech.",
+  "answer": "Jordan Lee was formerly the CTO of Initech. Initech will launch version 4 next year. A terabyte is 1,000 gigabytes. As of 2024, Initech has 1,200 employees. Since 2021, Dana Cruz has led Initech as CEO.",
+  "extraction": {"claims": [
+    {"text": "Jordan Lee was the CTO of Initech.", "span": "Jordan Lee was formerly the CTO of Initech", "subject": "Initech", "attribute": "CTO", "asserted_value": "Jordan Lee", "category": "leadership", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "YEARS"},
+    {"text": "Initech will launch version 4 next year.", "span": "Initech will launch version 4 next year", "subject": "Initech", "attribute": "next major version", "asserted_value": "version 4", "category": "version", "temporal_scope": "UNCLEAR", "as_of": "", "volatility_band": "WEEKS_MONTHS"},
+    {"text": "A terabyte is 1,000 gigabytes.", "span": "A terabyte is 1,000 gigabytes", "subject": "terabyte", "attribute": "size in gigabytes", "asserted_value": "1,000 gigabytes", "category": "other", "temporal_scope": "TIMELESS", "as_of": "", "volatility_band": "NEVER"},
+    {"text": "Initech has 1,200 employees as of 2024.", "span": "As of 2024, Initech has 1,200 employees", "subject": "Initech", "attribute": "employee count", "asserted_value": "1,200", "category": "statistic", "temporal_scope": "CURRENT", "as_of": "2024", "volatility_band": "YEAR"},
+    {"text": "Dana Cruz has led Initech as CEO since 2021.", "span": "Since 2021, Dana Cruz has led Initech as CEO", "subject": "Initech", "attribute": "CEO", "asserted_value": "Dana Cruz", "category": "leadership", "temporal_scope": "CURRENT", "as_of": "2021", "volatility_band": "YEARS"}
+  ]},
+  "want": [
+    {"status": "not_checked", "scope": "HISTORICAL", "priority": "SKIP", "scope_reason": "past-tense or 'formerly' wording"},
+    {"status": "not_checked", "scope": "FUTURE", "priority": "SKIP", "scope_reason": "future wording"},
+    {"status": "not_checked", "scope": "TIMELESS", "priority": "SKIP"},
+    {"status": "not_checked", "scope": "HISTORICAL", "priority": "SKIP", "scope_reason": "tied to a past date (as_of)"},
+    {"status": "checked", "scope": "CURRENT", "priority": "HIGH", "reason": ""}
+  ]
+}

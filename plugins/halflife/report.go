@@ -18,21 +18,33 @@ type Report struct {
 	CreatedAt   time.Time  `json:"created_at"`
 	CompletedAt *time.Time `json:"completed_at,omitempty"`
 
-	Tenant   ReportTenant   `json:"tenant"`
-	Answer   ReportAnswer   `json:"answer"`
-	Claim    *ReportClaim   `json:"claim,omitempty"`
-	Evidence *ReportSources `json:"evidence,omitempty"`
-	Error    string         `json:"error,omitempty"`
+	Tenant ReportTenant  `json:"tenant"`
+	Answer ReportAnswer  `json:"answer"`
+	Claims []ReportClaim `json:"claims"`
+	// Extraction is the extractor's LLM call, when one was made.
+	Extraction *LLMResult `json:"extraction,omitempty"`
+	Error      string     `json:"error,omitempty"`
 }
 
 // Report outcomes, set when the report completes.
 const (
-	OutcomeEvidenceFound   = "evidence_found"   // the claim's search returned sources
-	OutcomeNoEvidence      = "no_evidence"      // the search returned nothing
-	OutcomeNoClaim         = "no_claim"         // no sentence was worth checking
-	OutcomeNoVerifierKey   = "no_verifier_key"  // the tenant has no verifier key, and there is no "*" entry
-	OutcomeBudgetExhausted = "budget_exhausted" // the verifier key's budget refused the search (402)
-	OutcomeSearchFailed    = "search_failed"    // the relay or Tavily failed
+	OutcomeEvidenceFound    = "evidence_found"    // at least one claim's search returned sources
+	OutcomeNoEvidence       = "no_evidence"       // every search returned nothing
+	OutcomeNoClaim          = "no_claim"          // nothing in the answer was worth checking
+	OutcomeNothingToCheck   = "nothing_to_check"  // claims were found, but each was skipped or rejected
+	OutcomeNoVerifierKey    = "no_verifier_key"   // the tenant has no verifier key, and there is no "*" entry
+	OutcomeBudgetExhausted  = "budget_exhausted"  // the verifier key's budget refused the first call (402)
+	OutcomeSearchFailed     = "search_failed"     // the relay or Tavily failed for every claim tried
+	OutcomeExtractionFailed = "extraction_failed" // the extractor's reply was unusable or its call failed
+)
+
+// Claim statuses.
+const (
+	ClaimPending    = "pending"     // extracted and ranked, not yet searched
+	ClaimChecked    = "checked"     // searched; see Evidence
+	ClaimNotChecked = "not_checked" // skipped by priority, the per-answer cap or a spent budget; see StatusReason
+	ClaimRejected   = "rejected"    // failed the span check; never searched
+	ClaimFailed     = "failed"      // its search failed
 )
 
 const (
@@ -60,10 +72,28 @@ type ReportAnswer struct {
 	CacheID        string `json:"cache_id,omitempty"`
 }
 
-// ReportClaim is the sentence checked and the query searched for it.
+// ReportClaim is one claim from the answer, how it was classified, and what
+// was done about it. Claims picked by the M1 heuristic (no verifier model)
+// carry only Text, Span, Status, Query and Evidence.
 type ReportClaim struct {
-	Text  string `json:"text"`
-	Query string `json:"query"`
+	Text           string `json:"text"`
+	Span           string `json:"span"` // verbatim from the answer
+	Subject        string `json:"subject,omitempty"`
+	Attribute      string `json:"attribute,omitempty"`
+	AssertedValue  string `json:"asserted_value,omitempty"`
+	Category       string `json:"category,omitempty"`
+	TemporalScope  string `json:"temporal_scope,omitempty"`
+	ScopeReason    string `json:"scope_reason,omitempty"`
+	AsOf           string `json:"as_of,omitempty"`
+	VolatilityBand string `json:"volatility_band,omitempty"`
+	Priority       string `json:"priority,omitempty"`
+	PriorityReason string `json:"priority_reason,omitempty"`
+	Status         string `json:"status"`
+	StatusReason   string `json:"status_reason,omitempty"`
+	Query          string `json:"query,omitempty"`
+	// Search is the request sent to Tavily, policy included.
+	Search   *SearchRequest `json:"search,omitempty"`
+	Evidence *ReportSources `json:"evidence,omitempty"`
 }
 
 // ReportSources is the evidence found for the claim, and what it cost.
@@ -72,6 +102,8 @@ type ReportSources struct {
 	SearchDepth      string         `json:"search_depth"`
 	Credits          float64        `json:"credits"`
 	Reused           bool           `json:"reused"`                       // served from an earlier identical search (D34): no new credits
+	LiveFetchRefused bool           `json:"live_fetch_refused,omitempty"` // Tavily refused max_age_hours (434); served from its cache instead
+	ExtractedURL     string         `json:"extracted_url,omitempty"`      // the page fetched with Extract because the snippets were thin
 	GatewayRequestID string         `json:"gateway_request_id,omitempty"` // the relay call, in Bifrost's relay log
 	TavilyRequestID  string         `json:"tavily_request_id,omitempty"`
 	Sources          []ReportSource `json:"sources"`
@@ -84,6 +116,7 @@ type ReportSource struct {
 	Score         float64 `json:"score"`
 	PublishedDate string  `json:"published_date,omitempty"`
 	Snippet       string  `json:"snippet"`
+	Extracted     string  `json:"extracted,omitempty"` // the page's most relevant chunks, from Extract
 }
 
 // newReport starts the report for a capture about to be queued.
@@ -95,7 +128,26 @@ func newReport(c *Capture) *Report {
 			Provider: string(c.Provider), Model: c.Model, RequestedModel: c.RequestedModel, IsFallback: c.IsFallback,
 			Question: c.Question, Text: c.Answer, Truncated: c.Truncated, CacheID: c.CacheID,
 		},
+		Claims: []ReportClaim{},
 	}
+}
+
+func (c ReportClaim) clone() ReportClaim {
+	if c.Search != nil {
+		s := *c.Search
+		s.IncludeDomains = append([]string(nil), c.Search.IncludeDomains...)
+		if c.Search.MaxAgeHours != nil {
+			h := *c.Search.MaxAgeHours
+			s.MaxAgeHours = &h
+		}
+		c.Search = &s
+	}
+	if c.Evidence != nil {
+		ev := *c.Evidence
+		ev.Sources = append(make([]ReportSource, 0, len(c.Evidence.Sources)), c.Evidence.Sources...) // keep [] as [] in JSON
+		c.Evidence = &ev
+	}
+	return c
 }
 
 // clone returns a deep copy, so readers never share the store's report.
@@ -105,16 +157,14 @@ func (r *Report) clone() Report {
 		t := *r.CompletedAt
 		out.CompletedAt = &t
 	}
-	if r.Claim != nil {
-		cl := *r.Claim
-		out.Claim = &cl
+	out.Claims = make([]ReportClaim, len(r.Claims))
+	for i, c := range r.Claims {
+		out.Claims[i] = c.clone()
 	}
-	if r.Evidence != nil {
-		ev := *r.Evidence
-		if r.Evidence.Sources != nil { // keep [] as [] in JSON
-			ev.Sources = append(make([]ReportSource, 0, len(r.Evidence.Sources)), r.Evidence.Sources...)
-		}
-		out.Evidence = &ev
+	if r.Extraction != nil {
+		ex := *r.Extraction
+		ex.GatewayRequestIDs = append([]string{}, r.Extraction.GatewayRequestIDs...)
+		out.Extraction = &ex
 	}
 	return out
 }

@@ -37,14 +37,21 @@ func TestReportStoreEvictsOldest(t *testing.T) {
 func TestReportStoreReturnsCopies(t *testing.T) {
 	s := newReportStore(2)
 	done := time.Now()
-	s.put(&Report{ID: "a", CompletedAt: &done, Claim: &ReportClaim{Text: "c"},
-		Evidence: &ReportSources{Sources: []ReportSource{{URL: "https://one.example"}}}})
+	h := 24
+	s.put(&Report{ID: "a", CompletedAt: &done, Claims: []ReportClaim{{Text: "c",
+		Search:   &SearchRequest{IncludeDomains: []string{"one.example"}, MaxAgeHours: &h},
+		Evidence: &ReportSources{Sources: []ReportSource{{URL: "https://one.example"}}}}},
+		Extraction: &LLMResult{GatewayRequestIDs: []string{"gw-1"}}})
 	got, _ := s.get("a")
-	got.Claim.Text = "changed"
-	got.Evidence.Sources[0].URL = "changed"
-	*got.CompletedAt = time.Time{}
+	got.Claims[0].Text = "changed"
+	got.Claims[0].Evidence.Sources[0].URL = "changed"
+	got.Claims[0].Search.IncludeDomains[0] = "changed"
+	*got.Claims[0].Search.MaxAgeHours = 0
+	got.Extraction.GatewayRequestIDs[0] = "changed"
 	again, _ := s.get("a")
-	if again.Claim.Text != "c" || again.Evidence.Sources[0].URL != "https://one.example" || again.CompletedAt.IsZero() {
+	c := again.Claims[0]
+	if c.Text != "c" || c.Evidence.Sources[0].URL != "https://one.example" || c.Search.IncludeDomains[0] != "one.example" ||
+		*c.Search.MaxAgeHours != 24 || again.Extraction.GatewayRequestIDs[0] != "gw-1" || again.CompletedAt.IsZero() {
 		t.Errorf("store shared memory with a reader: %+v", again)
 	}
 }

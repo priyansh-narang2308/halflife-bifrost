@@ -1,0 +1,15 @@
+{
+  "_comment": "A multi-claim sentence with negation: one claim keeps it, one drops it.",
+  "question": "Does Acme have a free plan?",
+  "answer": "Acme no longer offers a free tier, and the Team plan costs $15 per user per month.",
+  "extraction": {"claims": [
+    {"text": "Acme offers a free tier.", "span": "Acme no longer offers a free tier", "subject": "Acme", "attribute": "free tier", "asserted_value": "", "category": "price", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"},
+    {"text": "Acme no longer offers a free tier.", "span": "Acme no longer offers a free tier", "subject": "Acme", "attribute": "free tier", "asserted_value": "", "category": "price", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"},
+    {"text": "The Acme Team plan costs $15 per user per month.", "span": "the Team plan costs $15 per user per month", "subject": "Acme Team plan", "attribute": "price per user per month", "asserted_value": "$15", "category": "price", "temporal_scope": "CURRENT", "as_of": "", "volatility_band": "WEEKS_MONTHS"}
+  ]},
+  "want": [
+    {"status": "rejected", "reason": "text and span disagree on negation"},
+    {"status": "checked", "scope": "CURRENT", "priority": "HIGH"},
+    {"status": "checked", "scope": "CURRENT", "priority": "HIGH"}
+  ]
+}

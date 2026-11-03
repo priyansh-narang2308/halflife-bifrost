@@ -61,7 +61,15 @@ func TestConfigValidate(t *testing.T) {
 		"verifier model without a provider":     {func(c *Config) { c.VerifierModels = []string{"gpt-4o"} }, "verifier_models[0]"},
 		"verifier model with an empty provider": {func(c *Config) { c.VerifierModels = []string{"openai/ok", "/x"} }, "verifier_models[1]"},
 		"unknown reasoning effort":              {func(c *Config) { c.VerifierReasoningEffort = "max" }, "verifier_reasoning_effort"},
-		"tenant verifies itself":                {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
+		"cutoff not a date":                     {func(c *Config) { c.ModelCutoffs = map[string]string{"openai/gpt-x": "mid 2024"} }, "model_cutoffs"},
+		"boost unknown category":                {func(c *Config) { c.PriorityBoostCategories = []string{"weather"} }, "priority_boost_categories[0]"},
+		"too many boost categories": {func(c *Config) {
+			c.PriorityBoostCategories = []string{"law", "law", "law", "law", "law", "law", "law", "law"}
+		}, "priority_boost_categories lists 8"},
+		"domains for unknown category": {func(c *Config) { c.PreferredDomains = map[string][]string{"weather": {"x.dev"}} }, "preferred_domains key"},
+		"domain is a URL":              {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {"https://go.dev"}} }, "bare domains"},
+		"empty domain":                 {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {""}} }, "bare domains"},
+		"tenant verifies itself":       {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
 	} {
 		c := ok
 		tc.mutate(&c)
@@ -104,5 +112,22 @@ func TestConfigVerifiersJSON(t *testing.T) {
 	c.VerifierVirtualKey = "vk-legacy"
 	if got := c.verifierKeyIDs(); !reflect.DeepEqual(got, map[string]bool{"vk-legacy": true, "vk-verifier-acme": true, "vk-verifier": true}) {
 		t.Errorf("guarded keys = %v", got)
+	}
+}
+
+// The claim pipeline's settings decode from JSON and are tidied before use.
+func TestConfigClaimPipelineJSON(t *testing.T) {
+	var c Config
+	raw := `{"model_cutoffs":{"openai/gpt-x*":"2025-06"},"priority_boost_categories":[" law "],"preferred_domains":{" version ":[" Go.dev "]},"disable_extract":true}`
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatal(err)
+	}
+	c = c.withDefaults()
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.ModelCutoffs["openai/gpt-x*"] != "2025-06" || c.PriorityBoostCategories[0] != "law" ||
+		!reflect.DeepEqual(c.PreferredDomains, map[string][]string{"version": {"go.dev"}}) || !c.DisableExtract {
+		t.Errorf("decoded %+v", c)
 	}
 }

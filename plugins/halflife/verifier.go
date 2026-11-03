@@ -2,6 +2,7 @@ package halflife
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,9 +14,13 @@ import (
 	"github.com/maximhq/bifrost/framework/envutils"
 )
 
-// The minimal verifier (M1): pick one claim, search Tavily for it through the
-// relay with the tenant's verifier key, and store the sources on the report.
-// It judges nothing yet, so it never finds an answer stale.
+// The verifier audits one answer and completes its report. With verifier
+// models configured it extracts atomic claims through the gateway, rejects
+// any that drifted from the answer, classifies their temporal scope, ranks
+// them by verification priority and searches the highest-ranked ones with a
+// per-category retrieval policy. Without models it falls back to M1's
+// heuristic: one keyword-picked sentence, searched as is. It judges nothing
+// yet, so it never finds an answer stale.
 
 const (
 	searchMemoTTL    = 10 * time.Minute // D34: an identical search inside this window is reused
@@ -28,6 +33,7 @@ const (
 // searcher is the part of the Tavily client the verifier uses.
 type searcher interface {
 	Search(ctx context.Context, req SearchRequest, attr Attribution) (*SearchResponse, error)
+	Extract(ctx context.Context, req ExtractRequest, attr Attribution) (*ExtractResponse, error)
 }
 
 type verifierKey struct {
@@ -40,23 +46,42 @@ type verifier struct {
 	newClient  func(key verifierKey) searcher
 	newLLM     func(key verifierKey) *LLM // nil when no verifier models are configured
 	maxResults int
+	maxClaims  int // searches per answer
+	cutoffs    cutoffTable
+	boosted    map[string]bool     // categories raised one priority level
+	domains    map[string][]string // category -> preferred domains
+	extract    bool                // Extract the best page when snippets are thin
 	reports    *reportStore
 	memo       *searchMemo
 	logger     schemas.Logger
 	sleep      func(context.Context, time.Duration) error
+	now        func() time.Time
 }
 
 // newVerifier resolves each verifier key's secret (env.VAR allowed). It fails
 // if one is missing, naming the variable, never a value.
 func newVerifier(cfg Config, reports *reportStore, logger schemas.Logger) (*verifier, error) {
+	cutoffs, err := newCutoffTable(cfg.ModelCutoffs)
+	if err != nil {
+		return nil, err
+	}
 	httpClient := &http.Client{Timeout: 30 * time.Second}
 	v := &verifier{
 		keys:       make(map[string]verifierKey, len(cfg.Verifiers)),
 		maxResults: cfg.SearchMaxResults,
+		maxClaims:  cfg.MaxClaimsPerResponse,
+		cutoffs:    cutoffs,
+		boosted:    make(map[string]bool, len(cfg.PriorityBoostCategories)),
+		domains:    cfg.PreferredDomains,
+		extract:    !cfg.DisableExtract,
 		reports:    reports,
 		memo:       newSearchMemo(searchMemoSize, searchMemoTTL),
 		logger:     logger,
 		sleep:      sleepCtx,
+		now:        time.Now,
+	}
+	for _, c := range cfg.PriorityBoostCategories {
+		v.boosted[c] = true
 	}
 	v.newClient = func(key verifierKey) searcher {
 		return NewTavily(cfg.GatewayURL, cfg.TavilyRelay, key.value, httpClient)
@@ -99,84 +124,263 @@ func (v *verifier) llmFor(tenant string) (*LLM, verifierKey, bool) {
 	return v.newLLM(key), key, true
 }
 
+// audit is the outcome of one answer's verification.
+type audit struct {
+	outcome    string
+	claims     []ReportClaim
+	extraction *LLMResult
+	err        error
+}
+
 // verify audits one capture and completes its report. Expected outcomes (no
-// claim, no key, budget spent) are not errors; a failed search is.
+// claim, no key, budget spent, nothing worth checking) are not errors;
+// failed searches and a failed extraction are.
 func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 	v.reports.update(c.ReportID, func(r *Report) { r.Status = ReportRunning })
-	outcome, claim, evidence, err := v.run(ctx, c)
+	var a audit
+	if v.newLLM == nil {
+		a = v.runHeuristic(ctx, c)
+	} else {
+		a = v.runExtracted(ctx, c)
+	}
+	if a.claims == nil {
+		a.claims = []ReportClaim{}
+	}
 	now := time.Now().UTC()
 	v.reports.update(c.ReportID, func(r *Report) {
-		r.Status, r.Outcome, r.Claim, r.Evidence, r.CompletedAt = ReportComplete, outcome, claim, evidence, &now
-		if err != nil {
-			r.Error = err.Error()
+		r.Status, r.Outcome, r.Claims, r.Extraction, r.CompletedAt = ReportComplete, a.outcome, a.claims, a.extraction, &now
+		if a.err != nil {
+			r.Error = a.err.Error()
 		}
 	})
-	v.logger.Debug("halflife: report %s complete: outcome=%s", c.ReportID, outcome)
-	if outcome == OutcomeSearchFailed {
-		return false, err
+	v.logger.Debug("halflife: report %s complete: outcome=%s claims=%d", c.ReportID, a.outcome, len(a.claims))
+	if a.outcome == OutcomeSearchFailed || a.outcome == OutcomeExtractionFailed {
+		return false, a.err
 	}
 	return false, nil
 }
 
-func (v *verifier) run(ctx context.Context, c *Capture) (string, *ReportClaim, *ReportSources, error) {
+// runHeuristic is M1's path: one keyword-picked sentence, searched as is.
+func (v *verifier) runHeuristic(ctx context.Context, c *Capture) audit {
 	text, ok := pickClaim(c.Answer)
 	if !ok {
-		return OutcomeNoClaim, nil, nil, nil
+		return audit{outcome: OutcomeNoClaim}
 	}
-	claim := &ReportClaim{Text: text, Query: buildQuery(text, c.Question)}
+	claim := ReportClaim{Text: text, Span: text, Status: ClaimPending, Query: buildQuery(text, c.Question)}
 	key, ok := v.keyFor(c.VirtualKeyID)
 	if !ok {
-		return OutcomeNoVerifierKey, claim, nil, nil
+		claim.Status, claim.StatusReason = ClaimNotChecked, "no verifier key"
+		return audit{outcome: OutcomeNoVerifierKey, claims: []ReportClaim{claim}}
 	}
-	evidence := &ReportSources{VerifierKeyID: key.id, SearchDepth: "basic", Sources: []ReportSource{}}
+	req := SearchRequest{Query: claim.Query, SearchDepth: "basic", MaxResults: v.maxResults}
+	err := v.check(ctx, key, c, &claim, req, false)
+	return audit{outcome: outcomeOf([]ReportClaim{claim}, err), claims: []ReportClaim{claim}, err: err}
+}
 
-	memoKey := c.VirtualKeyID + "\x00" + strings.ToLower(claim.Query)
+// runExtracted is the model path: extract, filter, rank, then search.
+func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
+	llm, key, ok := v.llmFor(c.VirtualKeyID)
+	if !ok {
+		return audit{outcome: OutcomeNoVerifierKey}
+	}
+	extracted, res, err := extractClaims(ctx, llm, c.Question, c.Answer)
+	var le *LLMError
+	switch {
+	case errors.As(err, &le) && le.BudgetSpent():
+		return audit{outcome: OutcomeBudgetExhausted, extraction: res, err: err}
+	case err != nil:
+		return audit{outcome: OutcomeExtractionFailed, extraction: res, err: err}
+	case len(extracted) == 0:
+		return audit{outcome: OutcomeNoClaim, extraction: res}
+	}
+
+	now := v.now()
+	claims := make([]ReportClaim, len(extracted))
+	for i, e := range extracted {
+		claims[i] = v.classify(e, c, now)
+	}
+	ptrs := make([]*ReportClaim, len(claims))
+	for i := range claims {
+		ptrs[i] = &claims[i]
+	}
+
+	var firstErr error
+	searched, spent := 0, false
+	for _, rc := range rankForChecking(ptrs, v.boosted) {
+		switch {
+		case spent:
+			rc.Status, rc.StatusReason = ClaimNotChecked, "verifier budget spent (402)"
+			continue
+		case searched >= v.maxClaims:
+			rc.Status, rc.StatusReason = ClaimNotChecked, fmt.Sprintf("over max_claims_per_response (%d)", v.maxClaims)
+			continue
+		}
+		searched++
+		req := retrievalPolicy(rc, v.maxResults, v.domains[rc.Category])
+		if err := v.check(ctx, key, c, rc, req, v.extract); err != nil {
+			spent = isBudgetRefusal(err) // the key's budget covers every later call too
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	for i := range claims {
+		if claims[i].Status == ClaimPending { // SKIP
+			claims[i].Status, claims[i].StatusReason = ClaimNotChecked, "priority SKIP: "+claims[i].PriorityReason
+		}
+	}
+	return audit{outcome: outcomeOf(claims, firstErr), claims: claims, extraction: res, err: firstErr}
+}
+
+// classify turns an extracted claim into a report claim: span check, then
+// temporal scope, then priority.
+func (v *verifier) classify(e extractedClaim, c *Capture, now time.Time) ReportClaim {
+	rc := ReportClaim{
+		Text: e.Text, Span: e.Span, Subject: e.Subject, Attribute: e.Attribute, AssertedValue: e.AssertedValue,
+		Category: e.Category, AsOf: e.AsOf, VolatilityBand: e.VolatilityBand, Status: ClaimPending,
+	}
+	if reason := checkSpan(e, c.Answer); reason != "" {
+		rc.Status, rc.StatusReason = ClaimRejected, reason
+		return rc
+	}
+	rc.TemporalScope, rc.ScopeReason = classifyScope(e, now)
+	rc.Priority, rc.PriorityReason = prioritise(priorityInput{
+		Scope: rc.TemporalScope, Band: rc.VolatilityBand, Category: rc.Category, AsOf: rc.AsOf, Span: rc.Span,
+		Provider: string(c.Provider), Model: c.Model,
+	}, v.cutoffs, v.boosted, now)
+	return rc
+}
+
+// outcomeOf summarises the claims' statuses into the report's outcome.
+func outcomeOf(claims []ReportClaim, err error) string {
+	var checked, failed, budget, evidence int
+	for _, c := range claims {
+		switch {
+		case c.Status == ClaimChecked:
+			checked++
+			if c.Evidence != nil && len(c.Evidence.Sources) > 0 {
+				evidence++
+			}
+		case c.Status == ClaimFailed:
+			failed++
+		case c.Status == ClaimNotChecked && strings.Contains(c.StatusReason, "402"):
+			budget++
+		}
+	}
+	switch {
+	case evidence > 0:
+		return OutcomeEvidenceFound
+	case checked > 0:
+		return OutcomeNoEvidence
+	case budget > 0:
+		return OutcomeBudgetExhausted
+	case failed > 0 || err != nil:
+		return OutcomeSearchFailed
+	case len(claims) == 0:
+		return OutcomeNoClaim
+	}
+	return OutcomeNothingToCheck
+}
+
+// check searches one claim and records the evidence on it. A 402 leaves the
+// claim not checked; any other failure marks it failed. Both are returned.
+func (v *verifier) check(ctx context.Context, key verifierKey, c *Capture, rc *ReportClaim, req SearchRequest, extract bool) error {
+	rc.Query, rc.Search = req.Query, &req
+	evidence := &ReportSources{VerifierKeyID: key.id, SearchDepth: "basic", Sources: []ReportSource{}}
+	attr := Attribution{Tenant: c.VirtualKeyID, Report: c.ReportID}
+	client := v.newClient(key)
+
+	memoKey := c.VirtualKeyID + "\x00" + memoRequestKey(req)
 	resp, reused := v.memo.get(memoKey)
 	if !reused {
+		var refused bool
 		var err error
-		resp, err = v.search(ctx, key, claim.Query, Attribution{Tenant: c.VirtualKeyID, Report: c.ReportID})
-		var te *TavilyError
-		switch {
-		case errors.As(err, &te) && te.Status == http.StatusPaymentRequired:
-			// D36: the key's budget is spent for this window; retrying only adds refusals.
-			return OutcomeBudgetExhausted, claim, evidence, err
-		case err != nil:
-			return OutcomeSearchFailed, claim, evidence, err
+		resp, refused, err = v.search(ctx, client, req, attr)
+		if err != nil {
+			return v.recordFailure(rc, evidence, err)
 		}
 		v.memo.put(memoKey, resp)
-		evidence.Credits = resp.Usage.Credits
-		evidence.GatewayRequestID = resp.GatewayRequestID
+		evidence.Credits, evidence.GatewayRequestID, evidence.LiveFetchRefused = resp.Usage.Credits, resp.GatewayRequestID, refused
 	}
-	evidence.Reused = reused
-	evidence.TavilyRequestID = resp.RequestID
+	evidence.Reused, evidence.TavilyRequestID = reused, resp.RequestID
 	for _, r := range resp.Results {
 		snippet, _ := clip(strings.TrimSpace(r.Content), maxSnippetBytes)
 		evidence.Sources = append(evidence.Sources, ReportSource{Title: r.Title, URL: r.URL, Score: r.Score, PublishedDate: r.PublishedDate, Snippet: snippet})
 	}
-	if len(evidence.Sources) == 0 {
-		return OutcomeNoEvidence, claim, evidence, nil
+	rc.Status, rc.Evidence = ClaimChecked, evidence
+
+	// One Extract per claim at most, never for a reused search (its pages
+	// were already judged thin or not), and only when the snippets miss it.
+	if !extract || reused || !thinEvidence(rc, evidence.Sources) {
+		return nil
 	}
-	return OutcomeEvidenceFound, claim, evidence, nil
+	i := extractTarget(evidence.Sources, v.domains[rc.Category])
+	if i < 0 {
+		return nil
+	}
+	er, err := client.Extract(ctx, ExtractRequest{URLs: []string{evidence.Sources[i].URL}, Query: claimQuery(rc), ChunksPerSource: extractChunksPerSource}, attr)
+	if err != nil {
+		if isBudgetRefusal(err) {
+			rc.StatusReason = "extract refused: verifier budget spent (402)"
+			return err
+		}
+		rc.StatusReason = "extract failed: " + err.Error() // the search's evidence stands
+		return nil
+	}
+	evidence.Credits += er.Usage.Credits
+	evidence.ExtractedURL = evidence.Sources[i].URL
+	for _, r := range er.Results {
+		if r.URL == evidence.Sources[i].URL {
+			evidence.Sources[i].Extracted, _ = clip(strings.TrimSpace(r.RawContent), maxExtractedBytes)
+		}
+	}
+	return nil
 }
 
-// search runs one search, retrying once if Tavily or the gateway says a retry
-// may succeed (rate limit, capacity, server error).
-func (v *verifier) search(ctx context.Context, key verifierKey, query string, attr Attribution) (*SearchResponse, error) {
-	client := v.newClient(key)
-	req := SearchRequest{Query: query, SearchDepth: "basic", MaxResults: v.maxResults}
-	resp, err := client.Search(ctx, req, attr)
+func isBudgetRefusal(err error) bool {
 	var te *TavilyError
+	return errors.As(err, &te) && te.Status == http.StatusPaymentRequired
+}
+
+func (v *verifier) recordFailure(rc *ReportClaim, evidence *ReportSources, err error) error {
+	if isBudgetRefusal(err) {
+		// D36: the key's budget is spent for this window; retrying only adds refusals.
+		rc.Status, rc.StatusReason = ClaimNotChecked, "verifier budget spent (402)"
+	} else {
+		rc.Status, rc.StatusReason = ClaimFailed, err.Error()
+	}
+	rc.Evidence = evidence
+	return err
+}
+
+// memoRequestKey identifies a search by everything that changes its results.
+func memoRequestKey(req SearchRequest) string {
+	b, _ := json.Marshal(req)
+	return strings.ToLower(string(b))
+}
+
+// search runs one search. A refused live fetch (434) is retried at once
+// without max_age_hours; then a retryable failure (rate limit, capacity,
+// server error) is retried once after a wait. refused reports the first.
+func (v *verifier) search(ctx context.Context, client searcher, req SearchRequest, attr Attribution) (resp *SearchResponse, refused bool, err error) {
+	resp, err = client.Search(ctx, req, attr)
+	var te *TavilyError
+	if errors.As(err, &te) && te.LiveFetchRefused() && req.MaxAgeHours != nil {
+		req.MaxAgeHours, refused = nil, true
+		resp, err = client.Search(ctx, req, attr)
+	}
 	if err == nil || !errors.As(err, &te) || !te.Retryable() {
-		return resp, err
+		return resp, refused, err
 	}
 	wait := min(te.RetryAfter, maxRetryAfter)
 	if wait <= 0 {
 		wait = defaultRetryWait
 	}
 	if serr := v.sleep(ctx, wait); serr != nil {
-		return nil, err
+		return nil, refused, err
 	}
-	return client.Search(ctx, req, attr)
+	resp, err = client.Search(ctx, req, attr)
+	return resp, refused, err
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -190,7 +394,7 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-// searchMemo remembers recent search responses per tenant and query (D34:
+// searchMemo remembers recent search responses per tenant and request (D34:
 // Tavily bills a repeated query again, even when it serves it from its cache).
 type searchMemo struct {
 	mu      sync.Mutex

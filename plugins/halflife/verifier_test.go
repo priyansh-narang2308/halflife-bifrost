@@ -19,6 +19,9 @@ type fakeSearcher struct {
 	mu    sync.Mutex
 	calls []fakeCall
 	reply func(n int) (*SearchResponse, error) // n counts calls from 1
+
+	extracts     []ExtractRequest
+	extractReply func(req ExtractRequest) (*ExtractResponse, error)
 }
 
 type fakeCall struct {
@@ -44,6 +47,35 @@ func (k *keyedSearcher) Search(_ context.Context, req SearchRequest, attr Attrib
 	}
 	return &SearchResponse{RequestID: "tv-1", GatewayRequestID: "gw-1", Usage: TavilyUsage{Credits: 1},
 		Results: []SearchResult{{Title: "Acme pricing", URL: "https://acme.example/pricing", Content: "Pro is $59 per month.", Score: 0.9, PublishedDate: "2026-10-30"}}}, nil
+}
+
+func (k *keyedSearcher) Extract(_ context.Context, req ExtractRequest, attr Attribution) (*ExtractResponse, error) {
+	k.f.mu.Lock()
+	k.f.extracts = append(k.f.extracts, req)
+	k.f.mu.Unlock()
+	if k.f.extractReply != nil {
+		return k.f.extractReply(req)
+	}
+	out := &ExtractResponse{Usage: TavilyUsage{Credits: 1}}
+	for _, u := range req.URLs {
+		out.Results = append(out.Results, ExtractResult{URL: u, RawContent: "Extracted from " + u})
+	}
+	return out, nil
+}
+
+// claim0 and evidence0 are a report's first claim and its evidence, or nil.
+func claim0(r Report) *ReportClaim {
+	if len(r.Claims) == 0 {
+		return nil
+	}
+	return &r.Claims[0]
+}
+
+func evidence0(r Report) *ReportSources {
+	if c := claim0(r); c != nil {
+		return c.Evidence
+	}
+	return nil
 }
 
 func testVerifier(t *testing.T, keys ...VerifierKey) (*verifier, *fakeSearcher) {
@@ -95,18 +127,18 @@ func TestVerifierCollectsEvidence(t *testing.T) {
 	if r.Status != ReportComplete || r.Outcome != OutcomeEvidenceFound || r.Verdict != VerdictNone || r.CompletedAt == nil {
 		t.Errorf("report = %+v", r)
 	}
-	if r.Claim.Text != "It costs $49 per month." || r.Claim.Query != "How much is Acme Cloud Pro? It costs $49 per month." {
-		t.Errorf("claim = %+v", r.Claim)
+	if claim0(r).Text != "It costs $49 per month." || claim0(r).Query != "How much is Acme Cloud Pro? It costs $49 per month." {
+		t.Errorf("claim = %+v", claim0(r))
 	}
 	if len(f.calls) != 1 {
 		t.Fatalf("searches = %d", len(f.calls))
 	}
 	call := f.calls[0]
 	if call.key != "vk-verifier-acme" || call.attr != (Attribution{Tenant: "vk-acme", Report: "hlr_1"}) ||
-		!reflect.DeepEqual(call.req, SearchRequest{Query: r.Claim.Query, SearchDepth: "basic", MaxResults: DefaultSearchMaxResults}) {
+		!reflect.DeepEqual(call.req, SearchRequest{Query: claim0(r).Query, SearchDepth: "basic", MaxResults: DefaultSearchMaxResults}) {
 		t.Errorf("search = %+v", call)
 	}
-	e := r.Evidence
+	e := evidence0(r)
 	if e.VerifierKeyID != "vk-verifier-acme" || e.Credits != 1 || e.Reused || e.GatewayRequestID != "gw-1" || e.TavilyRequestID != "tv-1" ||
 		len(e.Sources) != 1 || e.Sources[0] != (ReportSource{Title: "Acme pricing", URL: "https://acme.example/pricing", Score: 0.9, PublishedDate: "2026-10-30", Snippet: "Pro is $59 per month."}) {
 		t.Errorf("evidence = %+v", e)
@@ -123,18 +155,18 @@ func TestVerifierKeyChoice(t *testing.T) {
 	v, f := testVerifier(t, acmeKey, sharedKey)
 	c := acmeCapture("hlr_g", "Globex Basic costs $10 per month.")
 	c.VirtualKeyID = "vk-globex"
-	if r, _ := runVerify(t, v, c); r.Evidence == nil || r.Evidence.VerifierKeyID != "vk-verifier" || f.calls[0].attr.Tenant != "vk-globex" {
-		t.Errorf("fallback key: %+v / %+v", r.Evidence, f.calls)
+	if r, _ := runVerify(t, v, c); evidence0(r) == nil || evidence0(r).VerifierKeyID != "vk-verifier" || f.calls[0].attr.Tenant != "vk-globex" {
+		t.Errorf("fallback key: %+v / %+v", evidence0(r), f.calls)
 	}
 	c.VirtualKeyID = "" // no governance on the request
-	if r, _ := runVerify(t, v, c); r.Evidence == nil || r.Evidence.VerifierKeyID != "vk-verifier" {
-		t.Errorf("keyless request: %+v", r.Evidence)
+	if r, _ := runVerify(t, v, c); evidence0(r) == nil || evidence0(r).VerifierKeyID != "vk-verifier" {
+		t.Errorf("keyless request: %+v", evidence0(r))
 	}
 
 	v, f = testVerifier(t, acmeKey)
 	c.VirtualKeyID = "vk-globex"
 	r, err := runVerify(t, v, c)
-	if err != nil || r.Outcome != OutcomeNoVerifierKey || r.Claim == nil || r.Evidence != nil || len(f.calls) != 0 {
+	if err != nil || r.Outcome != OutcomeNoVerifierKey || claim0(r) == nil || evidence0(r) != nil || len(f.calls) != 0 {
 		t.Errorf("no key: outcome %q err %v calls %d", r.Outcome, err, len(f.calls))
 	}
 }
@@ -142,7 +174,7 @@ func TestVerifierKeyChoice(t *testing.T) {
 func TestVerifierNoClaimSpendsNothing(t *testing.T) {
 	v, f := testVerifier(t, sharedKey)
 	r, err := runVerify(t, v, acmeCapture("hlr_n", "Recursion is when a function calls itself."))
-	if err != nil || r.Outcome != OutcomeNoClaim || r.Claim != nil || len(f.calls) != 0 {
+	if err != nil || r.Outcome != OutcomeNoClaim || claim0(r) != nil || len(f.calls) != 0 {
 		t.Errorf("outcome %q err %v calls %d", r.Outcome, err, len(f.calls))
 	}
 }
@@ -151,8 +183,8 @@ func TestVerifierNoEvidence(t *testing.T) {
 	v, f := testVerifier(t, sharedKey)
 	f.reply = func(int) (*SearchResponse, error) { return &SearchResponse{Usage: TavilyUsage{Credits: 1}}, nil }
 	r, err := runVerify(t, v, acmeCapture("hlr_e", "Acme Cloud Pro costs $49 per month."))
-	if err != nil || r.Outcome != OutcomeNoEvidence || r.Evidence.Credits != 1 || r.Evidence.Sources == nil {
-		t.Errorf("outcome %q err %v evidence %+v", r.Outcome, err, r.Evidence)
+	if err != nil || r.Outcome != OutcomeNoEvidence || evidence0(r).Credits != 1 || evidence0(r).Sources == nil {
+		t.Errorf("outcome %q err %v evidence %+v", r.Outcome, err, evidence0(r))
 	}
 }
 
@@ -204,9 +236,9 @@ func TestVerifierReusesIdenticalSearch(t *testing.T) {
 	v, f := testVerifier(t, acmeKey, sharedKey)
 	first, _ := runVerify(t, v, acmeCapture("hlr_1", "Acme Cloud Pro costs $49 per month."))
 	second, _ := runVerify(t, v, acmeCapture("hlr_2", "ACME cloud pro costs $49 per month."))
-	if len(f.calls) != 1 || first.Evidence.Reused || !second.Evidence.Reused || second.Evidence.Credits != 0 ||
-		second.Evidence.GatewayRequestID != "" || len(second.Evidence.Sources) != 1 {
-		t.Errorf("calls %d first %+v second %+v", len(f.calls), first.Evidence, second.Evidence)
+	if len(f.calls) != 1 || evidence0(first).Reused || !evidence0(second).Reused || evidence0(second).Credits != 0 ||
+		evidence0(second).GatewayRequestID != "" || len(evidence0(second).Sources) != 1 {
+		t.Errorf("calls %d first %+v second %+v", len(f.calls), evidence0(first), evidence0(second))
 	}
 	other := acmeCapture("hlr_3", "Acme Cloud Pro costs $49 per month.")
 	other.VirtualKeyID = "vk-globex" // another tenant pays for its own search
@@ -246,8 +278,8 @@ func TestVerifierOverRelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	r, err := runVerify(t, v, acmeCapture("hlr_w", "Acme Cloud Pro costs $49 per month."))
-	if err != nil || r.Outcome != OutcomeEvidenceFound || r.Evidence.GatewayRequestID != "gw-1" {
-		t.Fatalf("outcome %q err %v evidence %+v", r.Outcome, err, r.Evidence)
+	if err != nil || r.Outcome != OutcomeEvidenceFound || evidence0(r).GatewayRequestID != "gw-1" {
+		t.Fatalf("outcome %q err %v evidence %+v", r.Outcome, err, evidence0(r))
 	}
 	if relay.path != "/relay/tavily/search" || relay.header.Get("x-bf-vk") != "sk-bf-verifier-acme" ||
 		relay.header.Get("X-Project-ID") != "vk-acme" || relay.header.Get("X-Session-Id") != "hlr_w" {
@@ -289,7 +321,7 @@ func TestPluginReportLifecycle(t *testing.T) {
 	}
 	if rep.Status != ReportComplete || rep.Outcome != OutcomeEvidenceFound || rep.RequestID != "req-1" ||
 		rep.Tenant != (ReportTenant{VirtualKeyID: "vk-smoke", VirtualKeyName: "Smoke test app"}) ||
-		rep.Answer.Question != "How much is Acme Cloud Pro?" || rep.Evidence.VerifierKeyID != "vk-verifier-smoke" {
+		rep.Answer.Question != "How much is Acme Cloud Pro?" || evidence0(rep).VerifierKeyID != "vk-verifier-smoke" {
 		t.Errorf("report = %+v", rep)
 	}
 	if relay.header.Get("x-bf-vk") != "sk-bf-verifier-smoke" {
