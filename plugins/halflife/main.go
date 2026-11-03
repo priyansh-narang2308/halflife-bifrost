@@ -129,8 +129,8 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if verifier == "" {
 		verifier = "none"
 	}
-	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s cache_ttl=%s)",
-		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, cacheTTLLabel(cfg.cacheTTL()))
+	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s verifier_models=%d cache_ttl=%s)",
+		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, len(cfg.VerifierModels), cacheTTLLabel(cfg.cacheTTL()))
 	return p, nil
 }
 

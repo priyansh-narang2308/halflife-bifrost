@@ -12,13 +12,15 @@ func TestConfigDefaults(t *testing.T) {
 	want := Config{QueueSize: DefaultQueueSize, Workers: DefaultWorkers, MaxClaimsPerResponse: DefaultMaxClaimsPerResponse, TavilyRelay: DefaultTavilyRelay,
 		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds,
 		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds, GatewayURL: DefaultGatewayURL, Verifiers: []VerifierKey{},
-		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize}
+		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize,
+		VerifierModels: []string{}, VerifierMaxTokens: DefaultVerifierMaxTokens}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
 	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier",
 		CacheTTLSeconds: 600, CacheWriteSettleSeconds: 45, GatewayURL: "https://gw.example:8443", SearchMaxResults: 3, ReportStoreSize: 50,
-		Verifiers: []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME"}}}
+		Verifiers:      []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME"}},
+		VerifierModels: []string{"openrouter/a:free", "openrouter/b:free"}, VerifierMaxTokens: 512, VerifierReasoningEffort: "low"}
 	if got := set.withDefaults(); !reflect.DeepEqual(got, set) {
 		t.Errorf("withDefaults() changed explicit values: %+v", got)
 	}
@@ -53,7 +55,13 @@ func TestConfigValidate(t *testing.T) {
 		"tenant listed twice": {func(c *Config) {
 			c.Verifiers = []VerifierKey{{Tenant: "*", VirtualKeyID: "vk-v", VirtualKey: "k"}, {Tenant: "*", VirtualKeyID: "vk-w", VirtualKey: "k"}}
 		}, "listed twice"},
-		"tenant verifies itself": {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
+		"verifier reply too short":              {func(c *Config) { c.VerifierMaxTokens = 63 }, "verifier_max_tokens"},
+		"verifier reply too long":               {func(c *Config) { c.VerifierMaxTokens = 16385 }, "verifier_max_tokens"},
+		"too many verifier models":              {func(c *Config) { c.VerifierModels = []string{"a/1", "a/2", "a/3", "a/4", "a/5"} }, "at most 4"},
+		"verifier model without a provider":     {func(c *Config) { c.VerifierModels = []string{"gpt-4o"} }, "verifier_models[0]"},
+		"verifier model with an empty provider": {func(c *Config) { c.VerifierModels = []string{"openai/ok", "/x"} }, "verifier_models[1]"},
+		"unknown reasoning effort":              {func(c *Config) { c.VerifierReasoningEffort = "max" }, "verifier_reasoning_effort"},
+		"tenant verifies itself":                {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
 	} {
 		c := ok
 		tc.mutate(&c)

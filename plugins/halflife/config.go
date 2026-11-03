@@ -21,6 +21,9 @@ const (
 	DefaultGatewayURL              = "http://127.0.0.1:8080" // Bifrost's default listen address
 	DefaultSearchMaxResults        = 5
 	DefaultReportStoreSize         = 10000
+	DefaultVerifierMaxTokens       = 1024
+
+	maxVerifierModels = 4
 
 	// AnyTenant is the Verifiers entry used for tenants without their own.
 	AnyTenant = "*"
@@ -77,6 +80,17 @@ type Config struct {
 	SearchMaxResults int `json:"search_max_results,omitempty"`
 	// ReportStoreSize bounds the reports kept in memory; the oldest go first.
 	ReportStoreSize int `json:"report_store_size,omitempty"`
+	// VerifierModels are the models the verifier's own LLM calls use, as
+	// "provider/model": the first is asked, the rest are sent as Bifrost
+	// request fallbacks. The calls go through this gateway with the tenant's
+	// verifier key. Empty disables model-based verification.
+	VerifierModels []string `json:"verifier_models,omitempty"`
+	// VerifierMaxTokens caps each verifier LLM reply, reasoning included.
+	VerifierMaxTokens int `json:"verifier_max_tokens,omitempty"`
+	// VerifierReasoningEffort, when set, is sent with each verifier LLM call
+	// as reasoning.effort: none, minimal, low, medium or high. Empty sends
+	// nothing, because models without reasoning may reject the parameter.
+	VerifierReasoningEffort string `json:"verifier_reasoning_effort,omitempty"`
 }
 
 // VerifierKey is the governance virtual key that pays for one tenant's
@@ -141,6 +155,15 @@ func (c Config) withDefaults() Config {
 	if c.ReportStoreSize == 0 {
 		c.ReportStoreSize = DefaultReportStoreSize
 	}
+	if c.VerifierMaxTokens == 0 {
+		c.VerifierMaxTokens = DefaultVerifierMaxTokens
+	}
+	models := make([]string, len(c.VerifierModels))
+	for i, m := range c.VerifierModels {
+		models[i] = strings.TrimSpace(m)
+	}
+	c.VerifierModels = models
+	c.VerifierReasoningEffort = strings.TrimSpace(c.VerifierReasoningEffort)
 	verifiers := make([]VerifierKey, len(c.Verifiers))
 	for i, v := range c.Verifiers {
 		verifiers[i] = VerifierKey{Tenant: strings.TrimSpace(v.Tenant), VirtualKeyID: strings.TrimSpace(v.VirtualKeyID), VirtualKey: strings.TrimSpace(v.VirtualKey)}
@@ -170,6 +193,20 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: search_max_results must be between 1 and 20, got %d", c.SearchMaxResults)
 	case c.ReportStoreSize < 1 || c.ReportStoreSize > 1_000_000:
 		return fmt.Errorf("halflife: report_store_size must be between 1 and 1000000, got %d", c.ReportStoreSize)
+	case c.VerifierMaxTokens < 64 || c.VerifierMaxTokens > 16384:
+		return fmt.Errorf("halflife: verifier_max_tokens must be between 64 and 16384, got %d", c.VerifierMaxTokens)
+	case len(c.VerifierModels) > maxVerifierModels:
+		return fmt.Errorf("halflife: verifier_models takes at most %d models, got %d", maxVerifierModels, len(c.VerifierModels))
+	}
+	switch c.VerifierReasoningEffort {
+	case "", "none", "minimal", "low", "medium", "high":
+	default:
+		return fmt.Errorf("halflife: verifier_reasoning_effort must be none, minimal, low, medium or high, got %q", c.VerifierReasoningEffort)
+	}
+	for i, m := range c.VerifierModels {
+		if provider, model, ok := strings.Cut(m, "/"); !ok || provider == "" || model == "" {
+			return fmt.Errorf("halflife: verifier_models[%d] must be provider/model, got %q", i, m)
+		}
 	}
 	if u, err := url.Parse(c.GatewayURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return fmt.Errorf("halflife: gateway_url must be an http(s) origin, got %q", c.GatewayURL)

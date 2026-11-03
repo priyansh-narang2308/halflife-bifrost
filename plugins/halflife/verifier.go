@@ -38,6 +38,7 @@ type verifierKey struct {
 type verifier struct {
 	keys       map[string]verifierKey // tenant virtual key ID (or "*") -> verifier key
 	newClient  func(key verifierKey) searcher
+	newLLM     func(key verifierKey) *LLM // nil when no verifier models are configured
 	maxResults int
 	reports    *reportStore
 	memo       *searchMemo
@@ -60,6 +61,12 @@ func newVerifier(cfg Config, reports *reportStore, logger schemas.Logger) (*veri
 	v.newClient = func(key verifierKey) searcher {
 		return NewTavily(cfg.GatewayURL, cfg.TavilyRelay, key.value, httpClient)
 	}
+	if len(cfg.VerifierModels) > 0 {
+		llmHTTP := &http.Client{Timeout: 90 * time.Second} // free models can take a while; the audit timeout still bounds it
+		v.newLLM = func(key verifierKey) *LLM {
+			return NewLLM(cfg.GatewayURL, key.value, LLMOptions{Models: cfg.VerifierModels, MaxTokens: cfg.VerifierMaxTokens, ReasoningEffort: cfg.VerifierReasoningEffort}, llmHTTP)
+		}
+	}
 	for _, k := range cfg.Verifiers {
 		value, err := envutils.ProcessEnvValue(k.VirtualKey)
 		if err != nil || value == "" {
@@ -80,6 +87,16 @@ func (v *verifier) keyFor(tenant string) (verifierKey, bool) {
 	}
 	k, ok := v.keys[AnyTenant]
 	return k, ok
+}
+
+// llmFor returns the LLM client that charges tenant's verifier key, or
+// ok=false when the tenant has no key or no verifier model is configured.
+func (v *verifier) llmFor(tenant string) (*LLM, verifierKey, bool) {
+	key, ok := v.keyFor(tenant)
+	if !ok || v.newLLM == nil {
+		return nil, verifierKey{}, false
+	}
+	return v.newLLM(key), key, true
 }
 
 // verify audits one capture and completes its report. Expected outcomes (no

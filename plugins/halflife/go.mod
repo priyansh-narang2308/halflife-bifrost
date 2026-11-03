@@ -7,6 +7,7 @@ require (
 	github.com/maximhq/bifrost/core v1.14.1
 	github.com/maximhq/bifrost/framework v1.11.1
 	github.com/maximhq/bifrost/plugins/semanticcache v1.7.4
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 )
 
 require (
@@ -89,7 +90,6 @@ require (
 	github.com/qdrant/go-client v1.16.2 // indirect
 	github.com/redis/go-redis/v9 v9.17.2 // indirect
 	github.com/rs/zerolog v1.34.0 // indirect
-	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
 	github.com/savsgio/gotils v0.0.0-20250408102913-196191ec6287 // indirect
 	github.com/spf13/cast v1.10.0 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
