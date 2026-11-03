@@ -410,7 +410,7 @@ func TestReportHeader(t *testing.T) {
 // Every response that is not audited says so and why, and carries no report.
 func TestStatusHeaderWhenNotAudited(t *testing.T) {
 	p, got := recordingPlugin(t)
-	p.config.VerifierVirtualKey = "vk-verifier"
+	p.verifierKeys = map[string]bool{"vk-verifier": true}
 	for _, tc := range []struct {
 		name   string
 		run    func(r *request)
@@ -466,7 +466,7 @@ func TestStatusHeaderBeforeFinalize(t *testing.T) {
 // any attempt, whether they stream or not. Other tenants are unaffected.
 func TestVerifierTrafficNeverAudited(t *testing.T) {
 	p, got := recordingPlugin(t)
-	p.config.VerifierVirtualKey = "vk-verifier"
+	p.verifierKeys = map[string]bool{"vk-verifier": true}
 	verifier := func() *request {
 		r := newRequest(t, p)
 		r.core.SetValue(schemas.BifrostContextKeyGovernanceVirtualKeyID, "vk-verifier")

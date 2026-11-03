@@ -2,6 +2,7 @@ package halflife
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -17,6 +18,12 @@ const (
 	// The semantic cache's write timeout (semanticcache.CacheSetTimeout, 30s)
 	// plus a margin.
 	DefaultCacheWriteSettleSeconds = 35
+	DefaultGatewayURL              = "http://127.0.0.1:8080" // Bifrost's default listen address
+	DefaultSearchMaxResults        = 5
+	DefaultReportStoreSize         = 10000
+
+	// AnyTenant is the Verifiers entry used for tenants without their own.
+	AnyTenant = "*"
 
 	maxCacheTTLSeconds = 30 * 24 * 3600
 )
@@ -57,6 +64,33 @@ type Config struct {
 	// window closes; until then its cache partition bypasses the cache, so
 	// a write landing after the first delete is never served.
 	CacheWriteSettleSeconds int `json:"cache_write_settle_seconds,omitempty"`
+
+	// GatewayURL is this gateway's own origin, which the verifier sends its
+	// relay calls to (they must pass through governance like any caller's).
+	GatewayURL string `json:"gateway_url,omitempty"`
+	// Verifiers maps each tenant to the virtual key its verification is
+	// charged to (D37: one verifier key per tenant, inside the tenant's
+	// customer). Tenant "*" covers tenants without an entry; leave it out and
+	// those tenants' answers are reported as not verified.
+	Verifiers []VerifierKey `json:"verifiers,omitempty"`
+	// SearchMaxResults is how many sources one evidence search asks for.
+	SearchMaxResults int `json:"search_max_results,omitempty"`
+	// ReportStoreSize bounds the reports kept in memory; the oldest go first.
+	ReportStoreSize int `json:"report_store_size,omitempty"`
+}
+
+// VerifierKey is the governance virtual key that pays for one tenant's
+// verification.
+type VerifierKey struct {
+	// Tenant is the virtual key ID of the tenant's own requests, or "*".
+	Tenant string `json:"tenant"`
+	// VirtualKeyID is the verifier key's ID. Requests made with it are never
+	// audited (recursion guard).
+	VirtualKeyID string `json:"virtual_key_id"`
+	// VirtualKey is the verifier key's secret value, or env.VAR to read it
+	// from the environment (recommended: plugin configs are returned by the
+	// gateway's plugins API).
+	VirtualKey string `json:"virtual_key"`
 }
 
 func (c Config) auditTimeout() time.Duration {
@@ -97,6 +131,21 @@ func (c Config) withDefaults() Config {
 	if c.TavilyRelay == "" {
 		c.TavilyRelay = DefaultTavilyRelay
 	}
+	c.GatewayURL = strings.TrimRight(strings.TrimSpace(c.GatewayURL), "/")
+	if c.GatewayURL == "" {
+		c.GatewayURL = DefaultGatewayURL
+	}
+	if c.SearchMaxResults == 0 {
+		c.SearchMaxResults = DefaultSearchMaxResults
+	}
+	if c.ReportStoreSize == 0 {
+		c.ReportStoreSize = DefaultReportStoreSize
+	}
+	verifiers := make([]VerifierKey, len(c.Verifiers))
+	for i, v := range c.Verifiers {
+		verifiers[i] = VerifierKey{Tenant: strings.TrimSpace(v.Tenant), VirtualKeyID: strings.TrimSpace(v.VirtualKeyID), VirtualKey: strings.TrimSpace(v.VirtualKey)}
+	}
+	c.Verifiers = verifiers
 	return c
 }
 
@@ -117,6 +166,37 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: cache_write_settle_seconds must be between 31 and 600 (the cache writes for up to 30s), got %d", c.CacheWriteSettleSeconds)
 	case c.CacheTTLSeconds < 0 || c.CacheTTLSeconds > maxCacheTTLSeconds:
 		return fmt.Errorf("halflife: cache_ttl_seconds must be between 0 and %d, got %d", maxCacheTTLSeconds, c.CacheTTLSeconds)
+	case c.SearchMaxResults < 1 || c.SearchMaxResults > 20:
+		return fmt.Errorf("halflife: search_max_results must be between 1 and 20, got %d", c.SearchMaxResults)
+	case c.ReportStoreSize < 1 || c.ReportStoreSize > 1_000_000:
+		return fmt.Errorf("halflife: report_store_size must be between 1 and 1000000, got %d", c.ReportStoreSize)
+	}
+	if u, err := url.Parse(c.GatewayURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("halflife: gateway_url must be an http(s) origin, got %q", c.GatewayURL)
+	}
+	seen := map[string]bool{}
+	for i, v := range c.Verifiers {
+		switch {
+		case v.Tenant == "" || v.VirtualKeyID == "" || v.VirtualKey == "":
+			return fmt.Errorf("halflife: verifiers[%d] needs tenant, virtual_key_id and virtual_key", i)
+		case seen[v.Tenant]:
+			return fmt.Errorf("halflife: verifiers[%d]: tenant %q is listed twice", i, v.Tenant)
+		case v.VirtualKeyID == v.Tenant:
+			return fmt.Errorf("halflife: verifiers[%d]: tenant %q cannot verify with its own key", i, v.Tenant)
+		}
+		seen[v.Tenant] = true
 	}
 	return nil
+}
+
+// verifierKeyIDs returns every key whose requests the recursion guard skips.
+func (c Config) verifierKeyIDs() map[string]bool {
+	ids := map[string]bool{}
+	if c.VerifierVirtualKey != "" {
+		ids[c.VerifierVirtualKey] = true
+	}
+	for _, v := range c.Verifiers {
+		ids[v.VirtualKeyID] = true
+	}
+	return ids
 }

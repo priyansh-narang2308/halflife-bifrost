@@ -2,6 +2,8 @@ package halflife
 
 import (
 	"context"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,7 +29,7 @@ func TestInit(t *testing.T) {
 	if p.GetName() != "halflife" {
 		t.Errorf("GetName() = %q", p.GetName())
 	}
-	if p.Config() != (Config{}).withDefaults() {
+	if !reflect.DeepEqual(p.Config(), Config{}.withDefaults()) {
 		t.Errorf("nil config did not apply defaults: %+v", p.Config())
 	}
 	if _, err := Init(context.Background(), &Config{Workers: 100}, nil); err == nil {
@@ -36,6 +38,25 @@ func TestInit(t *testing.T) {
 	p, err := Init(context.Background(), &Config{Workers: 3}, nil)
 	if err != nil || p.Config().Workers != 3 || p.Config().QueueSize != DefaultQueueSize {
 		t.Errorf("partial config: %+v, %v", p.Config(), err)
+	}
+	p.Cleanup()
+}
+
+// A verifier key whose env.VAR is unset stops Init, naming the variable.
+func TestInitVerifierKeyFromEnv(t *testing.T) {
+	cfg := &Config{Verifiers: []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HALFLIFE_TEST_VK_UNSET"}}}
+	if _, err := Init(context.Background(), cfg, nil); err == nil || !strings.Contains(err.Error(), "HALFLIFE_TEST_VK_UNSET") {
+		t.Fatalf("unset env: err = %v", err)
+	}
+	t.Setenv("HALFLIFE_TEST_VK_SET", "sk-bf-test-secret")
+	cfg.Verifiers[0].VirtualKey = "env.HALFLIFE_TEST_VK_SET"
+	p, err := Init(context.Background(), cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Cleanup()
+	if !p.verifierKeys["vk-verifier-acme"] {
+		t.Errorf("recursion guard misses the tenant's verifier key: %v", p.verifierKeys)
 	}
 }
 

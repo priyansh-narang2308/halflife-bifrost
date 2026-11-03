@@ -2,6 +2,7 @@ package halflife
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -10,12 +11,15 @@ func TestConfigDefaults(t *testing.T) {
 	got := Config{TavilyRelay: "  ", VerifierVirtualKey: " \t"}.withDefaults()
 	want := Config{QueueSize: DefaultQueueSize, Workers: DefaultWorkers, MaxClaimsPerResponse: DefaultMaxClaimsPerResponse, TavilyRelay: DefaultTavilyRelay,
 		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds,
-		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds}
-	if got != want {
+		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds, GatewayURL: DefaultGatewayURL, Verifiers: []VerifierKey{},
+		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize}
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
-	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier", CacheTTLSeconds: 600, CacheWriteSettleSeconds: 45}
-	if got := set.withDefaults(); got != set {
+	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier",
+		CacheTTLSeconds: 600, CacheWriteSettleSeconds: 45, GatewayURL: "https://gw.example:8443", SearchMaxResults: 3, ReportStoreSize: 50,
+		Verifiers: []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME"}}}
+	if got := set.withDefaults(); !reflect.DeepEqual(got, set) {
 		t.Errorf("withDefaults() changed explicit values: %+v", got)
 	}
 }
@@ -41,6 +45,15 @@ func TestConfigValidate(t *testing.T) {
 		"settle too long":                        {func(c *Config) { c.CacheWriteSettleSeconds = 601 }, "cache_write_settle_seconds"},
 		"negative ttl":                           {func(c *Config) { c.CacheTTLSeconds = -1 }, "cache_ttl_seconds"},
 		"ttl too long":                           {func(c *Config) { c.CacheTTLSeconds = 30*24*3600 + 1 }, "cache_ttl_seconds"},
+		"too many sources":                       {func(c *Config) { c.SearchMaxResults = 21 }, "search_max_results"},
+		"no report store":                        {func(c *Config) { c.ReportStoreSize = -1 }, "report_store_size"},
+		"gateway not a URL":                      {func(c *Config) { c.GatewayURL = "127.0.0.1:8080" }, "gateway_url"},
+		"gateway not http":                       {func(c *Config) { c.GatewayURL = "ftp://gw" }, "gateway_url"},
+		"verifier without a key":                 {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-v"}} }, "verifiers[0]"},
+		"tenant listed twice": {func(c *Config) {
+			c.Verifiers = []VerifierKey{{Tenant: "*", VirtualKeyID: "vk-v", VirtualKey: "k"}, {Tenant: "*", VirtualKeyID: "vk-w", VirtualKey: "k"}}
+		}, "listed twice"},
+		"tenant verifies itself": {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
 	} {
 		c := ok
 		tc.mutate(&c)
@@ -58,11 +71,30 @@ func TestConfigJSON(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &c); err != nil {
 		t.Fatal(err)
 	}
-	if c != (Config{QueueSize: 32, Workers: 4, MaxClaimsPerResponse: 7, TavilyRelay: "tv", AuditTimeoutSeconds: 30, DrainTimeoutSeconds: 3, VerifierVirtualKey: "vk-v", CacheTTLSeconds: 90, CacheWriteSettleSeconds: 40}) {
+	if !reflect.DeepEqual(c, Config{QueueSize: 32, Workers: 4, MaxClaimsPerResponse: 7, TavilyRelay: "tv", AuditTimeoutSeconds: 30, DrainTimeoutSeconds: 3, VerifierVirtualKey: "vk-v", CacheTTLSeconds: 90, CacheWriteSettleSeconds: 40}) {
 		t.Errorf("decoded %+v", c)
 	}
 	out, _ := json.Marshal(Config{})
 	if string(out) != "{}" {
 		t.Errorf("zero config marshals to %s, want {}", out)
+	}
+}
+
+func TestConfigVerifiersJSON(t *testing.T) {
+	var c Config
+	raw := `{"gateway_url":"http://127.0.0.1:8090/","verifiers":[{"tenant":" vk-acme ","virtual_key_id":"vk-verifier-acme","virtual_key":"env.HL_VK_ACME"},{"tenant":"*","virtual_key_id":"vk-verifier","virtual_key":"sk-literal"}]}`
+	if err := json.Unmarshal([]byte(raw), &c); err != nil {
+		t.Fatal(err)
+	}
+	c = c.withDefaults()
+	if err := c.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.GatewayURL != "http://127.0.0.1:8090" || c.Verifiers[0].Tenant != "vk-acme" {
+		t.Errorf("normalized = %+v", c)
+	}
+	c.VerifierVirtualKey = "vk-legacy"
+	if got := c.verifierKeyIDs(); !reflect.DeepEqual(got, map[string]bool{"vk-legacy": true, "vk-verifier-acme": true, "vk-verifier": true}) {
+		t.Errorf("guarded keys = %v", got)
 	}
 }

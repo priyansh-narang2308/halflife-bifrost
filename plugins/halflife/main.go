@@ -58,8 +58,13 @@ type Plugin struct {
 	sink func(*Capture) bool
 	// links resolves cache hits to the report of the answer they replay.
 	links *cacheLinks
-	// verify decides whether an audited answer is stale.
+	// verify audits an answer, completes its report and says whether the
+	// answer is stale.
 	verify func(context.Context, *Capture) (stale bool, err error)
+	// reports holds the audit report of every queued answer.
+	reports *reportStore
+	// verifierKeys are the virtual key IDs whose requests are never audited.
+	verifierKeys map[string]bool
 	// inv evicts stale answers from the semantic cache.
 	inv *invalidator
 
@@ -91,13 +96,6 @@ func (p *Plugin) audit(ctx context.Context, c *Capture) error {
 	return nil
 }
 
-// verifyPlaceholder stands in for the verifier until it exists: it only marks
-// that the capture reached a worker, and finds nothing stale.
-func (p *Plugin) verifyPlaceholder(_ context.Context, c *Capture) (bool, error) {
-	p.logger.Debug("halflife: audit report=%s (no verifier yet)", c.ReportID)
-	return false, nil
-}
-
 var (
 	_ schemas.LLMPlugin           = (*Plugin)(nil)
 	_ schemas.HTTPTransportPlugin = (*Plugin)(nil)
@@ -117,8 +115,13 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if logger == nil {
 		logger = bifrost.NewNoOpLogger()
 	}
-	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks)}
-	p.verify = p.verifyPlaceholder
+	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks),
+		reports: newReportStore(cfg.ReportStoreSize), verifierKeys: cfg.verifierKeyIDs()}
+	v, err := newVerifier(cfg, p.reports, logger)
+	if err != nil {
+		return nil, err
+	}
+	p.verify = v.verify
 	p.inv = newInvalidator(cfg.cacheWriteSettle(), logger)
 	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.audit)
 	p.sink = p.pool.submit
@@ -126,8 +129,8 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if verifier == "" {
 		verifier = "none"
 	}
-	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s cache_ttl=%s)",
-		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, cacheTTLLabel(cfg.cacheTTL()))
+	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s cache_ttl=%s)",
+		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, cacheTTLLabel(cfg.cacheTTL()))
 	return p, nil
 }
 
@@ -137,6 +140,9 @@ func cacheTTLLabel(ttl time.Duration) string {
 	}
 	return ttl.String()
 }
+
+// Report returns the audit report with the given ID, if it is still held.
+func (p *Plugin) Report(id string) (Report, bool) { return p.reports.get(id) }
 
 // PoolStats returns the audit queue's counters.
 func (p *Plugin) PoolStats() PoolStats { return p.pool.stats() }
@@ -217,15 +223,16 @@ func (p *Plugin) capCacheTTL(ctx *schemas.BifrostContext) {
 // client receives for this attempt. For streams it runs once per chunk; those
 // requests are only marked.
 //
-// Recursion guard: the verifier's own calls through the gateway carry the
-// verifier virtual key and are marked, never captured. Tavily searches go
+// Recursion guard: the verifier's own calls through the gateway carry a
+// verifier virtual key (verifier_virtual_key or any key in verifiers) and are
+// marked, never captured. Tavily searches go
 // through a Bifrost relay, which never reaches these hooks (Halflife is not a
 // RelayPlugin), and in-process calls that skip the HTTP transport have no slot.
 func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostResponse, bifrostErr *schemas.BifrostError) (*schemas.BifrostResponse, *schemas.BifrostError, error) {
 	s := slotFrom(ctx)
 	switch {
 	case s == nil:
-	case p.config.VerifierVirtualKey != "" && ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID) == p.config.VerifierVirtualKey:
+	case p.isVerifierKey(ctx):
 		s.record(nil, SkipVerifier)
 	case ctx.Value(schemas.BifrostContextKeyStreamStartTime) != nil:
 		s.record(nil, SkipStreaming)
@@ -244,6 +251,11 @@ func (p *Plugin) PostLLMHook(ctx *schemas.BifrostContext, resp *schemas.BifrostR
 		s.record(c, reason)
 	}
 	return resp, bifrostErr, nil
+}
+
+func (p *Plugin) isVerifierKey(ctx *schemas.BifrostContext) bool {
+	id, _ := ctx.Value(schemas.BifrostContextKeyGovernanceVirtualKeyID).(string)
+	return id != "" && p.verifierKeys[id]
 }
 
 // HTTP transport hooks. HTTPTransportPostHook runs once per request, after
@@ -309,8 +321,10 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		// Link before queueing: once queued, the audit may finish (and act
 		// on the entry) before this hook returns.
 		linked := c.CacheID != "" && p.links.add(c.CacheID, c.ReportID, c.VirtualKeyID)
+		p.reports.put(newReport(c))
 		if !p.sink(c) {
 			// No report will exist, so the client gets no report header.
+			p.reports.remove(c.ReportID)
 			s.drop()
 			if linked {
 				p.links.remove(c.CacheID)
