@@ -33,20 +33,21 @@ type invalidator struct {
 	retry  time.Duration
 	logger schemas.Logger
 
-	mu      sync.Mutex
-	evict   CacheEvictor
-	pending map[string]int // cache partition -> evictions not yet final
-	active  atomic.Int32   // len(pending) > 0, read on the request path
-	done    chan struct{}
-	wg      sync.WaitGroup
-	closed  bool
+	mu       sync.Mutex
+	evict    CacheEvictor
+	pending  map[string]int         // cache partition -> evictions not yet final
+	active   atomic.Int32           // len(pending) > 0, read on the request path
+	expiries map[string]*time.Timer // cache ID -> scheduled volatility expiry
+	done     chan struct{}
+	wg       sync.WaitGroup
+	closed   bool
 
-	invalidated, bypassed atomic.Uint64
+	invalidated, expired, bypassed atomic.Uint64
 }
 
 func newInvalidator(settle time.Duration, logger schemas.Logger) *invalidator {
 	return &invalidator{settle: settle, retry: evictRetryInterval, logger: logger,
-		pending: map[string]int{}, done: make(chan struct{})}
+		pending: map[string]int{}, expiries: map[string]*time.Timer{}, done: make(chan struct{})}
 }
 
 func (v *invalidator) setEvictor(e CacheEvictor) {
@@ -66,19 +67,59 @@ func (p *Plugin) invalidate(c *Capture) {
 		return
 	}
 	p.links.remove(c.CacheID)
-	p.inv.invalidate(c.CacheID, c.CacheKey, c.CapturedAt)
+	if p.inv.remove(c.CacheID, c.CacheKey, c.CapturedAt) {
+		p.inv.invalidated.Add(1)
+	}
 }
 
-func (v *invalidator) invalidate(cacheID, partition string, answeredAt time.Time) {
+// expire evicts the entry behind c once ttl has passed since it was answered:
+// the semantic cache's TTL is fixed before Halflife has seen the answer (its
+// post-hook runs first), so a volatile answer's shorter life is enforced here.
+// Bounded by maxCacheLinks; an expiry that doesn't fit, or is lost in a
+// restart, leaves the entry to the cache's own TTL.
+func (p *Plugin) expire(c *Capture, ttl time.Duration) {
+	id, partition, answeredAt := c.CacheID, c.CacheKey, c.CapturedAt
+	p.inv.schedule(id, time.Until(answeredAt.Add(ttl)), func() {
+		p.links.remove(id)
+		if p.inv.remove(id, partition, answeredAt) {
+			p.inv.expired.Add(1)
+		}
+	})
+}
+
+// schedule runs fire after wait, at once if that has passed.
+func (v *invalidator) schedule(cacheID string, wait time.Duration, fire func()) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if _, dup := v.expiries[cacheID]; v.closed || dup || len(v.expiries) >= maxCacheLinks {
+		return
+	}
+	v.expiries[cacheID] = time.AfterFunc(max(wait, 0), func() {
+		v.mu.Lock()
+		delete(v.expiries, cacheID)
+		closed := v.closed
+		v.mu.Unlock()
+		if !closed {
+			fire()
+		}
+	})
+}
+
+// remove deletes the entry, handling the write race, and reports whether an
+// evictor took it.
+func (v *invalidator) remove(cacheID, partition string, answeredAt time.Time) bool {
 	v.mu.Lock()
 	evict := v.evict
 	closed := v.closed
+	if t, ok := v.expiries[cacheID]; ok {
+		t.Stop()
+		delete(v.expiries, cacheID)
+	}
 	v.mu.Unlock()
 	if evict == nil || closed {
 		v.logger.Warn("halflife: stale cache entry %s not evicted (no cache evictor)", cacheID)
-		return
+		return false
 	}
-	v.invalidated.Add(1)
 	wait := v.settle - time.Since(answeredAt)
 	if wait > 0 {
 		// The write may still land: hold the partition off the cache before
@@ -87,14 +128,15 @@ func (v *invalidator) invalidate(cacheID, partition string, answeredAt time.Time
 		if err := evict(cacheID); err != nil {
 			v.logger.Warn("halflife: evicting stale cache entry %s failed, retrying: %v", cacheID, err)
 		}
-		return
+		return true
 	}
 	if err := evict(cacheID); err != nil {
 		v.logger.Warn("halflife: evicting stale cache entry %s failed, retrying: %v", cacheID, err)
 		v.hold(evict, cacheID, partition, v.retry)
-		return
+		return true
 	}
 	v.logger.Info("halflife: evicted stale cache entry %s", cacheID)
+	return true
 }
 
 // hold makes partition bypass the cache until a delete of cacheID after wait
@@ -167,6 +209,9 @@ func (v *invalidator) close() {
 	if !v.closed {
 		v.closed = true
 		close(v.done)
+		for _, t := range v.expiries {
+			t.Stop()
+		}
 	}
 	v.mu.Unlock()
 	v.wg.Wait()

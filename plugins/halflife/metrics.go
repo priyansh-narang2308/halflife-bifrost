@@ -172,6 +172,7 @@ type Usage struct {
 	TavilyCreditUSD float64                 `json:"tavily_credit_usd"`
 	Tenants         []TenantUsage           `json:"tenants"`
 	Dependencies    map[string]BreakerState `json:"dependencies"`
+	Spend           map[string]TenantSpend  `json:"spend"` // tenants with their own spend cap
 	Requests        Stats                   `json:"requests"`
 	Queue           PoolStats               `json:"queue"`
 }
@@ -179,7 +180,7 @@ type Usage struct {
 // Usage reports per-tenant verification and spend since the process started.
 func (p *Plugin) Usage() Usage {
 	return Usage{Since: p.metrics.started, Mode: p.config.Mode, TavilyCreditUSD: p.config.TavilyCreditUSD, Tenants: p.metrics.usage(),
-		Dependencies: p.verifier.dependencies(), Requests: p.Stats(), Queue: p.pool.stats()}
+		Dependencies: p.verifier.dependencies(), Spend: p.verifier.spendState(), Requests: p.Stats(), Queue: p.pool.stats()}
 }
 
 func (v *verifier) dependencies() map[string]BreakerState {
@@ -204,6 +205,19 @@ func (p *Plugin) WriteMetrics(w io.Writer) error {
 	e.sample("halflife_queue_depth", nil, float64(q.QueueDepth))
 	e.family("halflife_cache_evictions_total", "counter", "Stale answers evicted from the semantic cache.")
 	e.sample("halflife_cache_evictions_total", nil, float64(s.Invalidated))
+	e.family("halflife_spend_usd", "gauge", "Verification spend in the tenant's current spend window.")
+	e.family("halflife_spend_cap_usd", "gauge", "The tenant's spend cap per window.")
+	spend := p.verifier.spendState()
+	for _, tenant := range slices.Sorted(maps.Keys(spend)) {
+		e.sample("halflife_spend_usd", labels{"tenant", tenant}, spend[tenant].SpentUSD)
+		e.sample("halflife_spend_cap_usd", labels{"tenant", tenant}, spend[tenant].CapUSD)
+	}
+	e.family("halflife_cache_expiries_total", "counter", "Answers evicted at their volatility TTL.")
+	e.sample("halflife_cache_expiries_total", nil, float64(s.Expired))
+	e.family("halflife_tombstone_bypasses_total", "counter", "Requests sent past the cache because their question's answer was found outdated.")
+	e.sample("halflife_tombstone_bypasses_total", nil, float64(s.TombstoneBypasses))
+	e.family("halflife_tombstone_reuses_total", "counter", "Repeats of an outdated answer given its report instead of a new audit.")
+	e.sample("halflife_tombstone_reuses_total", nil, float64(s.TombstoneReuses))
 
 	deps := p.verifier.dependencies()
 	e.family("halflife_circuit_open", "gauge", "1 while a dependency's circuit refuses calls (open or half-open).")

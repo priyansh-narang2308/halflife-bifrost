@@ -270,6 +270,9 @@ func (l *LLM) call(ctx context.Context, msgs []LLMMessage, schema *JSONSchema, r
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-bf-vk", l.virtualKey)
+	// A verifier prompt is near-identical for every claim but the claim
+	// itself, so a semantic cache hit would answer for a different claim.
+	req.Header.Set("x-bf-cache-type", string(bypassCacheType))
 	res.Calls++
 	resp, err := l.client.Do(req)
 	if err != nil {

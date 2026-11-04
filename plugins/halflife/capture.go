@@ -215,9 +215,10 @@ func (s *slot) status() string {
 
 // Values of the X-Halflife-Status header.
 const (
-	statusQueued     = "queued"
-	statusCached     = "cached"
-	statusNotAudited = "not-audited; reason="
+	statusQueued        = "queued"
+	statusCached        = "cached"
+	statusKnownOutdated = "known-outdated"
+	statusNotAudited    = "not-audited; reason="
 )
 
 // identify records who made the request and which gateway request it is.

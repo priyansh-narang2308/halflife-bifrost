@@ -12,6 +12,7 @@ func TestConfigDefaults(t *testing.T) {
 	want := Config{QueueSize: DefaultQueueSize, Workers: DefaultWorkers, MaxClaimsPerResponse: DefaultMaxClaimsPerResponse, TavilyRelay: DefaultTavilyRelay,
 		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds,
 		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds, GatewayURL: DefaultGatewayURL, Verifiers: []VerifierKey{},
+		SpendWindowSeconds: DefaultSpendWindowSeconds, TombstoneTTLSeconds: DefaultTombstoneTTLSeconds,
 		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize, ReportRetentionHours: DefaultReportRetentionHours,
 		VerifierModels: []string{}, VerifierMaxTokens: DefaultVerifierMaxTokens,
 		SearchTimeoutSeconds: DefaultSearchTimeoutSeconds, CircuitBreakerFailures: DefaultCircuitBreakerFailures,
@@ -25,7 +26,8 @@ func TestConfigDefaults(t *testing.T) {
 		ReportStorePath: "/var/lib/halflife/reports.db", ReportRetentionHours: 24, PersistAnswerText: true,
 		SearchTimeoutSeconds: 10, CircuitBreakerFailures: 3, CircuitBreakerCooldownSeconds: 60, TavilyCreditsCooldownSeconds: 120,
 		BudgetBackoffSeconds: 30, TavilyCreditUSD: 0.005, Mode: ModeProtect, ProtectTimeoutMs: 2000, ProtectAll: true,
-		Verifiers:      []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME"}},
+		SpendWindowSeconds: 120, TombstoneTTLSeconds: 60,
+		Verifiers:      []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME", SpendCapUSD: 1.5}},
 		VerifierModels: []string{"openrouter/a:free", "openrouter/b:free"}, VerifierMaxTokens: 512, VerifierReasoningEffort: "low"}
 	if got := set.withDefaults(); !reflect.DeepEqual(got, set) {
 		t.Errorf("withDefaults() changed explicit values: %+v", got)

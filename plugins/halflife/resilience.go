@@ -42,6 +42,7 @@ const (
 	FailureBadReply         = "bad_reply"
 	FailureCanceled         = "canceled"
 	FailureCircuitOpen      = "circuit_open"
+	FailureSpendCap         = "spend_cap"
 )
 
 // Dependencies, for breakers and metrics.

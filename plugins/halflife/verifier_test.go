@@ -108,12 +108,12 @@ func runVerify(t *testing.T, v *verifier, c *Capture) (Report, error) {
 	t.Helper()
 	v.reports.put(newReport(c))
 	stale, err := v.verify(context.Background(), c)
-	if stale {
-		t.Error("the minimal verifier judged an answer stale")
-	}
 	r, ok := v.reports.get(c.ReportID)
 	if !ok {
 		t.Fatal("report missing")
+	}
+	if stale != anyOutdated(r.Claims) {
+		t.Errorf("stale = %v for claims %+v", stale, r.Claims)
 	}
 	return r, err
 }

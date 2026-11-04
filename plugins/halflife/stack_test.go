@@ -176,6 +176,15 @@ func (st *stack) askWith(vk, question string, set func(*schemas.BifrostContext))
 	return r
 }
 
+func (p *fakeProvider) setAnswer(a string) { p.fixed.Store(&a) }
+
+func (p *fakeProvider) answerTo(n int32, q string) string {
+	if a := p.fixed.Load(); a != nil {
+		return *a
+	}
+	return fmt.Sprintf("answer %d to: %s", n, q)
+}
+
 // settle waits for the cache's asynchronous writes.
 func (st *stack) settle() { st.cache.WaitForPendingOperations() }
 
@@ -271,6 +280,7 @@ func (g *gatedStore) Add(ctx context.Context, namespace, id string, embedding []
 type fakeProvider struct {
 	srv   *httptest.Server
 	chats atomic.Int32
+	fixed atomic.Pointer[string] // answer given every time, instead of numbered ones
 }
 
 const embedDim = 32
@@ -291,7 +301,7 @@ func newFakeProvider(t *testing.T) *fakeProvider {
 		writeJSONResponse(w, map[string]any{
 			"id": fmt.Sprintf("chatcmpl-%d", n), "object": "chat.completion", "created": 1793491200, "model": req.Model,
 			"choices": []any{map[string]any{"index": 0, "finish_reason": "stop",
-				"message": map[string]any{"role": "assistant", "content": fmt.Sprintf("answer %d to: %s", n, q)}}},
+				"message": map[string]any{"role": "assistant", "content": p.answerTo(n, q)}}},
 			"usage": map[string]int{"prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10},
 		})
 	})

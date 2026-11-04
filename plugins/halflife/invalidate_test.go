@@ -3,11 +3,13 @@ package halflife
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	bifrost "github.com/maximhq/bifrost/core"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/maximhq/bifrost/plugins/semanticcache"
 )
@@ -25,6 +27,7 @@ type staleStack struct {
 
 func newStaleStack(t *testing.T, settle time.Duration) *staleStack {
 	st := &staleStack{stack: newStack(t, stackOptions{}), release: make(chan struct{})}
+	st.hl.tombs.ttl = 0 // eviction on its own; tombstone_test.go covers both
 	st.hl.inv.settle = settle
 	st.hl.inv.retry = 10 * time.Millisecond
 	st.hl.verify = func(ctx context.Context, c *Capture) (bool, error) {
@@ -196,6 +199,7 @@ func TestNoEvictionWithoutStaleOrEvictor(t *testing.T) {
 	}
 
 	st = newStack(t, stackOptions{})
+	st.hl.tombs.ttl = 0
 	st.hl.verify = func(context.Context, *Capture) (bool, error) { return true, nil }
 	st.ask("vk-a", priceQ)
 	st.settle()
@@ -217,5 +221,67 @@ func TestCleanupStopsPendingEvictions(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Cleanup waited for the settle window")
+	}
+}
+
+// A volatile answer leaves the cache at its claims' TTL, long before the
+// cache's own, through the same race-safe eviction.
+func TestVolatileAnswerExpires(t *testing.T) {
+	st := newStack(t, stackOptions{halflife: &Config{VolatilityTTLSeconds: map[string]int{BandHoursDays: 1}}})
+	st.hl.inv.settle = 0
+	st.hl.SetCacheEvictor(st.cache.ClearCacheForCacheID)
+	st.hl.verify = func(_ context.Context, c *Capture) (bool, error) {
+		st.hl.reports.update(c.ReportID, func(r *Report) {
+			r.Status, r.Outcome = ReportComplete, OutcomeEvidenceFound
+			r.Claims = []ReportClaim{{Status: ClaimChecked, Priority: PriorityHigh, VolatilityBand: BandHoursDays}}
+		})
+		return false, nil
+	}
+	st.ask("vk-a", priceQ)
+	st.settle()
+	if hit := st.ask("vk-a", priceQ); hit.hit() != "direct" {
+		t.Fatalf("before the TTL: %s", hit.hit())
+	}
+	eventually(t, "the expiry", func() bool { return st.hl.Stats().Expired == 1 })
+	if hit := st.ask("vk-a", priceQ); hit.hit() != "miss" {
+		t.Errorf("after the TTL: %s", hit.hit())
+	}
+	if s := st.hl.Stats(); s.Invalidated != 0 {
+		t.Errorf("an expiry is not an invalidation: %+v", s)
+	}
+}
+
+// Stale evidence beats a scheduled expiry; shutdown stops the rest.
+func TestExpiryCancelled(t *testing.T) {
+	p := newPlugin(t)
+	var evicted atomic.Int32
+	p.SetCacheEvictor(func(string) error { evicted.Add(1); return nil })
+	p.inv.settle = 0
+	c := &Capture{CacheID: "e", CapturedAt: time.Now()}
+	p.expire(c, time.Hour)
+	p.expire(c, time.Hour) // scheduled once
+	if n := len(p.inv.expiries); n != 1 {
+		t.Fatalf("expiries %d", n)
+	}
+	p.invalidate(c)
+	if len(p.inv.expiries) != 0 || evicted.Load() != 1 {
+		t.Errorf("expiries %d, evicted %d", len(p.inv.expiries), evicted.Load())
+	}
+	p.expire(&Capture{CacheID: "other", CapturedAt: time.Now()}, 10*time.Millisecond)
+	p.inv.close()
+	time.Sleep(30 * time.Millisecond)
+	if evicted.Load() != 1 || p.Stats().Expired != 0 {
+		t.Errorf("fired after close: %d", evicted.Load())
+	}
+}
+
+func TestExpiriesBounded(t *testing.T) {
+	v := newInvalidator(0, bifrost.NewNoOpLogger())
+	defer v.close()
+	for i := range maxCacheLinks + 5 {
+		v.schedule(fmt.Sprint(i), time.Hour, func() {})
+	}
+	if n := len(v.expiries); n != maxCacheLinks {
+		t.Errorf("expiries %d", n)
 	}
 }

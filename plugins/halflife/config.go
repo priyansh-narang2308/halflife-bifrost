@@ -12,6 +12,8 @@ const (
 	DefaultQueueSize            = 256
 	DefaultWorkers              = 2
 	DefaultMaxClaimsPerResponse = 5
+	DefaultSpendWindowSeconds   = 3600
+	DefaultTombstoneTTLSeconds  = 3600
 	DefaultTavilyRelay          = "tavily"
 	DefaultAuditTimeoutSeconds  = 60
 	DefaultDrainTimeoutSeconds  = 5
@@ -47,7 +49,8 @@ const (
 	// AnyTenant is the Verifiers entry used for tenants without their own.
 	AnyTenant = "*"
 
-	maxCacheTTLSeconds = 30 * 24 * 3600
+	maxCacheTTLSeconds    = 30 * 24 * 3600
+	maxSpendWindowSeconds = 31 * 24 * 3600
 )
 
 // Config is the plugin's configuration, read from the "halflife" entry of the
@@ -90,6 +93,16 @@ type Config struct {
 	// GatewayURL is this gateway's own origin, which the verifier sends its
 	// relay calls to (they must pass through governance like any caller's).
 	GatewayURL string `json:"gateway_url,omitempty"`
+	// SpendWindowSeconds is how long a tenant's spend cap lasts before it
+	// starts again.
+	SpendWindowSeconds int `json:"spend_window_seconds,omitempty"`
+	// VolatilityTTLSeconds overrides how long a cached answer lives, by the
+	// volatility band of its most volatile claim. Bands left out use the
+	// band's shortest change interval (1h, 7d, 180d, 2y).
+	VolatilityTTLSeconds map[string]int `json:"volatility_ttl_seconds,omitempty"`
+	// TombstoneTTLSeconds is how long a question whose answer was found
+	// outdated stays off the semantic cache. -1 turns tombstones off.
+	TombstoneTTLSeconds int `json:"tombstone_ttl_seconds,omitempty"`
 	// Verifiers maps each tenant to the virtual key its verification is
 	// charged to (D37: one verifier key per tenant, inside the tenant's
 	// customer). Tenant "*" covers tenants without an entry; leave it out and
@@ -179,6 +192,11 @@ type VerifierKey struct {
 	// from the environment (recommended: plugin configs are returned by the
 	// gateway's plugins API).
 	VirtualKey string `json:"virtual_key"`
+	// SpendCapUSD shapes what the tenant's verification buys in each spend
+	// window (spend.go); 0 means no cap. Keep it below the key's governance
+	// budget, which stays the hard limit. On the "*" entry it applies to each
+	// tenant separately.
+	SpendCapUSD float64 `json:"spend_cap_usd,omitempty"`
 }
 
 func (c Config) auditTimeout() time.Duration {
@@ -197,6 +215,30 @@ func (c Config) cacheWriteSettle() time.Duration {
 }
 func (c Config) cacheTTL() time.Duration {
 	return time.Duration(c.CacheTTLSeconds) * time.Second
+}
+
+// answerTTL is how long an answer should stay cached: the TTL of its most
+// volatile claim that can go stale. ok=false when no claim sets one, or the
+// cache's own cap is sooner.
+func (c Config) answerTTL(claims []ReportClaim) (time.Duration, bool) {
+	var ttl time.Duration
+	for i := range claims {
+		rc := &claims[i]
+		if rc.Status == ClaimRejected || rc.Priority == "" || rc.Priority == PrioritySkip {
+			continue
+		}
+		d, ok := bandChange[rc.VolatilityBand]
+		if s, set := c.VolatilityTTLSeconds[rc.VolatilityBand]; set {
+			d, ok = secs(s), true
+		}
+		if ok && (ttl == 0 || d < ttl) {
+			ttl = d
+		}
+	}
+	if ttl == 0 || (c.CacheTTLSeconds > 0 && c.cacheTTL() <= ttl) {
+		return 0, false
+	}
+	return ttl, true
 }
 
 // withDefaults returns a copy of c with zero fields set to their defaults.
@@ -218,6 +260,12 @@ func (c Config) withDefaults() Config {
 	}
 	if c.CacheWriteSettleSeconds == 0 {
 		c.CacheWriteSettleSeconds = DefaultCacheWriteSettleSeconds
+	}
+	if c.SpendWindowSeconds == 0 {
+		c.SpendWindowSeconds = DefaultSpendWindowSeconds
+	}
+	if c.TombstoneTTLSeconds == 0 {
+		c.TombstoneTTLSeconds = DefaultTombstoneTTLSeconds
 	}
 	c.VerifierVirtualKey = strings.TrimSpace(c.VerifierVirtualKey)
 	c.TavilyRelay = strings.TrimSpace(c.TavilyRelay)
@@ -292,7 +340,8 @@ func (c Config) withDefaults() Config {
 	}
 	verifiers := make([]VerifierKey, len(c.Verifiers))
 	for i, v := range c.Verifiers {
-		verifiers[i] = VerifierKey{Tenant: strings.TrimSpace(v.Tenant), VirtualKeyID: strings.TrimSpace(v.VirtualKeyID), VirtualKey: strings.TrimSpace(v.VirtualKey)}
+		v.Tenant, v.VirtualKeyID, v.VirtualKey = strings.TrimSpace(v.Tenant), strings.TrimSpace(v.VirtualKeyID), strings.TrimSpace(v.VirtualKey)
+		verifiers[i] = v
 	}
 	c.Verifiers = verifiers
 	return c
@@ -300,6 +349,16 @@ func (c Config) withDefaults() Config {
 
 // validate reports the first out-of-range field.
 func (c Config) validate() error {
+	for band, ttl := range c.VolatilityTTLSeconds {
+		if _, known := bandChange[band]; !known || ttl < 1 || ttl > maxCacheTTLSeconds {
+			return fmt.Errorf("halflife: volatility_ttl_seconds: band %q must be one of HOURS_DAYS, WEEKS_MONTHS, YEAR, YEARS, with 1 to %d seconds, got %d", band, maxCacheTTLSeconds, ttl)
+		}
+	}
+	for _, k := range c.Verifiers {
+		if k.SpendCapUSD < 0 {
+			return fmt.Errorf("halflife: verifier for tenant %q: spend_cap_usd must not be negative, got %g", k.Tenant, k.SpendCapUSD)
+		}
+	}
 	switch {
 	case c.QueueSize < 1 || c.QueueSize > 65536:
 		return fmt.Errorf("halflife: queue_size must be between 1 and 65536, got %d", c.QueueSize)
@@ -339,6 +398,10 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: tavily_credits_cooldown_seconds must be between 1 and %d, got %d", maxCreditsCooldownSeconds, c.TavilyCreditsCooldownSeconds)
 	case c.BudgetBackoffSeconds < 1 || c.BudgetBackoffSeconds > maxBudgetBackoffSeconds:
 		return fmt.Errorf("halflife: budget_backoff_seconds must be between 1 and %d, got %d", maxBudgetBackoffSeconds, c.BudgetBackoffSeconds)
+	case c.SpendWindowSeconds < 60 || c.SpendWindowSeconds > maxSpendWindowSeconds:
+		return fmt.Errorf("halflife: spend_window_seconds must be between 60 and %d, got %d", maxSpendWindowSeconds, c.SpendWindowSeconds)
+	case c.TombstoneTTLSeconds < -1 || c.TombstoneTTLSeconds > maxCacheTTLSeconds:
+		return fmt.Errorf("halflife: tombstone_ttl_seconds must be -1 (off) or at most %d, got %d", maxCacheTTLSeconds, c.TombstoneTTLSeconds)
 	case c.TavilyCreditUSD < 0 || c.TavilyCreditUSD > 1:
 		return fmt.Errorf("halflife: tavily_credit_usd must be between 0 and 1, got %g", c.TavilyCreditUSD)
 	case c.Mode != ModeAudit && c.Mode != ModeMonitor && c.Mode != ModeProtect:

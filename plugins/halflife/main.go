@@ -52,7 +52,8 @@ type Plugin struct {
 	logger schemas.Logger
 	closed atomic.Bool
 
-	pool *pool
+	pool  *pool
+	tombs *tombstones
 	// sink receives each finalized capture and reports whether it was
 	// accepted for audit. It runs on the request path, so it must not block.
 	sink func(*Capture) bool
@@ -85,7 +86,10 @@ type Stats struct {
 	SkippedUnsupported uint64
 	SkippedVerifier    uint64
 	Invalidated        uint64 // stale answers evicted from the semantic cache
+	Expired            uint64 // answers evicted at their volatility TTL
 	BypassedRequests   uint64 // requests sent past the cache while an eviction settles
+	TombstoneBypasses  uint64 // requests sent past the cache by a tombstone
+	TombstoneReuses    uint64 // repeats of an outdated answer given its report, no audit
 	ProtectVerified    uint64 // protected requests answered with their verdict in time
 	ProtectTimeouts    uint64 // protected requests sent without a verdict (fail-open)
 }
@@ -97,13 +101,10 @@ func (p *Plugin) audit(ctx context.Context, c *Capture) error {
 		defer close(c.done)
 	}
 	stale, err := p.verify(ctx, c)
-	if err != nil {
-		return err
+	if p.touchesTraffic() {
+		p.applyFreshness(c, stale, err == nil)
 	}
-	if stale && p.touchesTraffic() {
-		p.invalidate(c)
-	}
-	return nil
+	return err
 }
 
 var (
@@ -139,6 +140,7 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	v.metrics = p.metrics
 	p.verifier, p.verify = v, v.verify
 	p.inv = newInvalidator(cfg.cacheWriteSettle(), logger)
+	p.tombs = newTombstones(secs(cfg.TombstoneTTLSeconds))
 	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.audit)
 	p.sink = p.pool.submit
 	verifier := cfg.VerifierVirtualKey
@@ -188,7 +190,10 @@ func (p *Plugin) Stats() Stats {
 		SkippedUnsupported: p.skippedUnsupported.Load(),
 		SkippedVerifier:    p.skippedVerifier.Load(),
 		Invalidated:        p.inv.invalidated.Load(),
+		Expired:            p.inv.expired.Load(),
 		BypassedRequests:   p.inv.bypassed.Load(),
+		TombstoneBypasses:  p.tombs.bypassed.Load(),
+		TombstoneReuses:    p.tombs.reused.Load(),
 		ProtectVerified:    p.protectVerified.Load(),
 		ProtectTimeouts:    p.protectTimeouts.Load(),
 	}
@@ -233,7 +238,11 @@ func (p *Plugin) PreRequestHook(_ *schemas.BifrostContext, _ *schemas.BifrostReq
 func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostRequest) (*schemas.BifrostRequest, *schemas.LLMPluginShortCircuit, error) {
 	if s := slotFrom(ctx); s != nil {
 		if q, ok := questionFromRequest(req); ok {
-			s.setQuestion(clip(q, maxQuestionBytes))
+			q, truncated := clip(q, maxQuestionBytes)
+			s.setQuestion(q, truncated)
+			if p.touchesTraffic() {
+				p.tombs.bypass(ctx, q)
+			}
 		}
 	}
 	if p.touchesTraffic() {
@@ -348,7 +357,7 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		if c.RequestID == "" {
 			c.RequestID = strings.Clone(headerValue(resp.Headers, "X-Bifrost-Request-Id"))
 		}
-		if p.resolveCachedHit(s, c) {
+		if p.resolveCachedHit(s, c) || (p.touchesTraffic() && p.resolveTombstoned(s, c)) {
 			return nil
 		}
 		c.ReportID = newReportID()

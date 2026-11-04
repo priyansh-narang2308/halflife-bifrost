@@ -37,8 +37,9 @@ type searcher interface {
 }
 
 type verifierKey struct {
-	id    string
-	value string // the key's secret; sent only to this gateway
+	id       string
+	value    string  // the key's secret; sent only to this gateway
+	spendCap float64 // USD per spend window, 0 for none
 }
 
 type verifier struct {
@@ -61,6 +62,8 @@ type verifier struct {
 	llmCircuit      *breaker
 	creditsCooldown time.Duration
 	budget          *budgetBackoff
+	spend           *spendLedger
+	creditUSD       float64
 	metrics         *metrics // nil-safe: tests may run without one
 }
 
@@ -78,6 +81,8 @@ func newVerifier(cfg Config, store reports, logger schemas.Logger) (*verifier, e
 		llmCircuit:      newBreaker(DependencyLLM, cfg.CircuitBreakerFailures, cooldown),
 		creditsCooldown: secs(cfg.TavilyCreditsCooldownSeconds),
 		budget:          newBudgetBackoff(secs(cfg.BudgetBackoffSeconds)),
+		spend:           newSpendLedger(secs(cfg.SpendWindowSeconds)),
+		creditUSD:       cfg.TavilyCreditUSD,
 		keys:            make(map[string]verifierKey, len(cfg.Verifiers)),
 		maxResults:      cfg.SearchMaxResults,
 		maxClaims:       cfg.MaxClaimsPerResponse,
@@ -111,7 +116,7 @@ func newVerifier(cfg Config, store reports, logger schemas.Logger) (*verifier, e
 			}
 			return nil, fmt.Errorf("halflife: verifier key for tenant %q: %w", k.Tenant, err)
 		}
-		v.keys[k.Tenant] = verifierKey{id: k.VirtualKeyID, value: value}
+		v.keys[k.Tenant] = verifierKey{id: k.VirtualKeyID, value: value, spendCap: k.SpendCapUSD}
 	}
 	return v, nil
 }
@@ -173,10 +178,23 @@ func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 		v.metrics.record(r)
 	}
 	v.logger.Debug("halflife: report %s complete: outcome=%s verdict=%s claims=%d", c.ReportID, a.outcome, a.verdict, len(a.claims))
+	stale := anyOutdated(a.claims)
 	if a.outcome == OutcomeSearchFailed || a.outcome == OutcomeExtractionFailed {
-		return false, a.err
+		return stale, a.err
 	}
-	return false, nil
+	return stale, nil
+}
+
+// anyOutdated reports whether a claim was shown to have stopped being true.
+// Only OUTDATED counts (audit §3.4): CONTRADICTED may never have been true,
+// and a regenerated answer would say the same.
+func anyOutdated(claims []ReportClaim) bool {
+	for i := range claims {
+		if claims[i].Verdict == VerdictOutdated {
+			return true
+		}
+	}
+	return false
 }
 
 // budgetPause is the audit of a tenant whose budget backoff is running.
@@ -227,11 +245,19 @@ func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 			return audit{outcome: OutcomeUnavailable, reason: ue.Error()}
 		}
 	}
+	// With the cap used up not even a HIGH claim could be checked, so the
+	// extraction is not bought either.
+	if reason := v.passOver(key, c.VirtualKeyID, PriorityHigh); reason != "" {
+		return audit{outcome: OutcomeBudgetExhausted, reason: reason}
+	}
 	if err := v.llmCircuit.allow(); err != nil {
 		return audit{outcome: OutcomeUnavailable, reason: err.Error()}
 	}
 	extracted, res, err := extractClaims(ctx, llm, c.Question, c.Answer)
 	v.recordLLM(err)
+	if res != nil {
+		v.spend.charge(c.VirtualKeyID, res.CostUSD)
+	}
 	var le *LLMError
 	switch {
 	case errors.As(err, &le) && le.BudgetSpent():
@@ -264,6 +290,10 @@ func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 			rc.Status, rc.StatusReason = ClaimNotChecked, fmt.Sprintf("over max_claims_per_response (%d)", v.maxClaims)
 			continue
 		}
+		if reason := v.passOver(key, c.VirtualKeyID, rc.Priority); reason != "" {
+			rc.Status, rc.StatusReason, rc.Failure = ClaimNotChecked, reason, FailureSpendCap
+			continue
+		}
 		searched++
 		req := retrievalPolicy(rc, v.maxResults, v.domains[rc.Category])
 		if err := v.check(ctx, key, c, rc, req, v.extract); err != nil {
@@ -275,6 +305,7 @@ func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 		if rc.Status == ClaimChecked && !spent {
 			spent = v.judge(ctx, llm, rc) != nil // only a 402 is returned
 		}
+		v.spend.charge(c.VirtualKeyID, v.claimUSD(rc))
 		if spent {
 			v.budget.spent(c.VirtualKeyID)
 		}
@@ -338,7 +369,7 @@ func outcomeOf(claims []ReportClaim, err error) string {
 			}
 		case c.Status == ClaimFailed:
 			failed++
-		case c.Status == ClaimNotChecked && strings.Contains(c.StatusReason, "402"):
+		case c.Status == ClaimNotChecked && (c.Failure == FailureSpendCap || strings.Contains(c.StatusReason, "402")):
 			budget++
 		}
 	}

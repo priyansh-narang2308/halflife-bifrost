@@ -128,6 +128,9 @@ func TestLLMStructuredReply(t *testing.T) {
 	}
 
 	body, hdr := g.bodies[0], g.headers[0]
+	if got := hdr.Get("x-bf-cache-type"); got != string(bypassCacheType) {
+		t.Errorf("verifier calls must skip the semantic cache: x-bf-cache-type = %q", got)
+	}
 	if hdr.Get("x-bf-vk") != "sk-bf-verifier-acme" || hdr.Get("Content-Type") != "application/json" {
 		t.Errorf("headers %v", hdr)
 	}
