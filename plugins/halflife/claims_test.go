@@ -704,3 +704,25 @@ func TestVerifyAllChecksSkippedClaims(t *testing.T) {
 		}
 	}
 }
+
+// A model may cut its span one clause short of the value it read. The span
+// grows to the sentence holding both, and no further.
+func TestSpanGrowsToTheSentenceHoldingTheValue(t *testing.T) {
+	answer := `Asked "when did the last patch come out?", the answer is "Feb 13, 2024". Later releases cost $5.`
+	claim := extractedClaim{Text: "The last patch came out on Feb 13, 2024.", Span: "when did the last patch come out?",
+		Subject: "the last patch", AssertedValue: "Feb 13, 2024"}
+	widenSpan(&claim, answer)
+	if why := checkSpan(claim, answer); why != "" {
+		t.Fatalf("rejected: %s (span %q)", why, claim.Span)
+	}
+	if strings.Contains(claim.Span, "$5") {
+		t.Errorf("span left its sentence: %q", claim.Span)
+	}
+
+	other := extractedClaim{Text: "The last patch cost $5 in all.", Span: "when did the last patch come out?",
+		Subject: "the last patch", AssertedValue: "$5"}
+	widenSpan(&other, answer)
+	if why := checkSpan(other, answer); why != RejectValueNotInSpan {
+		t.Errorf("a value in another sentence must stay rejected, got %q", why)
+	}
+}

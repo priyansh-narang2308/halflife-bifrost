@@ -206,15 +206,8 @@ func checkSpan(c extractedClaim, answer string) string {
 	case c.AsOf != "" && !asOfRe.MatchString(c.AsOf):
 		return RejectBadAsOf
 	}
-	lowerSpan := strings.ToLower(span)
-	if v := strings.ToLower(normaliseSpan(c.AssertedValue)); v != "" {
-		if nums := numbers(v); len(nums) > 0 {
-			if !subset(nums, numbers(lowerSpan)) {
-				return RejectValueNotInSpan
-			}
-		} else if !strings.Contains(lowerSpan, v) {
-			return RejectValueNotInSpan
-		}
+	if !valueInSpan(c.AssertedValue, span) {
+		return RejectValueNotInSpan
 	}
 	if !subset(numbers(c.Text), numbers(span)) {
 		return RejectNewNumber
@@ -223,6 +216,38 @@ func checkSpan(c extractedClaim, answer string) string {
 		return RejectNegationFlipped
 	}
 	return ""
+}
+
+// valueInSpan reports whether a claim's asserted value appears in span.
+func valueInSpan(value, span string) bool {
+	v, lowerSpan := strings.ToLower(normaliseSpan(value)), strings.ToLower(span)
+	if nums := numbers(v); len(nums) > 0 {
+		return subset(nums, numbers(lowerSpan))
+	}
+	return strings.Contains(lowerSpan, v)
+}
+
+// widenSpan grows a span that stops short of its value to the sentence of the
+// answer holding both, and leaves any other span for checkSpan to judge. A
+// false sentence stop only leaves a span unwidened.
+func widenSpan(c *extractedClaim, answer string) {
+	span, text := normaliseSpan(c.Span), normaliseSpan(answer)
+	at := strings.Index(text, span)
+	if span == "" || at < 0 || valueInSpan(c.AssertedValue, span) {
+		return
+	}
+	start, end := 0, len(text)
+	for _, m := range sentenceEndsRe.FindAllStringIndex(text, -1) {
+		switch {
+		case m[1] <= at:
+			start = m[1]
+		case m[0] >= at+len(span) && end == len(text):
+			end = m[0] + 1
+		}
+	}
+	if sentence := text[start:end]; valueInSpan(c.AssertedValue, sentence) {
+		c.Span = sentence
+	}
 }
 
 // normaliseSpan makes formatting differences irrelevant to the span check:

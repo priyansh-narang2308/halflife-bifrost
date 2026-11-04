@@ -341,6 +341,7 @@ func notCheckedReason(rc *ReportClaim) string {
 // classify turns an extracted claim into a report claim: span check, then
 // temporal scope, then priority.
 func (v *verifier) classify(e extractedClaim, c *Capture, now time.Time) ReportClaim {
+	widenSpan(&e, c.Answer)
 	rc := ReportClaim{
 		Text: e.Text, Span: e.Span, Subject: e.Subject, Attribute: e.Attribute, AssertedValue: e.AssertedValue,
 		Category: e.Category, AsOf: e.AsOf, VolatilityBand: e.VolatilityBand, Status: ClaimPending,
