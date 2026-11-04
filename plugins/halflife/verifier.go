@@ -63,6 +63,7 @@ type verifier struct {
 	creditsCooldown time.Duration
 	budget          *budgetBackoff
 	spend           *spendLedger
+	verifyAll       bool
 	creditUSD       float64
 	metrics         *metrics // nil-safe: tests may run without one
 }
@@ -82,6 +83,7 @@ func newVerifier(cfg Config, store reports, logger schemas.Logger) (*verifier, e
 		creditsCooldown: secs(cfg.TavilyCreditsCooldownSeconds),
 		budget:          newBudgetBackoff(secs(cfg.BudgetBackoffSeconds)),
 		spend:           newSpendLedger(secs(cfg.SpendWindowSeconds)),
+		verifyAll:       cfg.VerifyAll,
 		creditUSD:       cfg.TavilyCreditUSD,
 		keys:            make(map[string]verifierKey, len(cfg.Verifiers)),
 		maxResults:      cfg.SearchMaxResults,
@@ -352,6 +354,9 @@ func (v *verifier) classify(e extractedClaim, c *Capture, now time.Time) ReportC
 		Scope: rc.TemporalScope, Band: rc.VolatilityBand, Category: rc.Category, AsOf: rc.AsOf, Span: rc.Span,
 		Provider: string(c.Provider), Model: c.Model,
 	}, v.cutoffs, v.boosted, now)
+	if v.verifyAll && rc.Priority == PrioritySkip {
+		rc.Priority, rc.PriorityReason = PriorityLow, "verify_all: "+rc.PriorityReason
+	}
 	return rc
 }
 

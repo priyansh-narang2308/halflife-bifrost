@@ -688,3 +688,19 @@ func TestPipelineNoKeyForTenant(t *testing.T) {
 		t.Errorf("err=%v outcome=%s llm=%d", err, r.Outcome, g.calls())
 	}
 }
+
+// The evaluation's verify-all baseline checks what priority would skip.
+func TestVerifyAllChecksSkippedClaims(t *testing.T) {
+	past := extractedClaim{Text: "Acme Cloud Pro cost $49 per month in 2019.", Span: "Acme Cloud Pro cost $49 per month in 2019", Subject: "Acme Cloud Pro",
+		Attribute: "monthly price", AssertedValue: "$49", Category: CategoryPrice, TemporalScope: ScopeHistorical, AsOf: "2019", VolatilityBand: BandWeeksMonths}
+	answer := "Acme Cloud Pro cost $49 per month in 2019."
+	for verifyAll, wantSearches := range map[bool]int{false: 0, true: 1} {
+		v, f, _ := extractingVerifier(t, func(c *Config) { c.VerifyAll, c.DisableExtract = verifyAll, true }, extractionReply(t, past))
+		if _, err := runVerify(t, v, acmeCapture("hlr_1", answer)); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.calls) != wantSearches {
+			t.Errorf("verify_all %v: %d searches", verifyAll, len(f.calls))
+		}
+	}
+}

@@ -103,6 +103,9 @@ type Config struct {
 	// TombstoneTTLSeconds is how long a question whose answer was found
 	// outdated stays off the semantic cache. -1 turns tombstones off.
 	TombstoneTTLSeconds int `json:"tombstone_ttl_seconds,omitempty"`
+	// VerifyAll checks claims priority would skip. For the evaluation's
+	// verify-all baseline (audit §6.2), not for production.
+	VerifyAll bool `json:"verify_all,omitempty"`
 	// Verifiers maps each tenant to the virtual key its verification is
 	// charged to (D37: one verifier key per tenant, inside the tenant's
 	// customer). Tenant "*" covers tenants without an entry; leave it out and

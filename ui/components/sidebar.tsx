@@ -736,6 +736,13 @@ export default function AppSidebar() {
 						hasAccess: hasRelayLogsAccess,
 					},
 					{
+						title: "Halflife",
+						url: "/workspace/halflife",
+						icon: ShieldCheck,
+						description: "Stale-fact audits of LLM answers",
+						hasAccess: hasLogsAccess,
+					},
+					{
 						title: "Connectors",
 						url: "/workspace/observability",
 						icon: ChevronsLeftRightEllipsis,
