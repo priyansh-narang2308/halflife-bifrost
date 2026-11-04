@@ -68,8 +68,12 @@ type Plugin struct {
 	verifierKeys map[string]bool
 	// inv evicts stale answers from the semantic cache.
 	inv *invalidator
+	// verifier and metrics back the usage and metrics endpoints.
+	verifier *verifier
+	metrics  *metrics
 
 	cachedHits, captured, skippedFailed, skippedStreaming, skippedUnsupported, skippedVerifier atomic.Uint64
+	protectVerified, protectTimeouts                                                           atomic.Uint64
 }
 
 // Stats counts finalized requests by outcome.
@@ -82,16 +86,21 @@ type Stats struct {
 	SkippedVerifier    uint64
 	Invalidated        uint64 // stale answers evicted from the semantic cache
 	BypassedRequests   uint64 // requests sent past the cache while an eviction settles
+	ProtectVerified    uint64 // protected requests answered with their verdict in time
+	ProtectTimeouts    uint64 // protected requests sent without a verdict (fail-open)
 }
 
 // audit runs on a pool worker: verify the answer, and evict it from the
 // semantic cache if it is stale.
 func (p *Plugin) audit(ctx context.Context, c *Capture) error {
+	if c.done != nil {
+		defer close(c.done)
+	}
 	stale, err := p.verify(ctx, c)
 	if err != nil {
 		return err
 	}
-	if stale {
+	if stale && p.touchesTraffic() {
 		p.invalidate(c)
 	}
 	return nil
@@ -120,13 +129,15 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if err != nil {
 		return nil, err
 	}
-	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks), reports: store, verifierKeys: cfg.verifierKeyIDs()}
+	p := &Plugin{config: cfg, logger: logger, links: newCacheLinks(maxCacheLinks), reports: store, verifierKeys: cfg.verifierKeyIDs(),
+		metrics: newMetrics(cfg.TavilyCreditUSD)}
 	v, err := newVerifier(cfg, p.reports, logger)
 	if err != nil {
 		store.close()
 		return nil, err
 	}
-	p.verify = v.verify
+	v.metrics = p.metrics
+	p.verifier, p.verify = v, v.verify
 	p.inv = newInvalidator(cfg.cacheWriteSettle(), logger)
 	p.pool = newPool(cfg.Workers, cfg.QueueSize, cfg.auditTimeout(), p.audit)
 	p.sink = p.pool.submit
@@ -138,8 +149,8 @@ func Init(_ context.Context, config *Config, logger schemas.Logger) (*Plugin, er
 	if cfg.ReportStorePath != "" {
 		reportStore = "sqlite"
 	}
-	logger.Info("halflife: initialized (queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s verifier_models=%d cache_ttl=%s report_store=%s)",
-		cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, len(cfg.VerifierModels), cacheTTLLabel(cfg.cacheTTL()), reportStore)
+	logger.Info("halflife: initialized (mode=%s queue_size=%d workers=%d max_claims=%d tavily_relay=%s verifier_vk=%s verifiers=%d gateway=%s verifier_models=%d cache_ttl=%s report_store=%s)",
+		cfg.Mode, cfg.QueueSize, cfg.Workers, cfg.MaxClaimsPerResponse, cfg.TavilyRelay, verifier, len(cfg.Verifiers), cfg.GatewayURL, len(cfg.VerifierModels), cacheTTLLabel(cfg.cacheTTL()), reportStore)
 	return p, nil
 }
 
@@ -178,6 +189,8 @@ func (p *Plugin) Stats() Stats {
 		SkippedVerifier:    p.skippedVerifier.Load(),
 		Invalidated:        p.inv.invalidated.Load(),
 		BypassedRequests:   p.inv.bypassed.Load(),
+		ProtectVerified:    p.protectVerified.Load(),
+		ProtectTimeouts:    p.protectTimeouts.Load(),
 	}
 }
 
@@ -223,8 +236,10 @@ func (p *Plugin) PreLLMHook(ctx *schemas.BifrostContext, req *schemas.BifrostReq
 			s.setQuestion(clip(q, maxQuestionBytes))
 		}
 	}
-	p.capCacheTTL(ctx)
-	p.inv.bypassIfPending(ctx)
+	if p.touchesTraffic() {
+		p.capCacheTTL(ctx)
+		p.inv.bypassIfPending(ctx)
+	}
 	return req, nil, nil
 }
 
@@ -292,7 +307,7 @@ func (p *Plugin) HTTPTransportPreAuthHook(_ *schemas.BifrostContext, _ *schemas.
 // values set here into the core context, so the LLM hooks find the same slot.
 func (p *Plugin) HTTPTransportPreHook(ctx *schemas.BifrostContext, req *schemas.HTTPRequest) (*schemas.HTTPResponse, error) {
 	if inferenceRequest(req) {
-		ctx.SetValue(slotKey{}, &slot{})
+		ctx.SetValue(slotKey{}, &slot{protect: p.protects(req)})
 	}
 	return nil, nil
 }
@@ -345,6 +360,9 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		// on the entry) before this hook returns.
 		linked := c.CacheID != "" && p.links.add(c.CacheID, c.ReportID, c.VirtualKeyID)
 		p.reports.put(newReport(c))
+		if s.protect {
+			c.done = make(chan struct{})
+		}
 		if !p.sink(c) {
 			// No report will exist, so the client gets no report header.
 			p.reports.remove(c.ReportID)
@@ -357,6 +375,9 @@ func (p *Plugin) HTTPTransportPostHook(ctx *schemas.BifrostContext, _ *schemas.H
 		}
 		if linked {
 			p.logger.Debug("halflife: report %s covers cache entry %s", c.ReportID, c.CacheID)
+		}
+		if c.done != nil {
+			p.awaitVerdict(s, c.done, c.ReportID)
 		}
 	case SkipFailed:
 		p.skippedFailed.Add(1)
@@ -388,6 +409,9 @@ func (p *Plugin) resolveCachedHit(s *slot, c *Capture) bool {
 		return false
 	}
 	s.setReport(link.reportID, true)
+	if s.protect {
+		p.protectCachedHit(s, link.reportID)
+	}
 	p.cachedHits.Add(1)
 	p.logger.Debug("halflife: %s cache hit on entry %s, report=%s request=%s vk=%s",
 		c.CacheHitType, c.CacheID, link.reportID, c.RequestID, c.VirtualKeyID)
@@ -401,7 +425,7 @@ func (p *Plugin) resolveCachedHit(s *slot, c *Capture) bool {
 // in M1, so it is reported as such from its content type.
 func (p *Plugin) HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, _ *schemas.HTTPRequest, resp *schemas.HTTPResponseMetadata) error {
 	s := slotFrom(ctx)
-	if s == nil || resp == nil || resp.Headers == nil {
+	if s == nil || resp == nil || resp.Headers == nil || !p.touchesTraffic() {
 		return nil
 	}
 	status := s.status()
@@ -416,6 +440,10 @@ func (p *Plugin) HTTPTransportResponseHeadersHook(ctx *schemas.BifrostContext, _
 	if id := s.report(); id != "" {
 		resp.Headers[HeaderReport] = id
 		expose(resp.Headers, HeaderReport)
+	}
+	if v := s.protectedVerdict(); v != "" {
+		resp.Headers[HeaderVerdict] = v
+		expose(resp.Headers, HeaderVerdict)
 	}
 	return nil
 }

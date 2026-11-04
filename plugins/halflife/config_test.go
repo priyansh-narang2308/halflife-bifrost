@@ -13,13 +13,18 @@ func TestConfigDefaults(t *testing.T) {
 		AuditTimeoutSeconds: DefaultAuditTimeoutSeconds, DrainTimeoutSeconds: DefaultDrainTimeoutSeconds,
 		CacheWriteSettleSeconds: DefaultCacheWriteSettleSeconds, GatewayURL: DefaultGatewayURL, Verifiers: []VerifierKey{},
 		SearchMaxResults: DefaultSearchMaxResults, ReportStoreSize: DefaultReportStoreSize, ReportRetentionHours: DefaultReportRetentionHours,
-		VerifierModels: []string{}, VerifierMaxTokens: DefaultVerifierMaxTokens}
+		VerifierModels: []string{}, VerifierMaxTokens: DefaultVerifierMaxTokens,
+		SearchTimeoutSeconds: DefaultSearchTimeoutSeconds, CircuitBreakerFailures: DefaultCircuitBreakerFailures,
+		CircuitBreakerCooldownSeconds: DefaultCircuitBreakerCooldownSeconds, TavilyCreditsCooldownSeconds: DefaultTavilyCreditsCooldownSeconds,
+		BudgetBackoffSeconds: DefaultBudgetBackoffSeconds, TavilyCreditUSD: DefaultTavilyCreditUSD, Mode: DefaultMode, ProtectTimeoutMs: DefaultProtectTimeoutMs}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("withDefaults() = %+v, want %+v", got, want)
 	}
 	set := Config{QueueSize: 8, Workers: 1, MaxClaimsPerResponse: 3, TavilyRelay: "tavily-eu", AuditTimeoutSeconds: 9, DrainTimeoutSeconds: 2, VerifierVirtualKey: "vk-verifier",
 		CacheTTLSeconds: 600, CacheWriteSettleSeconds: 45, GatewayURL: "https://gw.example:8443", SearchMaxResults: 3, ReportStoreSize: 50,
 		ReportStorePath: "/var/lib/halflife/reports.db", ReportRetentionHours: 24, PersistAnswerText: true,
+		SearchTimeoutSeconds: 10, CircuitBreakerFailures: 3, CircuitBreakerCooldownSeconds: 60, TavilyCreditsCooldownSeconds: 120,
+		BudgetBackoffSeconds: 30, TavilyCreditUSD: 0.005, Mode: ModeProtect, ProtectTimeoutMs: 2000, ProtectAll: true,
 		Verifiers:      []VerifierKey{{Tenant: "vk-acme", VirtualKeyID: "vk-verifier-acme", VirtualKey: "env.HL_ACME"}},
 		VerifierModels: []string{"openrouter/a:free", "openrouter/b:free"}, VerifierMaxTokens: 512, VerifierReasoningEffort: "low"}
 	if got := set.withDefaults(); !reflect.DeepEqual(got, set) {
@@ -67,13 +72,22 @@ func TestConfigValidate(t *testing.T) {
 		"too many boost categories": {func(c *Config) {
 			c.PriorityBoostCategories = []string{"law", "law", "law", "law", "law", "law", "law", "law"}
 		}, "priority_boost_categories lists 8"},
-		"domains for unknown category": {func(c *Config) { c.PreferredDomains = map[string][]string{"weather": {"x.dev"}} }, "preferred_domains key"},
-		"domain is a URL":              {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {"https://go.dev"}} }, "bare domains"},
-		"empty domain":                 {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {""}} }, "bare domains"},
-		"no retention":                 {func(c *Config) { c.ReportRetentionHours = -1 }, "report_retention_hours"},
-		"retention over ten years":     {func(c *Config) { c.ReportRetentionHours = 87601 }, "report_retention_hours"},
-		"store path with a query":      {func(c *Config) { c.ReportStorePath = "reports.db?mode=memory" }, "report_store_path"},
-		"tenant verifies itself":       {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
+		"domains for unknown category":  {func(c *Config) { c.PreferredDomains = map[string][]string{"weather": {"x.dev"}} }, "preferred_domains key"},
+		"domain is a URL":               {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {"https://go.dev"}} }, "bare domains"},
+		"empty domain":                  {func(c *Config) { c.PreferredDomains = map[string][]string{"version": {""}} }, "bare domains"},
+		"no retention":                  {func(c *Config) { c.ReportRetentionHours = -1 }, "report_retention_hours"},
+		"retention over ten years":      {func(c *Config) { c.ReportRetentionHours = 87601 }, "report_retention_hours"},
+		"store path with a query":       {func(c *Config) { c.ReportStorePath = "reports.db?mode=memory" }, "report_store_path"},
+		"search timeout over 2 min":     {func(c *Config) { c.SearchTimeoutSeconds = 121 }, "search_timeout_seconds"},
+		"breaker never opens":           {func(c *Config) { c.CircuitBreakerFailures = -1 }, "circuit_breaker_failures"},
+		"breaker cooldown over an hour": {func(c *Config) { c.CircuitBreakerCooldownSeconds = 3601 }, "circuit_breaker_cooldown_seconds"},
+		"credits cooldown negative":     {func(c *Config) { c.TavilyCreditsCooldownSeconds = -5 }, "tavily_credits_cooldown_seconds"},
+		"budget backoff over a day":     {func(c *Config) { c.BudgetBackoffSeconds = 86401 }, "budget_backoff_seconds"},
+		"credit price negative":         {func(c *Config) { c.TavilyCreditUSD = -1 }, "tavily_credit_usd"},
+		"unknown mode":                  {func(c *Config) { c.Mode = "enforce" }, "mode must be"},
+		"protect timeout too short":     {func(c *Config) { c.Mode, c.ProtectTimeoutMs = ModeProtect, 50 }, "protect_timeout_ms"},
+		"protect_all outside protect":   {func(c *Config) { c.ProtectAll = true }, "protect_all needs mode protect"},
+		"tenant verifies itself":        {func(c *Config) { c.Verifiers = []VerifierKey{{Tenant: "vk-a", VirtualKeyID: "vk-a", VirtualKey: "k"}} }, "own key"},
 	} {
 		c := ok
 		tc.mutate(&c)

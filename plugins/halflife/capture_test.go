@@ -28,9 +28,15 @@ type request struct {
 
 func newRequest(t *testing.T, p *Plugin) *request {
 	t.Helper()
+	return newRequestWith(t, p, nil)
+}
+
+// newRequestWith is newRequest with client request headers.
+func newRequestWith(t *testing.T, p *Plugin, headers map[string]string) *request {
+	t.Helper()
 	r := &request{t: t, p: p, transport: newCtx()}
 	scoped := r.scoped(r.transport)
-	if resp, err := p.HTTPTransportPreHook(scoped, &schemas.HTTPRequest{Method: "POST", Path: "/v1/chat/completions"}); resp != nil || err != nil {
+	if resp, err := p.HTTPTransportPreHook(scoped, &schemas.HTTPRequest{Method: "POST", Path: "/v1/chat/completions", Headers: headers}); resp != nil || err != nil {
 		t.Fatalf("HTTPTransportPreHook = %v, %v", resp, err)
 	}
 	scoped.ReleasePluginScope()

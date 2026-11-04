@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strconv"
 	"strings"
 	"time"
 )
@@ -255,13 +254,6 @@ func errorMessage(raw []byte) string {
 		}
 	}
 	return clipString(strings.TrimSpace(string(raw)), 200)
-}
-
-func retryAfter(v string) time.Duration {
-	if secs, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && secs > 0 {
-		return time.Duration(secs) * time.Second
-	}
-	return 0
 }
 
 func clipString(s string, n int) string {

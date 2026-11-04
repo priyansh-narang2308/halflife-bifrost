@@ -64,6 +64,9 @@ func evidenceStrength(rc *ReportClaim, preferred []string) (string, string) {
 	kind := comparatorFor(rc.Category)
 	agreeing, primary := map[string]bool{}, map[string]bool{}
 	for i, s := range rc.Evidence.Sources {
+		if s.Flagged {
+			continue // a page that addresses the model is not independent evidence
+		}
 		text := s.Snippet + "\n" + s.Extracted
 		agrees := i == rc.Quote.Source && rc.Quote.Verified
 		if !agrees && rc.ObservedValue != "" {

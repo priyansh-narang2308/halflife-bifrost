@@ -119,14 +119,17 @@ type LLMMessage struct {
 
 // LLMResult describes how a structured call was answered.
 type LLMResult struct {
-	Model             string   `json:"model"`    // the model that answered
-	Provider          string   `json:"provider"` // its provider
-	Fallback          bool     `json:"fallback"` // answered by one of Bifrost's fallbacks
-	Calls             int      `json:"calls"`    // HTTP calls made, including retries
-	Malformed         int      `json:"malformed"`
-	Truncated         bool     `json:"truncated"`
-	PromptTokens      int      `json:"prompt_tokens"`
-	CompletionTokens  int      `json:"completion_tokens"`
+	Model            string `json:"model"`    // the model that answered
+	Provider         string `json:"provider"` // its provider
+	Fallback         bool   `json:"fallback"` // answered by one of Bifrost's fallbacks
+	Calls            int    `json:"calls"`    // HTTP calls made, including retries
+	Malformed        int    `json:"malformed"`
+	Truncated        bool   `json:"truncated"`
+	PromptTokens     int    `json:"prompt_tokens"`
+	CompletionTokens int    `json:"completion_tokens"`
+	// CostUSD is the cost the gateway reported in usage.cost, summed over
+	// calls; 0 when the provider reports none.
+	CostUSD           float64  `json:"cost_usd,omitempty"`
 	GatewayRequestIDs []string `json:"gateway_request_ids"`
 }
 
@@ -202,10 +205,10 @@ func (l *LLM) Complete(ctx context.Context, messages []LLMMessage, schema *JSONS
 func (l *LLM) callWithRetry(ctx context.Context, msgs []LLMMessage, schema *JSONSchema, res *LLMResult) (string, bool, error) {
 	reply, truncated, err := l.call(ctx, msgs, schema, res)
 	var le *LLMError
-	if err == nil || !errors.As(err, &le) || !le.Retryable() {
-		return reply, truncated, err
+	if err == nil || !errors.As(err, &le) || !le.Retryable() || le.RetryAfter > maxRetryAfter {
+		return reply, truncated, err // a long Retry-After opens the circuit instead (resilience.go)
 	}
-	wait := min(le.RetryAfter, maxRetryAfter)
+	wait := le.RetryAfter
 	if wait <= 0 {
 		wait = defaultRetryWait
 	}
@@ -225,8 +228,9 @@ type chatReply struct {
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage struct {
-		PromptTokens     int `json:"prompt_tokens"`
-		CompletionTokens int `json:"completion_tokens"`
+		PromptTokens     int             `json:"prompt_tokens"`
+		CompletionTokens int             `json:"completion_tokens"`
+		Cost             json.RawMessage `json:"cost"` // a number, or {"total_cost": ...}
 	} `json:"usage"`
 	ExtraFields struct {
 		Provider          string `json:"provider"`
@@ -299,6 +303,7 @@ func (l *LLM) call(ctx context.Context, msgs []LLMMessage, schema *JSONSchema, r
 	res.Provider, res.Fallback = r.ExtraFields.Provider, r.ExtraFields.RoutingInfo.IsFallback
 	res.PromptTokens += r.Usage.PromptTokens
 	res.CompletionTokens += r.Usage.CompletionTokens
+	res.CostUSD += replyCost(r.Usage.Cost)
 	choice := r.Choices[0]
 	truncated := choice.FinishReason == "length"
 	if text := contentText(choice.Message.Content); text != "" {
@@ -342,4 +347,23 @@ func unfence(s string) string {
 		s = s[nl+1:] // the language tag line, e.g. "json"
 	}
 	return strings.TrimSpace(s)
+}
+
+// replyCost reads usage.cost, which Bifrost sends as a number or as an
+// object with total_cost. Anything else counts as no reported cost.
+func replyCost(raw json.RawMessage) float64 {
+	if len(raw) == 0 {
+		return 0
+	}
+	var total float64
+	if json.Unmarshal(raw, &total) == nil {
+		return max(total, 0)
+	}
+	var c struct {
+		TotalCost float64 `json:"total_cost"`
+	}
+	if json.Unmarshal(raw, &c) == nil {
+		return max(c.TotalCost, 0)
+	}
+	return 0
 }

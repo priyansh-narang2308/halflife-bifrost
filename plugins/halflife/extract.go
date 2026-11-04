@@ -144,8 +144,8 @@ func checkableSentences(answer string) []string {
 
 // extractionMessages builds the extractor's prompt from the filtered answer.
 func extractionMessages(question string, kept []string) []LLMMessage {
-	body, _ := clip(strings.Join(kept, "\n"), maxExtractInputBytes)
-	q, _ := clip(strings.TrimSpace(question), maxPromptQuestionBytes)
+	body, _ := clip(promptSafe(strings.Join(kept, "\n"), answerDelimiterRe), maxExtractInputBytes)
+	q, _ := clip(promptSafe(strings.TrimSpace(question), answerDelimiterRe), maxPromptQuestionBytes)
 	user := "<question>" + q + "</question>\n<answer>\n" + body + "\n</answer>"
 	return []LLMMessage{{Role: "system", Content: extractionPrompt}, {Role: "user", Content: user}}
 }

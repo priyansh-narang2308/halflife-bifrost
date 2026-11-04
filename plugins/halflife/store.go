@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ type reports interface {
 	update(id string, fn func(*Report)) bool
 	get(id string) (Report, bool)
 	remove(id string)
+	list(f ReportFilter) []ReportSummary
 	close() error
 }
 
@@ -79,6 +81,13 @@ var migrations = []string{
 		PRIMARY KEY (report_id, claim_position, position),
 		FOREIGN KEY (report_id, claim_position) REFERENCES claims (report_id, position) ON DELETE CASCADE
 	);`,
+	// 2: report listing by model, and flagged sources (untrusted.go).
+	`ALTER TABLE reports ADD COLUMN provider TEXT NOT NULL DEFAULT '';
+	ALTER TABLE reports ADD COLUMN model TEXT NOT NULL DEFAULT '';
+	UPDATE reports SET provider = COALESCE(json_extract(document, '$.answer.provider'), ''),
+		model = COALESCE(json_extract(document, '$.answer.model'), '');
+	CREATE INDEX reports_model ON reports (provider, model, created_at);
+	ALTER TABLE claim_sources ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0;`,
 }
 
 // sqliteReports keeps in-flight reports in memory and completed ones in SQLite.
@@ -220,9 +229,10 @@ func (s *sqliteReports) write(r Report) error {
 	if _, err := tx.Exec(`DELETE FROM reports WHERE id = ?`, r.ID); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`INSERT INTO reports (id, request_id, tenant_virtual_key_id, outcome, verdict, created_at, completed_at, document)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.RequestID, r.Tenant.VirtualKeyID, r.Outcome, r.Verdict, r.CreatedAt.UnixMilli(), completed.UnixMilli(), string(doc)); err != nil {
+	if _, err := tx.Exec(`INSERT INTO reports (id, request_id, tenant_virtual_key_id, outcome, verdict, created_at, completed_at, document, provider, model)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.RequestID, r.Tenant.VirtualKeyID, r.Outcome, r.Verdict, r.CreatedAt.UnixMilli(), completed.UnixMilli(), string(doc),
+		r.Answer.Provider, r.Answer.Model); err != nil {
 		return err
 	}
 	for i, c := range r.Claims {
@@ -261,9 +271,9 @@ func insertClaim(tx *sql.Tx, reportID string, pos int, c ReportClaim) error {
 		return err
 	}
 	for j, src := range ev.Sources {
-		if _, err := tx.Exec(`INSERT INTO claim_sources (report_id, claim_position, position, url, domain, title, published_date, extracted)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			reportID, pos, j, src.URL, registrableDomain(src.URL), src.Title, src.PublishedDate, src.Extracted != ""); err != nil {
+		if _, err := tx.Exec(`INSERT INTO claim_sources (report_id, claim_position, position, url, domain, title, published_date, extracted, flagged)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			reportID, pos, j, src.URL, registrableDomain(src.URL), src.Title, src.PublishedDate, src.Extracted != "", src.Flagged); err != nil {
 			return err
 		}
 	}
@@ -302,4 +312,48 @@ func (s *sqliteReports) schemaVersion() (int, error) {
 	var v int
 	err := s.db.QueryRow(`SELECT COALESCE(MAX(version), 0) FROM schema_migrations`).Scan(&v)
 	return v, err
+}
+
+// list merges in-flight reports (memory) with stored ones, newest first.
+func (s *sqliteReports) list(f ReportFilter) []ReportSummary {
+	live := s.live.list(f)
+	where, args := []string{"1 = 1"}, []any{}
+	for col, v := range map[string]string{"tenant_virtual_key_id": f.Tenant, "model": f.Model, "outcome": f.Outcome, "request_id": f.RequestID} {
+		if v != "" {
+			where, args = append(where, col+" = ?"), append(args, v)
+		}
+	}
+	if f.Provider != "" {
+		where, args = append(where, "provider = ? COLLATE NOCASE"), append(args, f.Provider)
+	}
+	if f.Verdict != "" {
+		where, args = append(where, "verdict = ? COLLATE NOCASE"), append(args, f.Verdict)
+	}
+	if f.Before != "" {
+		where, args = append(where, "id < ?"), append(args, f.Before)
+	}
+	rows, err := s.db.Query(`SELECT document FROM reports WHERE `+strings.Join(where, " AND ")+` ORDER BY id DESC LIMIT ?`, append(args, f.limit())...)
+	if err != nil {
+		return live
+	}
+	defer rows.Close()
+	stored := []ReportSummary{}
+	for rows.Next() {
+		var doc string
+		var r Report
+		if rows.Scan(&doc) == nil && json.Unmarshal([]byte(doc), &r) == nil {
+			stored = append(stored, summarise(&r))
+		}
+	}
+	// Both are sorted newest first; IDs are unique across the two (a report
+	// leaves memory when it is written).
+	out := make([]ReportSummary, 0, min(len(live)+len(stored), f.limit()))
+	for len(out) < f.limit() && (len(live) > 0 || len(stored) > 0) {
+		if len(stored) == 0 || (len(live) > 0 && live[0].ID > stored[0].ID) {
+			out, live = append(out, live[0]), live[1:]
+		} else {
+			out, stored = append(out, stored[0]), stored[1:]
+		}
+	}
+	return out
 }

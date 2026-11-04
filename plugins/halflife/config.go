@@ -24,6 +24,24 @@ const (
 	DefaultReportRetentionHours    = 30 * 24
 	DefaultVerifierMaxTokens       = 1024
 
+	DefaultSearchTimeoutSeconds          = 20
+	DefaultCircuitBreakerFailures        = 5
+	DefaultCircuitBreakerCooldownSeconds = 30
+	DefaultTavilyCreditsCooldownSeconds  = 15 * 60
+	DefaultBudgetBackoffSeconds          = 5 * 60
+	// DefaultTavilyCreditUSD is Tavily's pay-as-you-go price per credit, the
+	// shadow price Halflife reports spend in (the relay's cost_per_unit
+	// should match it).
+	DefaultTavilyCreditUSD    = 0.008
+	DefaultProtectTimeoutMs   = 8000
+	DefaultMode               = ModeAudit
+	maxProtectTimeoutMs       = 60_000
+	maxCircuitCooldownSeconds = 3600
+	maxCreditsCooldownSeconds = 24 * 3600
+	maxBudgetBackoffSeconds   = 24 * 3600
+	maxSearchTimeoutSeconds   = 120
+	maxCircuitBreakerFailures = 100
+
 	maxVerifierModels = 4
 
 	// AnyTenant is the Verifiers entry used for tenants without their own.
@@ -119,6 +137,34 @@ type Config struct {
 	// as reasoning.effort: none, minimal, low, medium or high. Empty sends
 	// nothing, because models without reasoning may reject the parameter.
 	VerifierReasoningEffort string `json:"verifier_reasoning_effort,omitempty"`
+
+	// Failure handling (resilience.go).
+	//
+	// SearchTimeoutSeconds bounds one Tavily call through the relay.
+	SearchTimeoutSeconds int `json:"search_timeout_seconds,omitempty"`
+	// CircuitBreakerFailures consecutive outage failures (timeouts, network
+	// errors, 5xx, 429) of Tavily or the verifier LLM open that dependency's
+	// circuit for CircuitBreakerCooldownSeconds; then one probe call decides.
+	CircuitBreakerFailures        int `json:"circuit_breaker_failures,omitempty"`
+	CircuitBreakerCooldownSeconds int `json:"circuit_breaker_cooldown_seconds,omitempty"`
+	// TavilyCreditsCooldownSeconds is how long Tavily is left alone after it
+	// reports exhausted credits (432 or 433).
+	TavilyCreditsCooldownSeconds int `json:"tavily_credits_cooldown_seconds,omitempty"`
+	// BudgetBackoffSeconds pauses a tenant's audits after its verifier key's
+	// budget refuses a call (402), so no call is made just to be refused.
+	BudgetBackoffSeconds int `json:"budget_backoff_seconds,omitempty"`
+
+	// TavilyCreditUSD converts credits to the USD reported in metrics.
+	TavilyCreditUSD float64 `json:"tavily_credit_usd,omitempty"`
+
+	// Mode is audit (default), monitor or protect (modes.go).
+	Mode string `json:"mode,omitempty"`
+	// ProtectTimeoutMs is how long a protected request waits for its
+	// verdict before the response goes out without one (fail-open).
+	ProtectTimeoutMs int `json:"protect_timeout_ms,omitempty"`
+	// ProtectAll protects every auditable request in protect mode, not only
+	// those sending X-Halflife-Protect: true.
+	ProtectAll bool `json:"protect_all,omitempty"`
 }
 
 // VerifierKey is the governance virtual key that pays for one tenant's
@@ -195,6 +241,31 @@ func (c Config) withDefaults() Config {
 	if c.VerifierMaxTokens == 0 {
 		c.VerifierMaxTokens = DefaultVerifierMaxTokens
 	}
+	if c.SearchTimeoutSeconds == 0 {
+		c.SearchTimeoutSeconds = DefaultSearchTimeoutSeconds
+	}
+	if c.CircuitBreakerFailures == 0 {
+		c.CircuitBreakerFailures = DefaultCircuitBreakerFailures
+	}
+	if c.CircuitBreakerCooldownSeconds == 0 {
+		c.CircuitBreakerCooldownSeconds = DefaultCircuitBreakerCooldownSeconds
+	}
+	if c.TavilyCreditsCooldownSeconds == 0 {
+		c.TavilyCreditsCooldownSeconds = DefaultTavilyCreditsCooldownSeconds
+	}
+	if c.BudgetBackoffSeconds == 0 {
+		c.BudgetBackoffSeconds = DefaultBudgetBackoffSeconds
+	}
+	if c.TavilyCreditUSD == 0 {
+		c.TavilyCreditUSD = DefaultTavilyCreditUSD
+	}
+	c.Mode = strings.ToLower(strings.TrimSpace(c.Mode))
+	if c.Mode == "" {
+		c.Mode = DefaultMode
+	}
+	if c.ProtectTimeoutMs == 0 {
+		c.ProtectTimeoutMs = DefaultProtectTimeoutMs
+	}
 	models := make([]string, len(c.VerifierModels))
 	for i, m := range c.VerifierModels {
 		models[i] = strings.TrimSpace(m)
@@ -258,6 +329,24 @@ func (c Config) validate() error {
 		return fmt.Errorf("halflife: priority_boost_categories lists %d categories; there are %d", len(c.PriorityBoostCategories), len(claimCategories))
 	case len(c.VerifierModels) > maxVerifierModels:
 		return fmt.Errorf("halflife: verifier_models takes at most %d models, got %d", maxVerifierModels, len(c.VerifierModels))
+	case c.SearchTimeoutSeconds < 1 || c.SearchTimeoutSeconds > maxSearchTimeoutSeconds:
+		return fmt.Errorf("halflife: search_timeout_seconds must be between 1 and %d, got %d", maxSearchTimeoutSeconds, c.SearchTimeoutSeconds)
+	case c.CircuitBreakerFailures < 1 || c.CircuitBreakerFailures > maxCircuitBreakerFailures:
+		return fmt.Errorf("halflife: circuit_breaker_failures must be between 1 and %d, got %d", maxCircuitBreakerFailures, c.CircuitBreakerFailures)
+	case c.CircuitBreakerCooldownSeconds < 1 || c.CircuitBreakerCooldownSeconds > maxCircuitCooldownSeconds:
+		return fmt.Errorf("halflife: circuit_breaker_cooldown_seconds must be between 1 and %d, got %d", maxCircuitCooldownSeconds, c.CircuitBreakerCooldownSeconds)
+	case c.TavilyCreditsCooldownSeconds < 1 || c.TavilyCreditsCooldownSeconds > maxCreditsCooldownSeconds:
+		return fmt.Errorf("halflife: tavily_credits_cooldown_seconds must be between 1 and %d, got %d", maxCreditsCooldownSeconds, c.TavilyCreditsCooldownSeconds)
+	case c.BudgetBackoffSeconds < 1 || c.BudgetBackoffSeconds > maxBudgetBackoffSeconds:
+		return fmt.Errorf("halflife: budget_backoff_seconds must be between 1 and %d, got %d", maxBudgetBackoffSeconds, c.BudgetBackoffSeconds)
+	case c.TavilyCreditUSD < 0 || c.TavilyCreditUSD > 1:
+		return fmt.Errorf("halflife: tavily_credit_usd must be between 0 and 1, got %g", c.TavilyCreditUSD)
+	case c.Mode != ModeAudit && c.Mode != ModeMonitor && c.Mode != ModeProtect:
+		return fmt.Errorf("halflife: mode must be audit, monitor or protect, got %q", c.Mode)
+	case c.ProtectTimeoutMs < 100 || c.ProtectTimeoutMs > maxProtectTimeoutMs:
+		return fmt.Errorf("halflife: protect_timeout_ms must be between 100 and %d, got %d", maxProtectTimeoutMs, c.ProtectTimeoutMs)
+	case c.ProtectAll && c.Mode != ModeProtect:
+		return fmt.Errorf("halflife: protect_all needs mode protect, got %q", c.Mode)
 	}
 	switch c.VerifierReasoningEffort {
 	case "", "none", "minimal", "low", "medium", "high":

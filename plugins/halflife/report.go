@@ -10,13 +10,16 @@ import (
 // GET /api/halflife/reports/{id}. It is created when the answer is queued for
 // audit and completed by the verifier.
 type Report struct {
-	ID          string     `json:"id"`
-	RequestID   string     `json:"request_id"` // the gateway request (X-Bifrost-Request-Id) whose answer this audits
-	Status      string     `json:"status"`     // queued, running or complete
-	Outcome     string     `json:"outcome,omitempty"`
-	Verdict     string     `json:"verdict"` // the claims' worst verdict; not_judged on the keyword path, which has no judge
-	CreatedAt   time.Time  `json:"created_at"`
-	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	ID        string `json:"id"`
+	RequestID string `json:"request_id"` // the gateway request (X-Bifrost-Request-Id) whose answer this audits
+	Status    string `json:"status"`     // queued, running or complete
+	Outcome   string `json:"outcome,omitempty"`
+	// OutcomeReason explains an outcome reached without checking anything:
+	// a paused budget or an unavailable dependency.
+	OutcomeReason string     `json:"outcome_reason,omitempty"`
+	Verdict       string     `json:"verdict"` // the claims' worst verdict; not_judged on the keyword path, which has no judge
+	CreatedAt     time.Time  `json:"created_at"`
+	CompletedAt   *time.Time `json:"completed_at,omitempty"`
 
 	Tenant ReportTenant  `json:"tenant"`
 	Answer ReportAnswer  `json:"answer"`
@@ -28,14 +31,15 @@ type Report struct {
 
 // Report outcomes, set when the report completes.
 const (
-	OutcomeEvidenceFound    = "evidence_found"    // at least one claim's search returned sources
-	OutcomeNoEvidence       = "no_evidence"       // every search returned nothing
-	OutcomeNoClaim          = "no_claim"          // nothing in the answer was worth checking
-	OutcomeNothingToCheck   = "nothing_to_check"  // claims were found, but each was skipped or rejected
-	OutcomeNoVerifierKey    = "no_verifier_key"   // the tenant has no verifier key, and there is no "*" entry
-	OutcomeBudgetExhausted  = "budget_exhausted"  // the verifier key's budget refused the first call (402)
-	OutcomeSearchFailed     = "search_failed"     // the relay or Tavily failed for every claim tried
-	OutcomeExtractionFailed = "extraction_failed" // the extractor's reply was unusable or its call failed
+	OutcomeEvidenceFound    = "evidence_found"       // at least one claim's search returned sources
+	OutcomeNoEvidence       = "no_evidence"          // every search returned nothing
+	OutcomeNoClaim          = "no_claim"             // nothing in the answer was worth checking
+	OutcomeNothingToCheck   = "nothing_to_check"     // claims were found, but each was skipped or rejected
+	OutcomeNoVerifierKey    = "no_verifier_key"      // the tenant has no verifier key, and there is no "*" entry
+	OutcomeBudgetExhausted  = "budget_exhausted"     // the verifier key's budget refused the first call (402)
+	OutcomeSearchFailed     = "search_failed"        // the relay or Tavily failed for every claim tried
+	OutcomeExtractionFailed = "extraction_failed"    // the extractor's reply was unusable or its call failed
+	OutcomeUnavailable      = "verifier_unavailable" // Tavily or the verifier LLM is down (circuit open) or out of credits; nothing was spent
 )
 
 // Claim statuses.
@@ -95,6 +99,9 @@ type ReportClaim struct {
 	// Search is the request sent to Tavily, policy included.
 	Search   *SearchRequest `json:"search,omitempty"`
 	Evidence *ReportSources `json:"evidence,omitempty"`
+	// Failure is the kind of failure that left the claim unchecked or
+	// unjudged (resilience.go), e.g. timeout or circuit_open.
+	Failure string `json:"failure,omitempty"`
 
 	// What the evidence says (judge.go): the verdict, why, and the quotes
 	// it rests on, each checked against the source it cites.
@@ -121,6 +128,7 @@ type ReportQuote struct {
 	Source   int    `json:"source"` // index into evidence.sources; -1 when none was cited
 	URL      string `json:"url,omitempty"`
 	Verified bool   `json:"verified"`
+	Flagged  bool   `json:"flagged,omitempty"` // its source held instruction-like text: it backs no verdict
 }
 
 // ReportSources is the evidence found for the claim, and what it cost.
@@ -133,6 +141,7 @@ type ReportSources struct {
 	ExtractedURL     string         `json:"extracted_url,omitempty"`      // the page fetched with Extract because the snippets were thin
 	GatewayRequestID string         `json:"gateway_request_id,omitempty"` // the relay call, in Bifrost's relay log
 	TavilyRequestID  string         `json:"tavily_request_id,omitempty"`
+	DroppedSources   int            `json:"dropped_sources,omitempty"` // results without a usable http(s) URL, or over the per-claim cap
 	Sources          []ReportSource `json:"sources"`
 }
 
@@ -144,6 +153,10 @@ type ReportSource struct {
 	PublishedDate string  `json:"published_date,omitempty"`
 	Snippet       string  `json:"snippet"`
 	Extracted     string  `json:"extracted,omitempty"` // the page's most relevant chunks, from Extract
+	// Flagged sources held instruction-like text (untrusted.go), removed
+	// before storing; no verdict rests on a flagged source's quote.
+	Flagged    bool   `json:"flagged,omitempty"`
+	FlagReason string `json:"flag_reason,omitempty"`
 }
 
 // newReport starts the report for a capture about to be queued.

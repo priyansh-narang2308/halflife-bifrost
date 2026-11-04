@@ -280,7 +280,6 @@ func TestLLMRetriesOnceWhenRetryable(t *testing.T) {
 		wait  time.Duration
 	}{
 		"rate limited":          {gwReply{status: 429, header: map[string]string{"Retry-After": "3"}, raw: `{"error":{"message":"rate limited"}}`}, 3 * time.Second},
-		"retry-after capped":    {gwReply{status: 429, header: map[string]string{"Retry-After": "120"}}, maxRetryAfter},
 		"server error":          {gwReply{status: 503, raw: `{"error":{"message":"all fallbacks failed"}}`}, defaultRetryWait},
 		"rate limited, no wait": {gwReply{status: 429}, defaultRetryWait},
 	} {
@@ -293,8 +292,17 @@ func TestLLMRetriesOnceWhenRetryable(t *testing.T) {
 		}
 	}
 
-	g := newFakeGateway(t, gwReply{status: 500, raw: `{"error":{"message":"boom"}}`})
-	l, _ := testLLM(g)
+	// A Retry-After longer than maxRetryAfter is not waited out: the verifier
+	// opens the LLM circuit instead (resilience.go).
+	g := newFakeGateway(t, gwReply{status: 429, header: map[string]string{"Retry-After": "120"}}, gwReply{content: validCheck})
+	l, slept := testLLM(g)
+	var le429 *LLMError
+	if res, err := l.Complete(context.Background(), checkPrompt, testCheckSchema, &claimCheck{}); !errors.As(err, &le429) || le429.RetryAfter != 2*time.Minute || res.Calls != 1 || len(*slept) != 0 {
+		t.Errorf("long retry-after: err %v result %+v slept %v", err, res, *slept)
+	}
+
+	g = newFakeGateway(t, gwReply{status: 500, raw: `{"error":{"message":"boom"}}`})
+	l, _ = testLLM(g)
 	var out claimCheck
 	var le *LLMError
 	if res, err := l.Complete(context.Background(), checkPrompt, testCheckSchema, &out); !errors.As(err, &le) || le.Status != 500 || res.Calls != 2 {

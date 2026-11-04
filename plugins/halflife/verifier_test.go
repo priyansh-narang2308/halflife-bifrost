@@ -204,19 +204,18 @@ func TestVerifierRetriesOnceWhenRetryable(t *testing.T) {
 	v.sleep = func(_ context.Context, d time.Duration) error { waited = d; return nil }
 	f.reply = func(n int) (*SearchResponse, error) {
 		if n == 1 {
-			return nil, &TavilyError{Status: 429, Message: "slow down", RetryAfter: 30 * time.Second}
+			return nil, &TavilyError{Status: 429, Message: "slow down", RetryAfter: 3 * time.Second}
 		}
 		return &SearchResponse{Results: []SearchResult{{URL: "https://x.example"}}}, nil
 	}
 	r, err := runVerify(t, v, acmeCapture("hlr_r", "Acme Cloud Pro costs $49 per month."))
-	if err != nil || r.Outcome != OutcomeEvidenceFound || len(f.calls) != 2 || waited != maxRetryAfter {
+	if err != nil || r.Outcome != OutcomeEvidenceFound || len(f.calls) != 2 || waited != 3*time.Second {
 		t.Errorf("outcome %q err %v calls %d waited %v", r.Outcome, err, len(f.calls), waited)
 	}
 
 	// A second failure, or one that is not retryable, fails the audit.
 	for name, reply := range map[string]func(int) (*SearchResponse, error){
 		"500 twice": func(int) (*SearchResponse, error) { return nil, &TavilyError{Status: 500, Message: "boom"} },
-		"432":       func(int) (*SearchResponse, error) { return nil, &TavilyError{Status: 432, Message: "plan limit"} },
 		"network":   func(int) (*SearchResponse, error) { return nil, errors.New("connection refused") },
 	} {
 		v, f := testVerifier(t, sharedKey)
@@ -225,7 +224,7 @@ func TestVerifierRetriesOnceWhenRetryable(t *testing.T) {
 		if err == nil || r.Outcome != OutcomeSearchFailed || r.Error == "" {
 			t.Errorf("%s: outcome %q err %v", name, r.Outcome, err)
 		}
-		if want := map[string]int{"500 twice": 2, "432": 1, "network": 1}[name]; len(f.calls) != want {
+		if want := map[string]int{"500 twice": 2, "network": 1}[name]; len(f.calls) != want {
 			t.Errorf("%s: searches = %d, want %d", name, len(f.calls), want)
 		}
 	}

@@ -56,6 +56,12 @@ type verifier struct {
 	logger     schemas.Logger
 	sleep      func(context.Context, time.Duration) error
 	now        func() time.Time
+
+	tavilyCircuit   *breaker // shared: one Tavily account behind the relay
+	llmCircuit      *breaker
+	creditsCooldown time.Duration
+	budget          *budgetBackoff
+	metrics         *metrics // nil-safe: tests may run without one
 }
 
 // newVerifier resolves each verifier key's secret (env.VAR allowed). It fails
@@ -65,20 +71,25 @@ func newVerifier(cfg Config, store reports, logger schemas.Logger) (*verifier, e
 	if err != nil {
 		return nil, err
 	}
-	httpClient := &http.Client{Timeout: 30 * time.Second}
+	httpClient := &http.Client{Timeout: secs(cfg.SearchTimeoutSeconds)}
+	cooldown := secs(cfg.CircuitBreakerCooldownSeconds)
 	v := &verifier{
-		keys:       make(map[string]verifierKey, len(cfg.Verifiers)),
-		maxResults: cfg.SearchMaxResults,
-		maxClaims:  cfg.MaxClaimsPerResponse,
-		cutoffs:    cutoffs,
-		boosted:    make(map[string]bool, len(cfg.PriorityBoostCategories)),
-		domains:    cfg.PreferredDomains,
-		extract:    !cfg.DisableExtract,
-		reports:    store,
-		memo:       newSearchMemo(searchMemoSize, searchMemoTTL),
-		logger:     logger,
-		sleep:      sleepCtx,
-		now:        time.Now,
+		tavilyCircuit:   newBreaker(DependencyTavily, cfg.CircuitBreakerFailures, cooldown),
+		llmCircuit:      newBreaker(DependencyLLM, cfg.CircuitBreakerFailures, cooldown),
+		creditsCooldown: secs(cfg.TavilyCreditsCooldownSeconds),
+		budget:          newBudgetBackoff(secs(cfg.BudgetBackoffSeconds)),
+		keys:            make(map[string]verifierKey, len(cfg.Verifiers)),
+		maxResults:      cfg.SearchMaxResults,
+		maxClaims:       cfg.MaxClaimsPerResponse,
+		cutoffs:         cutoffs,
+		boosted:         make(map[string]bool, len(cfg.PriorityBoostCategories)),
+		domains:         cfg.PreferredDomains,
+		extract:         !cfg.DisableExtract,
+		reports:         store,
+		memo:            newSearchMemo(searchMemoSize, searchMemoTTL),
+		logger:          logger,
+		sleep:           sleepCtx,
+		now:             time.Now,
 	}
 	for _, c := range cfg.PriorityBoostCategories {
 		v.boosted[c] = true
@@ -127,6 +138,7 @@ func (v *verifier) llmFor(tenant string) (*LLM, verifierKey, bool) {
 // audit is the outcome of one answer's verification.
 type audit struct {
 	outcome    string
+	reason     string // why nothing was checked, for paused or unavailable audits
 	verdict    string
 	claims     []ReportClaim
 	extraction *LLMResult
@@ -149,7 +161,7 @@ func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 	}
 	now := time.Now().UTC()
 	v.reports.update(c.ReportID, func(r *Report) {
-		r.Status, r.Outcome, r.Claims, r.Extraction, r.CompletedAt = ReportComplete, a.outcome, a.claims, a.extraction, &now
+		r.Status, r.Outcome, r.OutcomeReason, r.Claims, r.Extraction, r.CompletedAt = ReportComplete, a.outcome, a.reason, a.claims, a.extraction, &now
 		if a.verdict != "" {
 			r.Verdict = a.verdict
 		}
@@ -157,6 +169,9 @@ func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 			r.Error = a.err.Error()
 		}
 	})
+	if r, ok := v.reports.get(c.ReportID); ok {
+		v.metrics.record(r)
+	}
 	v.logger.Debug("halflife: report %s complete: outcome=%s verdict=%s claims=%d", c.ReportID, a.outcome, a.verdict, len(a.claims))
 	if a.outcome == OutcomeSearchFailed || a.outcome == OutcomeExtractionFailed {
 		return false, a.err
@@ -164,11 +179,23 @@ func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 	return false, nil
 }
 
+// budgetPause is the audit of a tenant whose budget backoff is running.
+func (v *verifier) budgetPause(tenant string) (audit, bool) {
+	until, paused := v.budget.blocked(tenant)
+	if !paused {
+		return audit{}, false
+	}
+	return audit{outcome: OutcomeBudgetExhausted, reason: "verifier budget refused a call (402); audits for this tenant paused until " + until.UTC().Format(time.RFC3339)}, true
+}
+
 // runHeuristic is M1's path: one keyword-picked sentence, searched as is.
 func (v *verifier) runHeuristic(ctx context.Context, c *Capture) audit {
 	text, ok := pickClaim(c.Answer)
 	if !ok {
 		return audit{outcome: OutcomeNoClaim}
+	}
+	if a, paused := v.budgetPause(c.VirtualKeyID); paused {
+		return a
 	}
 	claim := ReportClaim{Text: text, Span: text, Status: ClaimPending, Query: buildQuery(text, c.Question)}
 	key, ok := v.keyFor(c.VirtualKeyID)
@@ -178,19 +205,37 @@ func (v *verifier) runHeuristic(ctx context.Context, c *Capture) audit {
 	}
 	req := SearchRequest{Query: claim.Query, SearchDepth: "basic", MaxResults: v.maxResults}
 	err := v.check(ctx, key, c, &claim, req, false)
+	if isBudgetRefusal(err) {
+		v.budget.spent(c.VirtualKeyID)
+	}
 	return audit{outcome: outcomeOf([]ReportClaim{claim}, err), claims: []ReportClaim{claim}, err: err}
 }
 
 // runExtracted is the model path: extract, filter, rank, search, then judge.
 func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
+	if a, paused := v.budgetPause(c.VirtualKeyID); paused {
+		return a
+	}
 	llm, key, ok := v.llmFor(c.VirtualKeyID)
 	if !ok {
 		return audit{outcome: OutcomeNoVerifierKey}
 	}
+	// Degrade before spending: with Tavily or the LLM unavailable, an
+	// extraction would only pay for claims that can't be checked.
+	for _, b := range []*breaker{v.tavilyCircuit, v.llmCircuit} {
+		if open, ue := b.isOpen(); open {
+			return audit{outcome: OutcomeUnavailable, reason: ue.Error()}
+		}
+	}
+	if err := v.llmCircuit.allow(); err != nil {
+		return audit{outcome: OutcomeUnavailable, reason: err.Error()}
+	}
 	extracted, res, err := extractClaims(ctx, llm, c.Question, c.Answer)
+	v.recordLLM(err)
 	var le *LLMError
 	switch {
 	case errors.As(err, &le) && le.BudgetSpent():
+		v.budget.spent(c.VirtualKeyID)
 		return audit{outcome: OutcomeBudgetExhausted, extraction: res, err: err}
 	case err != nil:
 		return audit{outcome: OutcomeExtractionFailed, extraction: res, err: err}
@@ -229,6 +274,9 @@ func (v *verifier) runExtracted(ctx context.Context, c *Capture) audit {
 		}
 		if rc.Status == ClaimChecked && !spent {
 			spent = v.judge(ctx, llm, rc) != nil // only a 402 is returned
+		}
+		if spent {
+			v.budget.spent(c.VirtualKeyID)
 		}
 	}
 	for i := range claims {
@@ -278,9 +326,11 @@ func (v *verifier) classify(e extractedClaim, c *Capture, now time.Time) ReportC
 
 // outcomeOf summarises the claims' statuses into the report's outcome.
 func outcomeOf(claims []ReportClaim, err error) string {
-	var checked, failed, budget, evidence int
+	var checked, failed, budget, unavailable, evidence int
 	for _, c := range claims {
 		switch {
+		case c.Status == ClaimNotChecked && (c.Failure == FailureCircuitOpen || c.Failure == FailureOutOfCredits):
+			unavailable++
 		case c.Status == ClaimChecked:
 			checked++
 			if c.Evidence != nil && len(c.Evidence.Sources) > 0 {
@@ -299,6 +349,8 @@ func outcomeOf(claims []ReportClaim, err error) string {
 		return OutcomeNoEvidence
 	case budget > 0:
 		return OutcomeBudgetExhausted
+	case unavailable > 0 && failed == 0:
+		return OutcomeUnavailable
 	case failed > 0 || err != nil:
 		return OutcomeSearchFailed
 	case len(claims) == 0:
@@ -329,8 +381,12 @@ func (v *verifier) check(ctx context.Context, key verifierKey, c *Capture, rc *R
 	}
 	evidence.Reused, evidence.TavilyRequestID = reused, resp.RequestID
 	for _, r := range resp.Results {
-		snippet, _ := clip(strings.TrimSpace(r.Content), maxSnippetBytes)
-		evidence.Sources = append(evidence.Sources, ReportSource{Title: r.Title, URL: r.URL, Score: r.Score, PublishedDate: r.PublishedDate, Snippet: snippet})
+		src, ok := untrustedSource(r)
+		if !ok || len(evidence.Sources) >= maxSourcesPerClaim {
+			evidence.DroppedSources++
+			continue
+		}
+		evidence.Sources = append(evidence.Sources, src)
 	}
 	rc.Status, rc.Evidence = ClaimChecked, evidence
 
@@ -343,7 +399,9 @@ func (v *verifier) check(ctx context.Context, key verifierKey, c *Capture, rc *R
 	if i < 0 {
 		return nil
 	}
-	er, err := client.Extract(ctx, ExtractRequest{URLs: []string{evidence.Sources[i].URL}, Query: claimQuery(rc), ChunksPerSource: extractChunksPerSource}, attr)
+	er, err := guarded(v.tavilyCircuit, v.creditsCooldown, func() (*ExtractResponse, error) {
+		return client.Extract(ctx, ExtractRequest{URLs: []string{evidence.Sources[i].URL}, Query: claimQuery(rc), ChunksPerSource: extractChunksPerSource}, attr)
+	})
 	if err != nil {
 		if isBudgetRefusal(err) {
 			rc.StatusReason = "extract refused: verifier budget spent (402)"
@@ -356,7 +414,7 @@ func (v *verifier) check(ctx context.Context, key verifierKey, c *Capture, rc *R
 	evidence.ExtractedURL = evidence.Sources[i].URL
 	for _, r := range er.Results {
 		if r.URL == evidence.Sources[i].URL {
-			evidence.Sources[i].Extracted, _ = clip(strings.TrimSpace(r.RawContent), maxExtractedBytes)
+			evidence.Sources[i].setExtracted(r.RawContent)
 		}
 	}
 	return nil
@@ -368,15 +426,22 @@ func isBudgetRefusal(err error) bool {
 }
 
 func (v *verifier) recordFailure(rc *ReportClaim, evidence *ReportSources, err error) error {
-	if isBudgetRefusal(err) {
+	rc.Failure, rc.Evidence = failureKind(err), evidence
+	switch rc.Failure {
+	case FailureBudget:
 		// D36: the key's budget is spent for this window; retrying only adds refusals.
 		rc.Status, rc.StatusReason = ClaimNotChecked, "verifier budget spent (402)"
-	} else {
+	case FailureCircuitOpen:
+		rc.Status, rc.StatusReason = ClaimNotChecked, err.Error()
+	case FailureOutOfCredits:
+		rc.Status, rc.StatusReason = ClaimNotChecked, "Tavily credits exhausted: "+err.Error()
+	default:
 		rc.Status, rc.StatusReason = ClaimFailed, err.Error()
 	}
-	rc.Evidence = evidence
 	return err
 }
+
+func secs(n int) time.Duration { return time.Duration(n) * time.Second }
 
 // memoRequestKey identifies a search by everything that changes its results.
 func memoRequestKey(req SearchRequest) string {
@@ -384,27 +449,32 @@ func memoRequestKey(req SearchRequest) string {
 	return strings.ToLower(string(b))
 }
 
-// search runs one search. A refused live fetch (434) is retried at once
-// without max_age_hours; then a retryable failure (rate limit, capacity,
-// server error) is retried once after a wait. refused reports the first.
+// search runs one search through the Tavily circuit. A refused live fetch
+// (434) is retried at once without max_age_hours; then a retryable failure
+// (rate limit, capacity, server error) is retried once after a wait, unless
+// Retry-After asks for longer than maxRetryAfter: that opens the circuit
+// instead of holding a worker. refused reports the 434.
 func (v *verifier) search(ctx context.Context, client searcher, req SearchRequest, attr Attribution) (resp *SearchResponse, refused bool, err error) {
-	resp, err = client.Search(ctx, req, attr)
+	call := func() (*SearchResponse, error) {
+		return guarded(v.tavilyCircuit, v.creditsCooldown, func() (*SearchResponse, error) { return client.Search(ctx, req, attr) })
+	}
+	resp, err = call()
 	var te *TavilyError
 	if errors.As(err, &te) && te.LiveFetchRefused() && req.MaxAgeHours != nil {
 		req.MaxAgeHours, refused = nil, true
-		resp, err = client.Search(ctx, req, attr)
+		resp, err = call()
 	}
-	if err == nil || !errors.As(err, &te) || !te.Retryable() {
+	if err == nil || !errors.As(err, &te) || !te.Retryable() || te.RetryAfter > maxRetryAfter {
 		return resp, refused, err
 	}
-	wait := min(te.RetryAfter, maxRetryAfter)
+	wait := te.RetryAfter
 	if wait <= 0 {
 		wait = defaultRetryWait
 	}
 	if serr := v.sleep(ctx, wait); serr != nil {
 		return nil, refused, err
 	}
-	resp, err = client.Search(ctx, req, attr)
+	resp, err = call()
 	return resp, refused, err
 }
 

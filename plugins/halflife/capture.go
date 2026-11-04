@@ -20,9 +20,10 @@ const (
 // Capture is one completed answer, copied out of the gateway's pooled objects
 // so it stays valid after the request has been served.
 type Capture struct {
-	ReportID   string    // Halflife's ID for the audit report, sent to the client as X-Halflife-Report
-	RequestID  string    // the gateway's request ID (X-Bifrost-Request-Id), linking the report to Bifrost's logs
-	CapturedAt time.Time // when the request finished
+	ReportID   string        // Halflife's ID for the audit report, sent to the client as X-Halflife-Report
+	done       chan struct{} // protect mode: closed when the audit has finished
+	RequestID  string        // the gateway's request ID (X-Bifrost-Request-Id), linking the report to Bifrost's logs
+	CapturedAt time.Time     // when the request finished
 
 	// The governance virtual key that made the request: the tenant. Its ID and
 	// name only, never the key's secret value (the x-bf-vk header).
@@ -103,6 +104,9 @@ type slot struct {
 	reportID  string // the answer's report; read by the response-headers hook
 	cached    bool   // reportID belongs to the answer that filled the cache entry served here
 	dropped   bool   // captured, but the audit queue was full
+	protect   bool   // protect mode: the response waits for the verdict
+	protected string // protect mode's X-Halflife-Status, once known
+	verdict   string // protect mode: the verdict reached in time
 }
 
 func slotFrom(ctx *schemas.BifrostContext) *slot {
@@ -160,6 +164,19 @@ func (s *slot) setReport(id string, cached bool) {
 	s.mu.Unlock()
 }
 
+// setProtected records protect mode's outcome for the headers.
+func (s *slot) setProtected(status, verdict string) {
+	s.mu.Lock()
+	s.protected, s.verdict = status, verdict
+	s.mu.Unlock()
+}
+
+func (s *slot) protectedVerdict() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.verdict
+}
+
 // drop withdraws the report ID when the capture could not be queued.
 func (s *slot) drop() {
 	s.mu.Lock()
@@ -182,6 +199,8 @@ func (s *slot) status() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch {
+	case s.reportID != "" && s.protected != "":
+		return s.protected
 	case s.reportID != "" && s.cached:
 		return statusCached
 	case s.reportID != "":
