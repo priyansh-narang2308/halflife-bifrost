@@ -239,3 +239,24 @@ func TestFreshnessConfigValidation(t *testing.T) {
 		t.Error("tombstones off, but one was added")
 	}
 }
+
+// A wrong answer leaves the cache whether or not any source shows it was once
+// true, unless the only thing against it is weak evidence.
+func TestKnownWrongNeedsMoreThanWeakEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		verdict, strength string
+		want              bool
+	}{
+		{VerdictOutdated, StrengthWeak, true},
+		{VerdictContradicted, StrengthStrong, true},
+		{VerdictContradicted, StrengthModerate, true},
+		{VerdictContradicted, StrengthWeak, false},
+		{VerdictContradicted, "", false},
+		{VerdictConflicting, StrengthStrong, false},
+		{VerdictCurrent, StrengthStrong, false},
+	} {
+		if got := knownWrong([]ReportClaim{{Verdict: tc.verdict, Strength: tc.strength}}); got != tc.want {
+			t.Errorf("%s/%s: %v", tc.verdict, tc.strength, got)
+		}
+	}
+}

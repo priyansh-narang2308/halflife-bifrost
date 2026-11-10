@@ -127,7 +127,9 @@ func (p *Plugin) resolveTombstoned(s *slot, c *Capture) bool {
 	}
 	verdict := ""
 	if s.protect {
-		verdict = VerdictOutdated
+		if r, ok := p.reports.get(e.reportID); ok {
+			verdict = r.Verdict
+		}
 	}
 	s.setReport(e.reportID, false)
 	s.setProtected(statusKnownOutdated, verdict)
@@ -135,7 +137,7 @@ func (p *Plugin) resolveTombstoned(s *slot, c *Capture) bool {
 	return true
 }
 
-// applyFreshness acts on a finished audit: an outdated answer is evicted and
+// applyFreshness acts on a finished audit: a known wrong answer is evicted and
 // its question tombstoned; any other gets an expiry from its claims' volatility.
 func (p *Plugin) applyFreshness(c *Capture, stale, finished bool) {
 	key := questionKey(c.CacheKey, c.Question)

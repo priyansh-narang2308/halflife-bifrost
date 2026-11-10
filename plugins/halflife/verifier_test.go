@@ -112,7 +112,7 @@ func runVerify(t *testing.T, v *verifier, c *Capture) (Report, error) {
 	if !ok {
 		t.Fatal("report missing")
 	}
-	if stale != anyOutdated(r.Claims) {
+	if stale != knownWrong(r.Claims) {
 		t.Errorf("stale = %v for claims %+v", stale, r.Claims)
 	}
 	return r, err

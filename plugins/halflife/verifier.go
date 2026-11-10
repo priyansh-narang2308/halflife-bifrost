@@ -180,19 +180,22 @@ func (v *verifier) verify(ctx context.Context, c *Capture) (bool, error) {
 		v.metrics.record(r)
 	}
 	v.logger.Debug("halflife: report %s complete: outcome=%s verdict=%s claims=%d", c.ReportID, a.outcome, a.verdict, len(a.claims))
-	stale := anyOutdated(a.claims)
+	stale := knownWrong(a.claims)
 	if a.outcome == OutcomeSearchFailed || a.outcome == OutcomeExtractionFailed {
 		return stale, a.err
 	}
 	return stale, nil
 }
 
-// anyOutdated reports whether a claim was shown to have stopped being true.
-// Only OUTDATED counts (audit §3.4): CONTRADICTED may never have been true,
-// and a regenerated answer would say the same.
-func anyOutdated(claims []ReportClaim) bool {
+// knownWrong reports whether an answer should stop being served from the cache.
+// OUTDATED counts, and so does CONTRADICTED on better than weak evidence: search
+// mostly returns current pages, so a stale fact rarely comes with a quote showing
+// it once held, and the cached answer is just as wrong without one.
+func knownWrong(claims []ReportClaim) bool {
 	for i := range claims {
-		if claims[i].Verdict == VerdictOutdated {
+		c := &claims[i]
+		if c.Verdict == VerdictOutdated ||
+			c.Verdict == VerdictContradicted && (c.Strength == StrengthStrong || c.Strength == StrengthModerate) {
 			return true
 		}
 	}

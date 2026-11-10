@@ -33,7 +33,7 @@ func equalIDs(a []string, b ...string) bool {
 // two models, verdicts and outcomes varied. hlr_5 is still running.
 func listFixture(t *testing.T, s reports) {
 	t.Helper()
-	base := time.Date(2026, 11, 3, 12, 0, 0, 0, time.UTC)
+	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour) // inside the store's retention
 	for i, tc := range []struct{ tenant, provider, model, verdict, outcome string }{
 		{"vk-a", "openai", "gpt-4o", VerdictCurrent, OutcomeEvidenceFound},
 		{"vk-b", "openai", "gpt-4o", VerdictContradicted, OutcomeEvidenceFound},
